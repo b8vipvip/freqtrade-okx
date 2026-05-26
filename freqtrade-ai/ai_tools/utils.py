@@ -10,9 +10,11 @@ from typing import Dict
 
 from dotenv import load_dotenv
 
+BASE_DIR = Path(__file__).resolve().parents[1]
+
 
 def load_settings() -> Dict[str, str]:
-    load_dotenv()
+    load_dotenv(BASE_DIR / ".env")
     return {
         "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY", "").strip(),
         "OPENAI_MODEL": os.getenv("OPENAI_MODEL", "gpt-5.5").strip(),
