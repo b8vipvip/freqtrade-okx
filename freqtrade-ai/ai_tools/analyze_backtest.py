@@ -49,13 +49,14 @@ def analyze_backtest(input_path: str | None = None, output_path: str | None = No
         f"{payload}"
     )
 
-    client = OpenAI(api_key=api_key)
-    resp = client.responses.create(
+    client = OpenAI(api_key=settings["OPENAI_API_KEY"], base_url=settings.get("OPENAI_BASE_URL") or None)
+    response = client.chat.completions.create(
         model=settings["OPENAI_MODEL"],
-        input=prompt,
+        messages=[{"role": "user", "content": prompt}],
         temperature=0.2,
     )
-    analysis = resp.output_text.strip() + "\n"
+    result = response.choices[0].message.content
+    analysis = (result or "").strip() + "\n"
     write_text_file(analysis_file, analysis)
     return analysis
 
