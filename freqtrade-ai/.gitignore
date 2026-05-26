@@ -1,0 +1,12 @@
+.env
+user_data/config.json
+user_data/*.sqlite
+user_data/*.sqlite-shm
+user_data/*.sqlite-wal
+user_data/logs/
+user_data/backtest_results/
+user_data/data/
+__pycache__/
+*.pyc
+.venv/
+venv/
