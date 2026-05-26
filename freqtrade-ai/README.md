@@ -95,6 +95,20 @@ docker compose logs -f freqtrade
 docker compose down
 ```
 
+
+## 使用中转站 API
+如果你使用的是兼容 OpenAI 的中转站，请在 `.env` 中配置：
+
+```env
+OPENAI_API_KEY=你的Key
+OPENAI_BASE_URL=https://your-proxy-domain/v1
+OPENAI_MODEL=gpt-5.5
+```
+
+说明：
+- `OPENAI_BASE_URL` 留空时将直连官方 OpenAI 接口。
+- `OPENAI_MODEL` 仍然通过 `.env` 配置，脚本会按该值调用模型。
+
 ## 17. 常见问题
 - 找不到 `config.json`：请先执行复制命令并确认路径为 `user_data/config.json`。
 - 找不到 `backtest-result.json`：请先完成一次 backtesting 并导出结果文件。

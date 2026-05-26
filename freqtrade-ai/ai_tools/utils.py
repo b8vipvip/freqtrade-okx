@@ -16,6 +16,7 @@ def load_settings() -> Dict[str, str]:
     return {
         "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY", "").strip(),
         "OPENAI_MODEL": os.getenv("OPENAI_MODEL", "gpt-5.5").strip(),
+        "OPENAI_BASE_URL": os.getenv("OPENAI_BASE_URL", "").strip(),
         "BACKTEST_FILE": os.getenv("BACKTEST_FILE", "user_data/backtest_results/backtest-result.json").strip(),
         "AI_ANALYSIS_FILE": os.getenv("AI_ANALYSIS_FILE", "user_data/backtest_results/ai-analysis.txt").strip(),
         "AI_STRATEGY_FILE": os.getenv("AI_STRATEGY_FILE", "user_data/strategies/AI_Generated_Strategy.py").strip(),

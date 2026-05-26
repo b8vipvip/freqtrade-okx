@@ -51,13 +51,14 @@ def generate_strategy(analysis_path: str | None = None, output_path: str | None 
         f"{analysis}"
     )
 
-    client = OpenAI(api_key=api_key)
-    resp = client.responses.create(
+    client = OpenAI(api_key=settings["OPENAI_API_KEY"], base_url=settings.get("OPENAI_BASE_URL") or None)
+    response = client.chat.completions.create(
         model=settings["OPENAI_MODEL"],
-        input=prompt,
+        messages=[{"role": "user", "content": prompt}],
         temperature=0.3,
     )
-    code = extract_python_code(resp.output_text)
+    result = response.choices[0].message.content
+    code = extract_python_code(result or "")
     _validate_strategy(code)
     write_text_file(dst, code)
     return code
