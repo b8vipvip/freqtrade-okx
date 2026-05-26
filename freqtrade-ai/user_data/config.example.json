@@ -1,0 +1,51 @@
+{
+  "$schema": "https://schema.freqtrade.io/schema.json",
+  "dry_run": true,
+  "dry_run_wallet": 1000,
+  "trading_mode": "spot",
+  "stake_currency": "USDT",
+  "stake_amount": 50,
+  "max_open_trades": 3,
+  "timeframe": "5m",
+  "strategy": "SampleStrategy",
+  "exchange": {
+    "name": "okx",
+    "key": "",
+    "secret": "",
+    "password": "",
+    "ccxt_config": {},
+    "ccxt_async_config": {},
+    "pair_whitelist": [
+      "BTC/USDT",
+      "ETH/USDT",
+      "SOL/USDT"
+    ],
+    "pair_blacklist": []
+  },
+  "pairlists": [
+    {
+      "method": "StaticPairList"
+    }
+  ],
+  "telegram": {
+    "enabled": false,
+    "token": "",
+    "chat_id": ""
+  },
+  "api_server": {
+    "enabled": false,
+    "listen_ip_address": "127.0.0.1",
+    "listen_port": 8080,
+    "verbosity": "error",
+    "enable_openapi": false,
+    "jwt_secret_key": "change-this-local-secret",
+    "ws_token": "change-this-local-token",
+    "CORS_origins": [],
+    "username": "",
+    "password": ""
+  },
+  "bot_name": "freqtrade-okx-dryrun",
+  "internals": {
+    "process_throttle_secs": 5
+  }
+}

@@ -1,0 +1,13 @@
+services:
+  freqtrade:
+    image: freqtradeorg/freqtrade:stable
+    container_name: freqtrade
+    restart: unless-stopped
+    volumes:
+      - ./user_data:/freqtrade/user_data
+    env_file:
+      - .env
+    command: >
+      trade
+      --config /freqtrade/user_data/config.json
+      --strategy-path /freqtrade/user_data/strategies
