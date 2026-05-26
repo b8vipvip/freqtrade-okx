@@ -96,13 +96,13 @@ docker compose down
 ```
 
 
-## 使用中转站 API
+## 使用 OpenAI 中转站 API
 如果你使用的是兼容 OpenAI 的中转站，请在 `.env` 中配置：
 
 ```env
-OPENAI_API_KEY=你的Key
-OPENAI_BASE_URL=https://your-proxy-domain/v1
-OPENAI_MODEL=gpt-5.5
+OPENAI_API_KEY=你的中转站Key
+OPENAI_BASE_URL=https://你的中转站域名/v1
+OPENAI_MODEL=你的中转站支持的模型名
 ```
 
 说明：
