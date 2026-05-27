@@ -254,6 +254,158 @@ def ask_ai(client: OpenAI, model: str, messages: list[dict[str, str]]) -> str:
     return (res.choices[0].message.content or "").strip()
 
 
+def _build_periods(runtime_goal: dict[str, Any]) -> tuple[PeriodDef, list[PeriodDef]]:
+    train_cfg = runtime_goal.get("train_period", {})
+    train = PeriodDef(
+        name=str(train_cfg.get("name", "train")),
+        timerange=str(train_cfg.get("timerange", "")),
+        weight=float(train_cfg.get("weight", 1.0)),
+        kind="train",
+    )
+    validations: list[PeriodDef] = []
+    for idx, item in enumerate(runtime_goal.get("validation_periods", []), start=1):
+        validations.append(
+            PeriodDef(
+                name=str(item.get("name", f"valid_{idx:02d}")),
+                timerange=str(item.get("timerange", "")),
+                weight=float(item.get("weight", 1.0)),
+                kind="validation",
+            )
+        )
+    return train, validations
+
+
+def _extract_metrics(data: dict[str, Any]) -> dict[str, Any]:
+    s = data.get("strategy", {})
+    first = next(iter(s.values()), {}) if isinstance(s, dict) else {}
+    t = first.get("total", {}) if isinstance(first, dict) else {}
+    results_per_pair = first.get("results_per_pair", [])
+    return {
+        "total_trades": int(t.get("total_trades", 0) or 0),
+        "profit_total_abs": float(t.get("profit_total_abs", 0) or 0),
+        "profit_total_pct": float(t.get("profit_total_pct", 0) or 0),
+        "profit_factor": float(t.get("profit_factor", 0) or 0),
+        "max_drawdown": float(t.get("max_drawdown_account", t.get("max_drawdown", 0)) or 0),
+        "winrate": float(t.get("winrate", 0) or 0),
+        "roi_profit_total": float(t.get("profit_total_pct", 0) or 0),
+        "stop_loss_abs": float(t.get("stop_loss_abs", 0) or 0),
+        "pairs": results_per_pair,
+    }
+
+
+def _score(metrics: dict[str, Any], period: PeriodDef) -> float:
+    return (
+        metrics["profit_total_pct"] * 1.0
+        + metrics["profit_factor"] * 8.0
+        + metrics["winrate"] * 20.0
+        - metrics["max_drawdown"] * 40.0
+    ) * period.weight
+
+
+def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace, run_dir: Path) -> None:
+    config = str(runtime_goal.get("config", args.config))
+    timeframe = str(runtime_goal.get("timeframe", args.timeframe))
+    strategy_family = str(runtime_goal.get("strategy_family", args.base_strategy))
+    iterations = int(runtime_goal.get("max_iterations", args.iterations))
+    train, validations = _build_periods(runtime_goal)
+
+    if not train.timerange:
+        raise RuntimeError("缺少训练区间 train_period.timerange，无法继续。")
+
+    if runtime_goal.get("data_download", {}).get("auto_download", True) and not args.skip_download:
+        print("正在下载历史数据……")
+        dtr = str(runtime_goal.get("data_download", {}).get("download_timerange", train.timerange))
+        cmd = [
+            "docker", "compose", "run", "--rm", "freqtrade", "download-data",
+            "--config", config, "--exchange", "okx",
+            "--timeframes", "5m", "1h", "--timerange", dtr, "--prepend",
+        ]
+        cp = run_cmd(cmd, ROOT_DIR)
+        print(cp.stdout)
+        if cp.returncode != 0:
+            print(cp.stderr)
+            raise RuntimeError("下载历史数据失败。")
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    client = OpenAI(api_key=api_key, base_url=os.getenv("OPENAI_BASE_URL") or None) if api_key else None
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+    best: dict[str, Any] | None = None
+    for i in range(1, iterations + 1):
+        ver = f"v{i:03d}"
+        class_name = f"{strategy_family}_{ver}"
+        strategy_file = GENERATED_DIR / f"{class_name}.py"
+        print(f"正在生成第 {i} 版策略……")
+        if client is None:
+            print("自动优化主流程尚未实现完整 AI 生成：缺少 OPENAI_API_KEY，使用模板策略继续流程。")
+            code = f"""from freqtrade.strategy.interface import IStrategy\nfrom pandas import DataFrame\n\n\nclass {class_name}(IStrategy):\n    timeframe = '{timeframe}'\n    minimal_roi = {{'0': 0.02}}\n    stoploss = -0.03\n    startup_candle_count = 50\n\n    def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:\n        return dataframe\n\n    def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:\n        dataframe.loc[:, 'enter_long'] = 0\n        return dataframe\n\n    def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:\n        dataframe.loc[:, 'exit_long'] = 0\n        return dataframe\n"""
+        else:
+            prompt = (
+                f"请生成完整 freqtrade 策略代码，只输出 Python 代码。类名必须为 {class_name}，继承 IStrategy，"
+                f"timeframe='{timeframe}'，并实现 populate_indicators/populate_entry_trend/populate_exit_trend。"
+            )
+            code = extract_python_code(ask_ai(client, model, [{"role": "user", "content": prompt}]))
+        strategy_file.parent.mkdir(parents=True, exist_ok=True)
+        strategy_file.write_text(code, encoding="utf-8")
+
+        print("正在检查 Python 语法……")
+        pyc = run_cmd([sys.executable, "-m", "py_compile", str(strategy_file)], ROOT_DIR)
+        if pyc.returncode != 0:
+            print(pyc.stderr)
+            print(f"第 {i} 轮语法检查失败，跳过。")
+            continue
+
+        print(f"正在回测训练区间：{train.timerange}")
+        train_cmd = [
+            "docker", "compose", "run", "--rm", "freqtrade", "backtesting",
+            "--config", config, "--strategy", class_name, "--timeframe", timeframe,
+            "--timerange", train.timerange, "--export", "trades", "--cache", "none",
+        ]
+        train_cp = run_cmd(train_cmd, ROOT_DIR)
+        if train_cp.returncode != 0:
+            print(train_cp.stderr)
+            continue
+        print("正在解析回测结果……")
+        train_metrics = _extract_metrics(parse_backtest_from_zip(latest_backtest_zip(ROOT_DIR / "user_data" / "backtest_results")))
+        train_score = _score(train_metrics, train)
+
+        val_scores = []
+        for p in validations:
+            print(f"正在回测验证区间：{p.timerange}")
+            vcmd = train_cmd.copy()
+            vcmd[vcmd.index("--timerange") + 1] = p.timerange
+            val_cp = run_cmd(vcmd, ROOT_DIR)
+            if val_cp.returncode != 0:
+                print(val_cp.stderr)
+                continue
+            print("正在解析回测结果……")
+            vm = _extract_metrics(parse_backtest_from_zip(latest_backtest_zip(ROOT_DIR / "user_data" / "backtest_results")))
+            val_scores.append(_score(vm, p))
+        validation_score = sum(val_scores) / len(val_scores) if val_scores else 0.0
+        overfit_penalty = max(0.0, train_score - validation_score) * 0.3
+        final_score = train_score * 0.6 + validation_score * 0.4 - overfit_penalty
+        is_overfit = train_score > validation_score * 1.3 if validation_score else True
+
+        round_data = {
+            "iteration": i, "class_name": class_name, "strategy_file": str(strategy_file),
+            "train_metrics": train_metrics, "train_score": train_score, "validation_score": validation_score,
+            "overfit_penalty": overfit_penalty, "final_score": final_score, "is_overfit": is_overfit,
+        }
+        write_json(run_dir / f"round_{i:03d}.json", round_data)
+        is_best = best is None or final_score > float(best["final_score"])
+        if is_best:
+            best = round_data
+            write_json(run_dir / "best_strategy.json", best)
+            shutil.copy2(strategy_file, GENERATED_DIR / f"BEST_{strategy_family}.py")
+        print(f"第 {i} 轮完成")
+        print(f"是否成为新最佳：{'是' if is_best else '否'}")
+
+    if best:
+        print(f"自动优化完成，最佳策略：{best['class_name']}，得分：{best['final_score']:.4f}")
+    else:
+        print("自动优化结束：没有可用策略通过流程。")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--goal", default="ai_tools/optimization_goal.json")
@@ -287,8 +439,7 @@ def main() -> None:
     write_json(run_dir / "goal.json", goal)
     print(f"运行时配置已保存：{run_dir / 'goal.runtime.json'}")
 
-    # 这里保留原有执行入口提示（避免大改现有逻辑）
-    print("设置完成，后续将按运行时配置执行自动优化流程。")
+    run_auto_optimization(runtime_goal, args, run_dir)
 
 
 if __name__ == "__main__":
