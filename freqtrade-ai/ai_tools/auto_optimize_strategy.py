@@ -546,6 +546,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     client = OpenAI(api_key=api_key, base_url=base_url)
 
     best: dict[str, Any] | None = None
+    prev_train_trades: int | None = None
     leaderboard: list[dict[str, Any]] = []
     best_summary_path: Path | None = None
     for i in range(1, iterations + 1):
@@ -555,9 +556,37 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         version_dir = run_dir / ver
         version_dir.mkdir(parents=True, exist_ok=True)
         print(f"正在生成第 {i} 版策略……")
+        target_cfg = runtime_goal.get("target", {}) or {}
+        baseline_cfg = runtime_goal.get("baseline", {}) or {}
+        min_trades = int(target_cfg.get("min_trades", 80))
+        max_trades = int(target_cfg.get("max_trades", 200))
+        relax_hint = (
+            "上一轮训练区间交易数为 0，本轮必须明显放宽入场条件（降低阈值、减少强趋势过滤叠加、避免过多与条件），"
+            "确保训练区间产生可观测交易。"
+            if prev_train_trades == 0 else
+            "优先保证训练区间有稳定交易，不要把过滤条件堆得过严。"
+        )
         prompt = (
             f"请生成完整 freqtrade 策略代码，只输出 Python 代码。类名必须为 {class_name}，继承 IStrategy，"
-            f"timeframe='{timeframe}'，并实现 populate_indicators/populate_entry_trend/populate_exit_trend。"
+            f"timeframe='{timeframe}'，并实现 populate_indicators/populate_entry_trend/populate_exit_trend。\n"
+            "硬性约束：\n"
+            "1) 策略必须在训练区间产生合理交易，严禁生成完全无交易策略。\n"
+            f"2) 目标交易数为 {min_trades}~{max_trades}。\n"
+            f"3) {relax_hint}\n"
+            "4) use_exit_signal 必须为 False。\n"
+            "5) 仅现货 long only：不做空、不杠杆、不马丁格尔、不无限补仓。\n"
+            "6) 入场条件不能过度依赖过强趋势过滤（例如要求多个强趋势条件同时成立）。\n"
+            "7) 允许并建议使用 RSI、EMA、MACD、成交量、布林带等常规指标构建中等强度的入场逻辑。\n"
+            "8) 目标不是追求 0 回撤，而是在足够交易数下综合表现优于 baseline。\n"
+            "当前 baseline：\n"
+            f"- 总收益(USDT)：{baseline_cfg.get('profit_total_abs', -7.43)}\n"
+            f"- 收益率(%)：{baseline_cfg.get('profit_total_pct', -0.74)}\n"
+            f"- Profit Factor：{baseline_cfg.get('profit_factor', 0.63)}\n"
+            f"- 最大回撤(%)：{baseline_cfg.get('max_drawdown_pct', 1.45)}\n"
+            f"- 交易数：{baseline_cfg.get('total_trades', 47)}\n"
+            "输出要求：\n"
+            "- 只输出可运行的完整 Python 策略代码，不要解释。\n"
+            "- 避免把入场条件写成几乎永远不触发的苛刻组合。\n"
         )
         code = extract_python_code(ask_ai(client, model, [{"role": "user", "content": prompt}]))
         strategy_file.parent.mkdir(parents=True, exist_ok=True)
@@ -592,6 +621,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             continue
         print("正在解析回测结果……")
         train_metrics = _extract_metrics(parse_backtest_from_zip(latest_backtest_zip(ROOT_DIR / "user_data" / "backtest_results")))
+        prev_train_trades = int(train_metrics.get("total_trades", 0) or 0)
         write_json(version_dir / "train_metrics.json", train_metrics)
         train_score = _score(train_metrics, train)
         _print_round_table(ver, train.timerange, train_metrics)
