@@ -33,8 +33,9 @@ class MultiCoin_AI_Strategy(IStrategy):
         "360": 0.0,
     }
 
-    # Slightly wider stop to avoid tiny-pullback shakeouts.
-    stoploss = -0.07
+    # Exits rely primarily on ROI/stoploss to avoid loss-heavy signal exits.
+    use_exit_signal = False
+    stoploss = -0.065
 
     protections = [
         {
@@ -64,13 +65,16 @@ class MultiCoin_AI_Strategy(IStrategy):
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         dataframe.loc[
             (
-                # 1h context: trend-friendly or at least not weak
-                ((dataframe["close_1h"] > dataframe["ema200_1h"]) | (dataframe["rsi_1h"] > 46))
-                # 5m momentum/trend alignment (relaxed for more opportunities)
-                & (dataframe["close"] > dataframe["ema20"])
-                & (dataframe["rsi"] >= 34)
-                & (dataframe["rsi"] <= 72)
+                # 1h context: trade only with medium/long trend tailwind
+                (dataframe["close_1h"] > dataframe["ema200_1h"])
+                & (dataframe["rsi_1h"] > 50)
+                # 5m alignment: reduce low-quality churn entries
+                & (dataframe["close"] > dataframe["ema50"])
+                & (dataframe["ema20"] > dataframe["ema50"])
+                & (dataframe["rsi"] >= 45)
+                & (dataframe["rsi"] <= 68)
                 & (dataframe["macd"] > dataframe["macdsignal"])
+                & (dataframe["macd"] > 0)
                 & (dataframe["volume"] > 0)
             ),
             "enter_long",
@@ -82,10 +86,14 @@ class MultiCoin_AI_Strategy(IStrategy):
         dataframe.loc[
             (
                 (
-                    # Confirmed weakness instead of tiny pullback
-                    ((dataframe["close"] < dataframe["ema50"]) & (dataframe["rsi"] < 40))
-                    | ((dataframe["ema20"] < dataframe["ema50"]) & (dataframe["macd"] < dataframe["macdsignal"]))
-                    | ((dataframe["close"] < dataframe["ema100"]) & (dataframe["rsi"] < 45))
+                    # Extreme trend break only (kept as fallback if use_exit_signal is enabled)
+                    (dataframe["close"] < dataframe["ema200"])
+                    | ((dataframe["close"] < dataframe["ema100"]) & (dataframe["rsi"] < 35))
+                    | (
+                        (dataframe["ema20"] < dataframe["ema50"])
+                        & (dataframe["ema50"] < dataframe["ema100"])
+                        & (dataframe["macd"] < dataframe["macdsignal"])
+                    )
                 )
                 & (dataframe["volume"] > 0)
             ),
