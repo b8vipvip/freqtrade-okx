@@ -109,6 +109,11 @@ OPENAI_MODEL=你的中转站支持的模型名
 - `OPENAI_BASE_URL` 留空时将直连官方 OpenAI 接口。
 - `OPENAI_MODEL` 仍然通过 `.env` 配置，脚本会按该值调用模型。
 
+## 新版 Freqtrade 回测结果说明
+- 新版 Freqtrade 回测结果默认会写入 `user_data/backtest_results/` 下的 `backtest-result-*.zip`。
+- `ai_tools/analyze_backtest.py` 会优先读取 `.env` 中 `BACKTEST_FILE` 指向的 `backtest-result.json`。
+- 如果该文件不存在，脚本会自动查找最新的 `backtest-result-*.zip`，并读取其中第一个非 `.meta.json` 的 `.json` 回测结果。
+
 ## 17. 常见问题
 - 找不到 `config.json`：请先执行复制命令并确认路径为 `user_data/config.json`。
 - 找不到 `backtest-result.json`：请先完成一次 backtesting 并导出结果文件。
