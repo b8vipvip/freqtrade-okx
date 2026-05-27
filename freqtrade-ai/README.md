@@ -121,3 +121,103 @@ OPENAI_MODEL=你的中转站支持的模型名
 - 策略类名不匹配：确认策略文件中类名与命令 `--strategy` 参数一致。
 - Freqtrade 找不到策略：确认策略文件位于 `user_data/strategies/`。
 - OKX API 权限错误：检查 API 是否启用交易权限、IP 白名单与 passphrase 是否正确。
+
+## 18. 自动策略优化循环（中文友好模式）
+
+### 18.1 目标文件说明
+- 实际运行目标文件：`ai_tools/optimization_goal.json`
+- 示例模板文件：`ai_tools/optimization_goal.example.json`
+- 建议先复制示例，再按你的需求修改实际目标文件。
+- 中文模式请保持：`"language": "zh-CN"`。
+
+### 18.2 如何编辑 `ai_tools/optimization_goal.json`
+重点字段：
+- `train_period.timerange`：训练区间（例如 `20260501-20260525`）
+- `validation_periods[]`：验证区间列表（建议至少 2~3 段）
+- `target.min_profit_total_pct`：最低目标收益率
+- `target.max_drawdown_pct`：最大回撤限制
+- `target.min_trades` / `target.max_trades`：交易次数上下限
+- `overfit_guard`：防过拟合规则（训练验证收益差、验证 PF、验证回撤等）
+
+### 18.3 推荐运行
+```bash
+python3 ai_tools/auto_optimize_strategy.py \
+  --goal ai_tools/optimization_goal.json \
+  --iterations 5
+```
+
+### 18.4 使用 `--auto-approve`
+```bash
+python3 ai_tools/auto_optimize_strategy.py \
+  --goal ai_tools/optimization_goal.json \
+  --iterations 5 \
+  --auto-approve
+```
+说明：遇到风险提示时自动继续，不再人工确认。
+
+### 18.5 使用 `--skip-download`
+```bash
+python3 ai_tools/auto_optimize_strategy.py \
+  --goal ai_tools/optimization_goal.json \
+  --iterations 5 \
+  --skip-download
+```
+说明：跳过开头的历史数据下载步骤。
+
+### 18.6 仅验证模式
+```bash
+python3 ai_tools/auto_optimize_strategy.py \
+  --goal ai_tools/optimization_goal.json \
+  --validation-only
+```
+
+### 18.7 promote best 策略
+```bash
+python3 ai_tools/auto_optimize_strategy.py \
+  --goal ai_tools/optimization_goal.json \
+  --iterations 5 \
+  --promote-best
+```
+说明：会先备份 `user_data/strategies/MultiCoin_AI_Strategy.py`，再用最佳策略覆盖。
+
+### 18.8 中文交互确认选项
+当未开启 `--auto-approve` 且触发风险时，可输入：
+- `y`：继续
+- `n`：停止
+- `s`：跳过当前策略
+- `b`：查看当前最佳策略
+- `p`：将当前最佳策略提升为正式策略
+
+
+
+### 18.9 启动方式补充
+普通交互式运行：
+```bash
+python3 ai_tools/auto_optimize_strategy.py \
+  --goal ai_tools/optimization_goal.json \
+  --iterations 5
+```
+
+完全使用 JSON，不弹出向导：
+```bash
+python3 ai_tools/auto_optimize_strategy.py \
+  --goal ai_tools/optimization_goal.json \
+  --iterations 5 \
+  --no-wizard
+```
+
+全自动不中途确认：
+```bash
+python3 ai_tools/auto_optimize_strategy.py \
+  --goal ai_tools/optimization_goal.json \
+  --iterations 10 \
+  --auto-approve
+```
+
+修改后保存到 JSON：
+```bash
+python3 ai_tools/auto_optimize_strategy.py \
+  --goal ai_tools/optimization_goal.json \
+  --iterations 5 \
+  --save-goal
+```
