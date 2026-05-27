@@ -21,6 +21,7 @@ from openai import OpenAI
 ROOT_DIR = Path(__file__).resolve().parents[1]
 RESULT_ROOT = ROOT_DIR / "user_data" / "backtest_results" / "ai_optimization_runs"
 GENERATED_DIR = ROOT_DIR / "user_data" / "strategies" / "generated"
+STRATEGY_DIR = ROOT_DIR / "user_data" / "strategies"
 TIMERANGE_RE = re.compile(r"^\d{8}-\d{8}$")
 
 
@@ -249,6 +250,28 @@ def run_cmd(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, cwd=cwd, text=True, capture_output=True)
 
 
+def load_project_env() -> None:
+    env_path = ROOT_DIR / ".env"
+    if not env_path.exists():
+        return
+    for raw in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'").strip('"')
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def validate_strategy_class_name(strategy_file: Path, class_name: str) -> None:
+    content = strategy_file.read_text(encoding="utf-8")
+    pattern = rf"class\s+{re.escape(class_name)}\s*\(\s*IStrategy\s*\)\s*:"
+    if not re.search(pattern, content):
+        raise RuntimeError(f"策略文件类名校验失败：{strategy_file.name} 中未找到 class {class_name}(IStrategy):")
+
+
 def ask_ai(client: OpenAI, model: str, messages: list[dict[str, str]]) -> str:
     res = client.chat.completions.create(model=model, messages=messages, temperature=0.2)
     return (res.choices[0].message.content or "").strip()
@@ -326,27 +349,28 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             print(cp.stderr)
             raise RuntimeError("下载历史数据失败。")
 
-    api_key = os.getenv("OPENAI_API_KEY")
-    client = OpenAI(api_key=api_key, base_url=os.getenv("OPENAI_BASE_URL") or None) if api_key else None
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("未检测到 OPENAI_API_KEY，请检查 .env。")
+    base_url = (os.getenv("OPENAI_BASE_URL") or "").strip() or None
+    model = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
+    client = OpenAI(api_key=api_key, base_url=base_url)
 
     best: dict[str, Any] | None = None
     for i in range(1, iterations + 1):
         ver = f"v{i:03d}"
         class_name = f"{strategy_family}_{ver}"
-        strategy_file = GENERATED_DIR / f"{class_name}.py"
+        strategy_file = STRATEGY_DIR / f"{class_name}.py"
         print(f"正在生成第 {i} 版策略……")
-        if client is None:
-            print("自动优化主流程尚未实现完整 AI 生成：缺少 OPENAI_API_KEY，使用模板策略继续流程。")
-            code = f"""from freqtrade.strategy.interface import IStrategy\nfrom pandas import DataFrame\n\n\nclass {class_name}(IStrategy):\n    timeframe = '{timeframe}'\n    minimal_roi = {{'0': 0.02}}\n    stoploss = -0.03\n    startup_candle_count = 50\n\n    def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:\n        return dataframe\n\n    def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:\n        dataframe.loc[:, 'enter_long'] = 0\n        return dataframe\n\n    def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:\n        dataframe.loc[:, 'exit_long'] = 0\n        return dataframe\n"""
-        else:
-            prompt = (
-                f"请生成完整 freqtrade 策略代码，只输出 Python 代码。类名必须为 {class_name}，继承 IStrategy，"
-                f"timeframe='{timeframe}'，并实现 populate_indicators/populate_entry_trend/populate_exit_trend。"
-            )
-            code = extract_python_code(ask_ai(client, model, [{"role": "user", "content": prompt}]))
+        prompt = (
+            f"请生成完整 freqtrade 策略代码，只输出 Python 代码。类名必须为 {class_name}，继承 IStrategy，"
+            f"timeframe='{timeframe}'，并实现 populate_indicators/populate_entry_trend/populate_exit_trend。"
+        )
+        code = extract_python_code(ask_ai(client, model, [{"role": "user", "content": prompt}]))
         strategy_file.parent.mkdir(parents=True, exist_ok=True)
         strategy_file.write_text(code, encoding="utf-8")
+        GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(strategy_file, GENERATED_DIR / strategy_file.name)
 
         print("正在检查 Python 语法……")
         pyc = run_cmd([sys.executable, "-m", "py_compile", str(strategy_file)], ROOT_DIR)
@@ -354,6 +378,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             print(pyc.stderr)
             print(f"第 {i} 轮语法检查失败，跳过。")
             continue
+        validate_strategy_class_name(strategy_file, class_name)
 
         print(f"正在回测训练区间：{train.timerange}")
         train_cmd = [
@@ -364,6 +389,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         train_cp = run_cmd(train_cmd, ROOT_DIR)
         if train_cp.returncode != 0:
             print(train_cp.stderr)
+            if "Impossible to load Strategy" in (train_cp.stdout + train_cp.stderr):
+                raise RuntimeError(f"第 {i} 轮回测失败：Impossible to load Strategy（{class_name}）。已停止后续轮次。")
             continue
         print("正在解析回测结果……")
         train_metrics = _extract_metrics(parse_backtest_from_zip(latest_backtest_zip(ROOT_DIR / "user_data" / "backtest_results")))
@@ -407,6 +434,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
 
 
 def main() -> None:
+    load_project_env()
     parser = argparse.ArgumentParser()
     parser.add_argument("--goal", default="ai_tools/optimization_goal.json")
     parser.add_argument("--iterations", type=int, default=5)
