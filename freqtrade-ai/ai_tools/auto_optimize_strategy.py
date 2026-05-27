@@ -254,6 +254,57 @@ def run_cmd(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, cwd=cwd, text=True, capture_output=True)
 
 
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _format_pct(value: float) -> str:
+    return f"{value:.2f}%"
+
+
+def _print_round_table(version: str, interval: str, metrics: dict[str, Any]) -> None:
+    trades = _safe_int(metrics.get("total_trades"))
+    profit_pct = _safe_float(metrics.get("profit_total_pct"))
+    profit_abs = _safe_float(metrics.get("profit_total_abs"))
+    winrate = _safe_float(metrics.get("winrate")) * 100.0
+    pf = _safe_float(metrics.get("profit_factor"))
+    max_dd = _safe_float(metrics.get("max_drawdown")) * 100.0
+    roi_profit = _safe_float(metrics.get("roi_profit_total"))
+    stop_loss_abs = _safe_float(metrics.get("stop_loss_abs"))
+    print("版本 | 区间 | 交易数 | 收益率 | 收益USDT | 胜率 | PF | 最大回撤 | ROI收益 | 止损亏损")
+    print(
+        f"{version} | {interval} | {trades} | {_format_pct(profit_pct)} | {profit_abs:.4f} | "
+        f"{_format_pct(winrate)} | {pf:.4f} | {_format_pct(max_dd)} | {_format_pct(roi_profit)} | {stop_loss_abs:.4f}"
+    )
+
+
+def _score_zero_reason(
+    final_score: float,
+    train_metrics: dict[str, Any],
+    validation_metrics: list[dict[str, Any]],
+    validation_score: float,
+) -> str | None:
+    if abs(final_score) > 1e-12:
+        return None
+    if _safe_int(train_metrics.get("total_trades")) == 0:
+        return "训练区间无交易，导致训练分数为0。"
+    if not validation_metrics:
+        return "没有可用的验证区间结果，验证分数按0处理。"
+    if abs(validation_score) <= 1e-12:
+        return "验证分数为0（收益、PF、胜率与回撤综合后接近0）。"
+    return "综合评分公式计算结果为0。"
+
+
 def load_project_env() -> None:
     env_path = ROOT_DIR / ".env"
     if not env_path.exists():
@@ -495,10 +546,14 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     client = OpenAI(api_key=api_key, base_url=base_url)
 
     best: dict[str, Any] | None = None
+    leaderboard: list[dict[str, Any]] = []
+    best_summary_path: Path | None = None
     for i in range(1, iterations + 1):
         ver = f"v{i:03d}"
         class_name = f"{strategy_family}_{ver}"
         strategy_file = STRATEGY_DIR / f"{class_name}.py"
+        version_dir = run_dir / ver
+        version_dir.mkdir(parents=True, exist_ok=True)
         print(f"正在生成第 {i} 版策略……")
         prompt = (
             f"请生成完整 freqtrade 策略代码，只输出 Python 代码。类名必须为 {class_name}，继承 IStrategy，"
@@ -507,6 +562,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         code = extract_python_code(ask_ai(client, model, [{"role": "user", "content": prompt}]))
         strategy_file.parent.mkdir(parents=True, exist_ok=True)
         strategy_file.write_text(code, encoding="utf-8")
+        shutil.copy2(strategy_file, version_dir / "strategy.py")
         GENERATED_DIR.mkdir(parents=True, exist_ok=True)
         shutil.copy2(strategy_file, GENERATED_DIR / strategy_file.name)
 
@@ -525,6 +581,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "--timerange", train.timerange, "--export", "trades", "--cache", "none",
         ]
         train_cp = run_cmd(train_cmd, ROOT_DIR)
+        (version_dir / "backtest_logs.txt").write_text(
+            f"[Train {train.timerange}]\nSTDOUT:\n{train_cp.stdout}\n\nSTDERR:\n{train_cp.stderr}\n",
+            encoding="utf-8",
+        )
         if train_cp.returncode != 0:
             print(train_cp.stderr)
             if "Impossible to load Strategy" in (train_cp.stdout + train_cp.stderr):
@@ -532,24 +592,41 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             continue
         print("正在解析回测结果……")
         train_metrics = _extract_metrics(parse_backtest_from_zip(latest_backtest_zip(ROOT_DIR / "user_data" / "backtest_results")))
+        write_json(version_dir / "train_metrics.json", train_metrics)
         train_score = _score(train_metrics, train)
+        _print_round_table(ver, train.timerange, train_metrics)
 
         val_scores = []
+        validation_metrics: list[dict[str, Any]] = []
         for p in validations:
             print(f"正在回测验证区间：{p.timerange}")
             vcmd = train_cmd.copy()
             vcmd[vcmd.index("--timerange") + 1] = p.timerange
             val_cp = run_cmd(vcmd, ROOT_DIR)
+            with (version_dir / "backtest_logs.txt").open("a", encoding="utf-8") as logf:
+                logf.write(f"\n[Validation {p.name} {p.timerange}]\nSTDOUT:\n{val_cp.stdout}\n\nSTDERR:\n{val_cp.stderr}\n")
             if val_cp.returncode != 0:
                 print(val_cp.stderr)
                 continue
             print("正在解析回测结果……")
             vm = _extract_metrics(parse_backtest_from_zip(latest_backtest_zip(ROOT_DIR / "user_data" / "backtest_results")))
+            validation_metrics.append({"period": p.name, "timerange": p.timerange, "metrics": vm})
+            _print_round_table(ver, p.timerange, vm)
             val_scores.append(_score(vm, p))
         validation_score = sum(val_scores) / len(val_scores) if val_scores else 0.0
+        write_json(
+            version_dir / "validation_metrics.json",
+            {
+                "periods": validation_metrics,
+                "average_score": validation_score,
+            },
+        )
         overfit_penalty = max(0.0, train_score - validation_score) * 0.3
         final_score = train_score * 0.6 + validation_score * 0.4 - overfit_penalty
         is_overfit = train_score > validation_score * 1.3 if validation_score else True
+        zero_reason = _score_zero_reason(final_score, train_metrics, validation_metrics, validation_score)
+        if zero_reason:
+            print(f"第 {i} 轮 final_score 为 0，原因：{zero_reason}")
 
         round_data = {
             "iteration": i, "class_name": class_name, "strategy_file": str(strategy_file),
@@ -558,15 +635,71 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         }
         write_json(run_dir / f"round_{i:03d}.json", round_data)
         is_best = best is None or final_score > float(best["final_score"])
+        score_breakdown = {
+            "train_score": train_score,
+            "validation_score": validation_score,
+            "overfit_penalty": overfit_penalty,
+            "formula": "final_score = train_score*0.6 + validation_score*0.4 - overfit_penalty",
+            "zero_score_reason": zero_reason,
+        }
+        summary = {
+            "strategy_class": class_name,
+            "strategy_file": str(strategy_file),
+            "train_metrics": train_metrics,
+            "validation_metrics": validation_metrics,
+            "score_breakdown": score_breakdown,
+            "overfit_result": {
+                "is_overfit": is_overfit,
+                "train_score": train_score,
+                "validation_score": validation_score,
+            },
+            "final_score": final_score,
+            "is_best": is_best,
+        }
+        summary_path = version_dir / "summary.json"
+        write_json(summary_path, summary)
+        avg_validation_profit_pct = (
+            sum(_safe_float(item["metrics"].get("profit_total_pct")) for item in validation_metrics) / len(validation_metrics)
+            if validation_metrics else 0.0
+        )
+        leaderboard_entry = {
+            "version": ver,
+            "strategy_class": class_name,
+            "final_score": final_score,
+            "train_profit_pct": _safe_float(train_metrics.get("profit_total_pct")),
+            "avg_validation_profit_pct": avg_validation_profit_pct,
+            "profit_factor": _safe_float(train_metrics.get("profit_factor")),
+            "max_drawdown_pct": _safe_float(train_metrics.get("max_drawdown")) * 100.0,
+            "total_trades": _safe_int(train_metrics.get("total_trades")),
+            "is_overfit": is_overfit,
+            "is_best": False,
+        }
+        leaderboard.append(leaderboard_entry)
         if is_best:
             best = round_data
+            best_summary_path = summary_path
             write_json(run_dir / "best_strategy.json", best)
             shutil.copy2(strategy_file, GENERATED_DIR / f"BEST_{strategy_family}.py")
         print(f"第 {i} 轮完成")
         print(f"是否成为新最佳：{'是' if is_best else '否'}")
 
+    leaderboard_sorted = sorted(leaderboard, key=lambda x: float(x["final_score"]), reverse=True)
+    best_version = None
     if best:
-        print(f"自动优化完成，最佳策略：{best['class_name']}，得分：{best['final_score']:.4f}")
+        best_version = f"v{int(best['iteration']):03d}"
+    for row in leaderboard_sorted:
+        row["is_best"] = row["version"] == best_version
+    write_json(run_dir / "leaderboard.json", {"items": leaderboard_sorted})
+
+    if best:
+        best_strategy_file = run_dir / best_version / "strategy.py" if best_version else Path(best["strategy_file"])
+        print("自动优化完成")
+        print(f"- 最佳策略: {best['class_name']}")
+        print(f"- 最佳得分: {best['final_score']:.4f}")
+        print(f"- 最佳策略文件路径: {best_strategy_file}")
+        print(f"- leaderboard.json 路径: {run_dir / 'leaderboard.json'}")
+        if best_summary_path:
+            print(f"- summary.json 路径: {best_summary_path}")
     else:
         print("自动优化结束：没有可用策略通过流程。")
 
