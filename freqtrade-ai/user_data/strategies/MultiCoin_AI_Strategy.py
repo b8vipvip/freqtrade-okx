@@ -46,14 +46,15 @@ class MultiCoin_AI_Strategy(IStrategy):
 
     @informative("1h")
     def populate_indicators_1h(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        dataframe["ema200"] = ta.EMA(dataframe, timeperiod=200)
+        dataframe["ema_200"] = ta.EMA(dataframe, timeperiod=200)
         dataframe["rsi"] = ta.RSI(dataframe, timeperiod=14)
         return dataframe
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        dataframe["ema20"] = ta.EMA(dataframe, timeperiod=20)
-        dataframe["ema50"] = ta.EMA(dataframe, timeperiod=50)
-        dataframe["ema100"] = ta.EMA(dataframe, timeperiod=100)
+        dataframe["ema_20"] = ta.EMA(dataframe, timeperiod=20)
+        dataframe["ema_50"] = ta.EMA(dataframe, timeperiod=50)
+        dataframe["ema_100"] = ta.EMA(dataframe, timeperiod=100)
+        dataframe["ema_200"] = ta.EMA(dataframe, timeperiod=200)
         dataframe["rsi"] = ta.RSI(dataframe, timeperiod=14)
 
         macd = ta.MACD(dataframe, fastperiod=12, slowperiod=26, signalperiod=9)
@@ -66,11 +67,11 @@ class MultiCoin_AI_Strategy(IStrategy):
         dataframe.loc[
             (
                 # 1h context: trade only with medium/long trend tailwind
-                (dataframe["close_1h"] > dataframe["ema200_1h"])
+                (dataframe["close_1h"] > dataframe["ema_200_1h"])
                 & (dataframe["rsi_1h"] > 50)
                 # 5m alignment: reduce low-quality churn entries
-                & (dataframe["close"] > dataframe["ema50"])
-                & (dataframe["ema20"] > dataframe["ema50"])
+                & (dataframe["close"] > dataframe["ema_50"])
+                & (dataframe["ema_20"] > dataframe["ema_50"])
                 & (dataframe["rsi"] >= 45)
                 & (dataframe["rsi"] <= 68)
                 & (dataframe["macd"] > dataframe["macdsignal"])
@@ -87,11 +88,11 @@ class MultiCoin_AI_Strategy(IStrategy):
             (
                 (
                     # Extreme trend break only (kept as fallback if use_exit_signal is enabled)
-                    (dataframe["close"] < dataframe["ema200"])
-                    | ((dataframe["close"] < dataframe["ema100"]) & (dataframe["rsi"] < 35))
+                    (dataframe["close"] < dataframe["ema_200"])
+                    | ((dataframe["close"] < dataframe["ema_100"]) & (dataframe["rsi"] < 35))
                     | (
-                        (dataframe["ema20"] < dataframe["ema50"])
-                        & (dataframe["ema50"] < dataframe["ema100"])
+                        (dataframe["ema_20"] < dataframe["ema_50"])
+                        & (dataframe["ema_50"] < dataframe["ema_100"])
                         & (dataframe["macd"] < dataframe["macdsignal"])
                     )
                 )
