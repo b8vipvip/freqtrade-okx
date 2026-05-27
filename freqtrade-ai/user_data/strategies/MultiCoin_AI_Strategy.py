@@ -105,6 +105,19 @@ class MultiCoin_AI_Strategy(IStrategy):
 
         entry_mask = continuation_entry | pullback_entry
 
+        # ETH is the largest drag in recent runs, so gate entries with stricter
+        # multi-timeframe trend confirmation to reduce low-quality trades.
+        if "ETH/USDT" in pair:
+            eth_filter = (
+                (dataframe["close_1h"] > dataframe["ema_200_1h"])
+                & (dataframe["rsi_1h"] > 50)
+                & (dataframe["close"] > dataframe["ema_100"])
+                & (dataframe["ema_20"] > dataframe["ema_50"])
+                & (dataframe["rsi"] >= 46)
+                & (dataframe["adx"] > 18)
+            )
+            entry_mask = entry_mask & eth_filter
+
         # DOGE underperformed, so apply stricter filter to cut weak/flat entries.
         if "DOGE/USDT" in pair:
             doge_filter = (
