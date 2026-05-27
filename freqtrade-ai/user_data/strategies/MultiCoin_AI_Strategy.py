@@ -35,12 +35,12 @@ class MultiCoin_AI_Strategy(IStrategy):
 
     # Exits rely primarily on ROI/stoploss to avoid loss-heavy signal exits.
     use_exit_signal = False
-    stoploss = -0.055
+    stoploss = -0.045
 
     protections = [
         {
             "method": "CooldownPeriod",
-            "stop_duration_candles": 3,
+            "stop_duration_candles": 2,
         }
     ]
 
@@ -67,27 +67,56 @@ class MultiCoin_AI_Strategy(IStrategy):
         return dataframe
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        dataframe.loc[
-            (
-                # 1h context: trade only with medium/long trend tailwind
-                (dataframe["close_1h"] > dataframe["ema_200_1h"])
-                & (dataframe["rsi_1h"] > 50)
-                # 5m alignment: reduce low-quality churn entries
-                & (dataframe["close"] > dataframe["ema_50"])
-                & (dataframe["close"] > dataframe["ema_100"])
-                & (dataframe["ema_20"] > dataframe["ema_50"])
-                & (dataframe["ema_50"] > dataframe["ema_100"])
-                & (dataframe["rsi"] >= 45)
-                & (dataframe["rsi"] <= 62)
-                & (dataframe["adx"] > 18)
-                & (dataframe["atr_pct"] > 0.002)
-                & (dataframe["atr_pct"] < 0.03)
-                & (dataframe["macd"] > dataframe["macdsignal"])
-                & (dataframe["macd"] > 0)
-                & (dataframe["volume"] > 0)
-            ),
-            "enter_long",
-        ] = 1
+        pair = metadata.get("pair", "")
+
+        # Core gate: keep strong 1h bias and positive liquidity.
+        base_guard = (
+            (dataframe["close_1h"] > dataframe["ema_200_1h"])
+            & (dataframe["rsi_1h"] > 48)
+            & (dataframe["close"] > dataframe["ema_50"])
+            & (dataframe["ema_20"] > dataframe["ema_50"])
+            & (dataframe["rsi"] >= 42)
+            & (dataframe["rsi"] <= 66)
+            & (dataframe["adx"] > 15)
+            & (dataframe["atr_pct"] > 0.0018)
+            & (dataframe["atr_pct"] < 0.028)
+            & (dataframe["macd"] > dataframe["macdsignal"])
+            & (dataframe["volume"] > 0)
+        )
+
+        # Continuation setup: slightly looser to raise total trade count.
+        continuation_entry = (
+            base_guard
+            & (dataframe["close"] > dataframe["ema_100"])
+            & (dataframe["ema_50"] > dataframe["ema_100"])
+            & (dataframe["macd"] > 0)
+        )
+
+        # Pullback-recovery setup: buy dip recoveries inside uptrend, avoiding weak tape.
+        pullback_entry = (
+            base_guard
+            & (dataframe["close"] > dataframe["ema_200"])
+            & (dataframe["close"] > (dataframe["ema_20"] * 0.995))
+            & (dataframe["rsi"] >= 44)
+            & (dataframe["rsi"] <= 58)
+            & (dataframe["adx"] > 17)
+            & (dataframe["macd"] > (dataframe["macdsignal"] * 0.985))
+        )
+
+        entry_mask = continuation_entry | pullback_entry
+
+        # DOGE underperformed, so apply stricter filter to cut weak/flat entries.
+        if "DOGE/USDT" in pair:
+            doge_filter = (
+                (dataframe["close_1h"] > (dataframe["ema_200_1h"] * 1.002))
+                & (dataframe["rsi_1h"] > 52)
+                & (dataframe["adx"] > 20)
+                & (dataframe["atr_pct"] > 0.0022)
+                & (dataframe["rsi"] >= 46)
+            )
+            entry_mask = entry_mask & doge_filter
+
+        dataframe.loc[entry_mask, "enter_long"] = 1
 
         return dataframe
 
