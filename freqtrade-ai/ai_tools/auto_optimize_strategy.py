@@ -129,7 +129,12 @@ def run_wizard(goal: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]
     runtime["timeframe"] = ask_text("主周期 timeframe", str(runtime.get("timeframe", args.timeframe)))
 
     runtime.setdefault("train_period", {})
-    runtime["train_period"]["timerange"] = ask_timerange("训练区间", str(runtime["train_period"].get("timerange", args.timerange)))
+    default_train_timerange = (
+        runtime.get("train_period", {}).get("timerange")
+        or getattr(args, "timerange", None)
+        or "20260501-20260525"
+    )
+    runtime["train_period"]["timerange"] = ask_timerange("训练区间", str(default_train_timerange))
     runtime["train_period"]["name"] = runtime["train_period"].get("name", "train")
     runtime["train_period"]["weight"] = float(runtime["train_period"].get("weight", 1.0))
 
@@ -260,6 +265,7 @@ def main() -> None:
     parser.add_argument("--config", default="user_data/config.5coins.json")
     parser.add_argument("--base-strategy", default="MultiCoin_AI_Strategy")
     parser.add_argument("--timeframe", default="5m")
+    parser.add_argument("--timerange", default=None, help="训练回测区间，例如 20260501-20260525")
     args = parser.parse_args()
 
     goal_path = ROOT_DIR / args.goal
