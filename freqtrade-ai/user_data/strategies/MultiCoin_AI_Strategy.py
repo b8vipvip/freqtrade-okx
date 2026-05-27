@@ -27,15 +27,15 @@ class MultiCoin_AI_Strategy(IStrategy):
 
     # Keep ROI-based exits available.
     minimal_roi = {
-        "0": 0.030,
-        "60": 0.018,
-        "180": 0.010,
+        "0": 0.022,
+        "60": 0.012,
+        "180": 0.008,
         "360": 0.0,
     }
 
     # Exits rely primarily on ROI/stoploss to avoid loss-heavy signal exits.
     use_exit_signal = False
-    stoploss = -0.065
+    stoploss = -0.040
 
     protections = [
         {
@@ -46,14 +46,15 @@ class MultiCoin_AI_Strategy(IStrategy):
 
     @informative("1h")
     def populate_indicators_1h(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        dataframe["ema200"] = ta.EMA(dataframe, timeperiod=200)
+        dataframe["ema_200"] = ta.EMA(dataframe, timeperiod=200)
         dataframe["rsi"] = ta.RSI(dataframe, timeperiod=14)
         return dataframe
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        dataframe["ema20"] = ta.EMA(dataframe, timeperiod=20)
-        dataframe["ema50"] = ta.EMA(dataframe, timeperiod=50)
-        dataframe["ema100"] = ta.EMA(dataframe, timeperiod=100)
+        dataframe["ema_20"] = ta.EMA(dataframe, timeperiod=20)
+        dataframe["ema_50"] = ta.EMA(dataframe, timeperiod=50)
+        dataframe["ema_100"] = ta.EMA(dataframe, timeperiod=100)
+        dataframe["ema_200"] = ta.EMA(dataframe, timeperiod=200)
         dataframe["rsi"] = ta.RSI(dataframe, timeperiod=14)
 
         macd = ta.MACD(dataframe, fastperiod=12, slowperiod=26, signalperiod=9)
@@ -66,11 +67,16 @@ class MultiCoin_AI_Strategy(IStrategy):
         dataframe.loc[
             (
                 # 1h context: trade only with medium/long trend tailwind
-                (dataframe["close_1h"] > dataframe["ema200_1h"])
+                (dataframe["close_1h"] > dataframe["ema_200_1h"])
                 & (dataframe["rsi_1h"] > 50)
+                # Explicitly avoid obvious 1h bearish context
+                & ~((dataframe["close_1h"] < dataframe["ema_200_1h"]) & (dataframe["rsi_1h"] < 45))
                 # 5m alignment: reduce low-quality churn entries
-                & (dataframe["close"] > dataframe["ema50"])
-                & (dataframe["ema20"] > dataframe["ema50"])
+                & (dataframe["close"] > dataframe["ema_50"])
+                & (dataframe["close"] > dataframe["ema_100"])
+                & (dataframe["ema_20"] > dataframe["ema_50"])
+                # Avoid short-term bearish structure that often drifts to stoploss
+                & ~((dataframe["close"] < dataframe["ema_100"]) & (dataframe["ema_20"] < dataframe["ema_50"]))
                 & (dataframe["rsi"] >= 45)
                 & (dataframe["rsi"] <= 68)
                 & (dataframe["macd"] > dataframe["macdsignal"])
@@ -87,11 +93,11 @@ class MultiCoin_AI_Strategy(IStrategy):
             (
                 (
                     # Extreme trend break only (kept as fallback if use_exit_signal is enabled)
-                    (dataframe["close"] < dataframe["ema200"])
-                    | ((dataframe["close"] < dataframe["ema100"]) & (dataframe["rsi"] < 35))
+                    (dataframe["close"] < dataframe["ema_200"])
+                    | ((dataframe["close"] < dataframe["ema_100"]) & (dataframe["rsi"] < 35))
                     | (
-                        (dataframe["ema20"] < dataframe["ema50"])
-                        & (dataframe["ema50"] < dataframe["ema100"])
+                        (dataframe["ema_20"] < dataframe["ema_50"])
+                        & (dataframe["ema_50"] < dataframe["ema_100"])
                         & (dataframe["macd"] < dataframe["macdsignal"])
                     )
                 )
