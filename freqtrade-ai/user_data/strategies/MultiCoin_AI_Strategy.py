@@ -27,15 +27,15 @@ class MultiCoin_AI_Strategy(IStrategy):
 
     # Keep ROI-based exits available.
     minimal_roi = {
-        "0": 0.030,
-        "60": 0.018,
-        "180": 0.010,
+        "0": 0.032,
+        "90": 0.020,
+        "240": 0.012,
         "360": 0.0,
     }
 
     # Exits rely primarily on ROI/stoploss to avoid loss-heavy signal exits.
     use_exit_signal = False
-    stoploss = -0.065
+    stoploss = -0.055
 
     protections = [
         {
@@ -56,6 +56,9 @@ class MultiCoin_AI_Strategy(IStrategy):
         dataframe["ema_100"] = ta.EMA(dataframe, timeperiod=100)
         dataframe["ema_200"] = ta.EMA(dataframe, timeperiod=200)
         dataframe["rsi"] = ta.RSI(dataframe, timeperiod=14)
+        dataframe["adx"] = ta.ADX(dataframe, timeperiod=14)
+        dataframe["atr"] = ta.ATR(dataframe, timeperiod=14)
+        dataframe["atr_pct"] = dataframe["atr"] / dataframe["close"]
 
         macd = ta.MACD(dataframe, fastperiod=12, slowperiod=26, signalperiod=9)
         dataframe["macd"] = macd["macd"]
@@ -71,9 +74,14 @@ class MultiCoin_AI_Strategy(IStrategy):
                 & (dataframe["rsi_1h"] > 50)
                 # 5m alignment: reduce low-quality churn entries
                 & (dataframe["close"] > dataframe["ema_50"])
+                & (dataframe["close"] > dataframe["ema_100"])
                 & (dataframe["ema_20"] > dataframe["ema_50"])
+                & (dataframe["ema_50"] > dataframe["ema_100"])
                 & (dataframe["rsi"] >= 45)
-                & (dataframe["rsi"] <= 68)
+                & (dataframe["rsi"] <= 62)
+                & (dataframe["adx"] > 18)
+                & (dataframe["atr_pct"] > 0.002)
+                & (dataframe["atr_pct"] < 0.03)
                 & (dataframe["macd"] > dataframe["macdsignal"])
                 & (dataframe["macd"] > 0)
                 & (dataframe["volume"] > 0)
