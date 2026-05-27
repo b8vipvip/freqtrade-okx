@@ -13,8 +13,11 @@ import sys
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
+
+import pandas as pd
 
 from openai import OpenAI
 
@@ -165,6 +168,7 @@ def run_wizard(goal: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]
         "数据下载区间", str(runtime["data_download"].get("download_timerange", runtime["train_period"]["timerange"]))
     )
     runtime["data_download"]["auto_download"] = ask_bool("是否自动下载数据", bool(runtime["data_download"].get("auto_download", True)))
+    runtime["runtime_force_download"] = ask_bool("是否强制重新下载历史数据", bool(runtime.get("runtime_force_download", False)))
 
     default_iter = args.iterations if args.iterations else int(runtime.get("max_iterations", 5))
     runtime["max_iterations"] = ask_int("最大迭代轮数", int(default_iter))
@@ -325,6 +329,152 @@ def _score(metrics: dict[str, Any], period: PeriodDef) -> float:
     ) * period.weight
 
 
+
+
+def _parse_timerange(timerange: str) -> tuple[pd.Timestamp, pd.Timestamp]:
+    if not TIMERANGE_RE.match(timerange):
+        raise ValueError(f"无效时间区间格式: {timerange}")
+    start_s, end_s = timerange.split("-", 1)
+    start = pd.to_datetime(start_s, format="%Y%m%d", utc=True)
+    end = pd.to_datetime(end_s, format="%Y%m%d", utc=True)
+    return start, end
+
+
+def _pair_candidates(pair: str) -> list[str]:
+    base = pair.replace(":", "").replace("/", "_")
+    return [base, base.lower(), base.upper()]
+
+
+def _find_data_file(data_dir: Path, pair: str, timeframe: str) -> Path | None:
+    exts = ("feather", "parquet", "json", "json.gz")
+    for pair_key in _pair_candidates(pair):
+        for ext in exts:
+            matches = sorted(data_dir.glob(f"**/{pair_key}-{timeframe}.{ext}"))
+            if matches:
+                return matches[0]
+    return None
+
+
+@lru_cache(maxsize=256)
+def _read_data_coverage(file_path: str) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+    p = Path(file_path)
+    try:
+        if p.suffix == ".feather":
+            df = pd.read_feather(p, columns=["date"])
+        elif p.suffix == ".parquet":
+            df = pd.read_parquet(p, columns=["date"])
+        else:
+            df = pd.read_json(p, compression="infer")
+    except Exception:
+        return None
+    if "date" not in df.columns or df.empty:
+        return None
+    dates = pd.to_datetime(df["date"], utc=True, errors="coerce").dropna()
+    if dates.empty:
+        return None
+    return dates.min(), dates.max()
+
+
+def check_local_data_coverage(goal: dict[str, Any]) -> dict[str, Any]:
+    config_path = ROOT_DIR / str(goal.get("config", ""))
+    config_data = read_json(config_path) if config_path.exists() else {}
+    exchange = str(config_data.get("exchange", {}).get("name") or goal.get("exchange") or "okx").lower()
+    pair_whitelist = config_data.get("exchange", {}).get("pair_whitelist", [])
+    if not isinstance(pair_whitelist, list):
+        pair_whitelist = []
+    timeframes = goal.get("data_download", {}).get("timeframes") or [goal.get("timeframe", "5m"), "1h"]
+    timeframes = [str(tf) for tf in timeframes]
+
+    needed_ranges = [goal.get("data_download", {}).get("download_timerange"), goal.get("train_period", {}).get("timerange")]
+    needed_ranges.extend([x.get("timerange") for x in goal.get("validation_periods", []) if isinstance(x, dict)])
+    needed_ranges = [x for x in needed_ranges if isinstance(x, str) and TIMERANGE_RE.match(x)]
+
+    min_start: pd.Timestamp | None = None
+    max_end: pd.Timestamp | None = None
+    for tr in needed_ranges:
+        s, e = _parse_timerange(tr)
+        min_start = s if min_start is None else min(min_start, s)
+        max_end = e if max_end is None else max(max_end, e)
+
+    data_dir = ROOT_DIR / "user_data" / "data" / exchange
+    missing: list[dict[str, str]] = []
+    insufficient: list[dict[str, str]] = []
+
+    for pair in pair_whitelist:
+        for tf in timeframes:
+            data_file = _find_data_file(data_dir, pair, tf)
+            if data_file is None:
+                missing.append({"pair": pair, "timeframe": tf})
+                continue
+            coverage = _read_data_coverage(str(data_file))
+            if coverage is None or min_start is None or max_end is None:
+                continue
+            local_start, local_end = coverage
+            if local_start > min_start or local_end < max_end:
+                insufficient.append({
+                    "pair": pair,
+                    "timeframe": tf,
+                    "local": f"{local_start.strftime('%Y%m%d')}-{local_end.strftime('%Y%m%d')}",
+                    "required": f"{min_start.strftime('%Y%m%d')}-{max_end.strftime('%Y%m%d')}",
+                })
+
+    return {
+        "exchange": exchange,
+        "pair_whitelist": pair_whitelist,
+        "timeframes": timeframes,
+        "download_timerange": goal.get("data_download", {}).get("download_timerange"),
+        "required_range": None if min_start is None or max_end is None else f"{min_start.strftime('%Y%m%d')}-{max_end.strftime('%Y%m%d')}",
+        "missing": missing,
+        "insufficient": insufficient,
+        "is_covered": not missing and not insufficient,
+    }
+
+
+def maybe_download_data(runtime_goal: dict[str, Any], args: argparse.Namespace, train_timerange: str) -> None:
+    if args.skip_download:
+        print("已启用 --skip-download：直接跳过数据下载。")
+        return
+
+    dcfg = runtime_goal.setdefault("data_download", {})
+    if not dcfg.get("auto_download", True):
+        print("配置 data_download.auto_download=false，跳过数据下载。")
+        return
+
+    if not dcfg.get("timeframes"):
+        dcfg["timeframes"] = [runtime_goal.get("timeframe", args.timeframe), "1h"]
+
+    if args.force_download:
+        print("已启用 --force-download：强制重新下载历史数据。")
+    else:
+        coverage = check_local_data_coverage(runtime_goal)
+        if coverage["is_covered"]:
+            print("本地历史数据已存在，覆盖目标区间，跳过下载。")
+            return
+        if coverage["missing"]:
+            print("缺少数据：")
+            for item in coverage["missing"]:
+                print(f"- {item['pair']} {item['timeframe']}")
+        for item in coverage["insufficient"]:
+            print(
+                f"{item['pair']} {item['timeframe']} 本地数据范围为 {item['local']}，"
+                f"但目标需要 {item['required']}，将执行补充下载。"
+            )
+        print("将执行 download-data 补齐。")
+
+    dtr = str(dcfg.get("download_timerange", train_timerange))
+    exchange = str(read_json(ROOT_DIR / runtime_goal["config"]).get("exchange", {}).get("name", "okx")).lower()
+    tf_list = [str(x) for x in dcfg.get("timeframes", [])]
+    cmd = [
+        "docker", "compose", "run", "--rm", "freqtrade", "download-data",
+        "--config", str(runtime_goal.get("config", args.config)), "--exchange", exchange,
+        "--timeframes", *tf_list, "--timerange", dtr, "--prepend",
+    ]
+    cp = run_cmd(cmd, ROOT_DIR)
+    print(cp.stdout)
+    if cp.returncode != 0:
+        print(cp.stderr)
+        raise RuntimeError("下载历史数据失败。")
+
 def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace, run_dir: Path) -> None:
     config = str(runtime_goal.get("config", args.config))
     timeframe = str(runtime_goal.get("timeframe", args.timeframe))
@@ -335,19 +485,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     if not train.timerange:
         raise RuntimeError("缺少训练区间 train_period.timerange，无法继续。")
 
-    if runtime_goal.get("data_download", {}).get("auto_download", True) and not args.skip_download:
-        print("正在下载历史数据……")
-        dtr = str(runtime_goal.get("data_download", {}).get("download_timerange", train.timerange))
-        cmd = [
-            "docker", "compose", "run", "--rm", "freqtrade", "download-data",
-            "--config", config, "--exchange", "okx",
-            "--timeframes", "5m", "1h", "--timerange", dtr, "--prepend",
-        ]
-        cp = run_cmd(cmd, ROOT_DIR)
-        print(cp.stdout)
-        if cp.returncode != 0:
-            print(cp.stderr)
-            raise RuntimeError("下载历史数据失败。")
+    maybe_download_data(runtime_goal, args, train.timerange)
 
     api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
     if not api_key:
@@ -440,6 +578,7 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--auto-approve", action="store_true")
     parser.add_argument("--skip-download", action="store_true")
+    parser.add_argument("--force-download", action="store_true")
     parser.add_argument("--no-wizard", action="store_true")
     parser.add_argument("--save-goal", action="store_true")
     parser.add_argument("--config", default="user_data/config.5coins.json")
@@ -456,6 +595,8 @@ def main() -> None:
     runtime_goal = goal if args.no_wizard else run_wizard(goal, args)
     if runtime_goal.get("runtime_auto_approve", False):
         args.auto_approve = True
+    if runtime_goal.get("runtime_force_download", False):
+        args.force_download = True
 
     if args.save_goal:
         write_json(goal_path, runtime_goal)

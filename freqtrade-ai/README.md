@@ -155,7 +155,23 @@ python3 ai_tools/auto_optimize_strategy.py \
 ```
 说明：遇到风险提示时自动继续，不再人工确认。
 
-### 18.5 使用 `--skip-download`
+### 18.5 历史数据下载策略（默认）
+- 脚本启动后会先检查 `user_data/data/<exchange>/` 本地历史数据。
+- 检查维度包括：交易所、`pair_whitelist`、`timeframes`、下载区间/训练区间/验证区间。
+- 若本地数据已覆盖目标区间，将输出“本地历史数据已存在，覆盖目标区间，跳过下载。”
+- 若有缺失或覆盖不足，会输出中文明细并自动执行一次 `download-data` 补齐。
+- 下载仅在自动优化开始前执行一次，后续每轮回测复用本地数据。
+
+### 18.6 使用 `--force-download`
+```bash
+python3 ai_tools/auto_optimize_strategy.py \
+  --goal ai_tools/optimization_goal.json \
+  --iterations 5 \
+  --force-download
+```
+说明：无论本地数据是否存在，都强制重新下载历史数据。
+
+### 18.6 使用 `--skip-download`
 ```bash
 python3 ai_tools/auto_optimize_strategy.py \
   --goal ai_tools/optimization_goal.json \
@@ -164,14 +180,14 @@ python3 ai_tools/auto_optimize_strategy.py \
 ```
 说明：跳过开头的历史数据下载步骤。
 
-### 18.6 仅验证模式
+### 18.7 仅验证模式
 ```bash
 python3 ai_tools/auto_optimize_strategy.py \
   --goal ai_tools/optimization_goal.json \
   --validation-only
 ```
 
-### 18.7 promote best 策略
+### 18.8 promote best 策略
 ```bash
 python3 ai_tools/auto_optimize_strategy.py \
   --goal ai_tools/optimization_goal.json \
@@ -180,7 +196,7 @@ python3 ai_tools/auto_optimize_strategy.py \
 ```
 说明：会先备份 `user_data/strategies/MultiCoin_AI_Strategy.py`，再用最佳策略覆盖。
 
-### 18.8 中文交互确认选项
+### 18.9 中文交互确认选项
 当未开启 `--auto-approve` 且触发风险时，可输入：
 - `y`：继续
 - `n`：停止
@@ -190,7 +206,7 @@ python3 ai_tools/auto_optimize_strategy.py \
 
 
 
-### 18.9 启动方式补充
+### 18.10 启动方式补充
 普通交互式运行：
 ```bash
 python3 ai_tools/auto_optimize_strategy.py \
