@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime
@@ -170,7 +171,7 @@ def run_wizard(goal: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]
     runtime["data_download"]["auto_download"] = ask_bool("是否自动下载数据", bool(runtime["data_download"].get("auto_download", True)))
     runtime["runtime_force_download"] = ask_bool("是否强制重新下载历史数据", bool(runtime.get("runtime_force_download", False)))
 
-    default_iter = args.iterations if args.iterations else int(runtime.get("max_iterations", 5))
+    default_iter = args.iterations if args.iterations is not None else int(runtime.get("max_iterations", 5))
     runtime["max_iterations"] = ask_int("最大迭代轮数", int(default_iter))
 
     auto_default = bool(args.auto_approve)
@@ -236,18 +237,44 @@ def extract_python_code(content: str) -> str:
     return (m.group(1) if m else content).strip() + "\n"
 
 
-def latest_backtest_zip(results_dir: Path) -> Path:
-    zips = sorted(results_dir.glob("backtest-result-*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not zips:
-        raise FileNotFoundError("未找到 backtest-result-*.zip")
-    return zips[0]
+def _list_backtest_zips(results_dir: Path) -> list[Path]:
+    return sorted(results_dir.glob("backtest-result-*.zip"), key=lambda p: p.stat().st_mtime)
 
 
-def parse_backtest_from_zip(zip_path: Path) -> dict[str, Any]:
+def _select_backtest_zip(results_dir: Path, before_set: set[Path], cmd_end_ts: float) -> Path:
+    all_zips = _list_backtest_zips(results_dir)
+    new_zips = [z for z in all_zips if z not in before_set]
+    candidates = new_zips if new_zips else [z for z in all_zips if z.stat().st_mtime >= cmd_end_ts]
+    if not candidates:
+        raise FileNotFoundError("未找到本轮回测新增的 backtest-result-*.zip")
+    return sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)[0]
+
+
+def parse_backtest_from_zip(zip_path: Path, strategy_class: str) -> dict[str, Any]:
+    print(f"正在解析 zip: {zip_path}")
     with zipfile.ZipFile(zip_path) as zf:
-        names = [n for n in zf.namelist() if n.endswith('.json') and not n.endswith('.meta.json') and not n.endswith('_config.json')]
-        with zf.open(names[0]) as fp:
-            return json.load(fp)
+        names = [
+            n for n in zf.namelist()
+            if n.endswith('.json')
+            and not n.endswith('.meta.json')
+            and not n.endswith('_config.json')
+        ]
+        primary = [n for n in names if Path(n).name.startswith("backtest-result-")]
+        if not primary:
+            raise RuntimeError(f"zip 内未找到 backtest-result-*.json: {zip_path}")
+        json_name = sorted(primary)[-1]
+        print(f"正在读取 json: {json_name}")
+        with zf.open(json_name) as fp:
+            data = json.load(fp)
+
+    strategy_data = data.get("strategy")
+    if not isinstance(strategy_data, dict):
+        raise RuntimeError("回测结果缺少 strategy 字段")
+    if strategy_class not in strategy_data:
+        raise RuntimeError(f"未在回测结果中找到当前策略 {strategy_class}")
+    result = strategy_data[strategy_class]
+    print(f"找到策略: {strategy_class}")
+    return result
 
 
 def run_cmd(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -332,6 +359,81 @@ def ask_ai(client: OpenAI, model: str, messages: list[dict[str, str]]) -> str:
     return (res.choices[0].message.content or "").strip()
 
 
+
+def has_enter_long_assignment(strategy_file: Path) -> bool:
+    content = strategy_file.read_text(encoding="utf-8")
+    if "populate_entry_trend" not in content:
+        return False
+    entry_func = re.search(
+        r"def\s+populate_entry_trend\s*\(.*?\):(?P<body>.*?)(?:\n\s*def\s+|\Z)",
+        content,
+        flags=re.DOTALL,
+    )
+    if not entry_func:
+        return False
+    body = entry_func.group("body")
+    return bool(re.search(r"enter_long\s*\]\s*=\s*1|enter_long\s*=\s*1", body))
+
+
+def _validate_round(train_metrics: dict[str, Any], validation_metrics: list[dict[str, Any]], final_score: float) -> tuple[bool, str | None]:
+    train_trades = _safe_int(train_metrics.get("total_trades"))
+    if train_trades == 0:
+        return False, "训练区间无交易"
+    if not validation_metrics:
+        return False, "验证区间结果缺失"
+    if all(_safe_int(item.get("metrics", {}).get("total_trades")) == 0 for item in validation_metrics):
+        return False, "所有验证区间无交易"
+    if final_score <= 0:
+        return False, "final_score<=0"
+    return True, None
+
+
+def _baseline_gate_and_penalty(
+    train_metrics: dict[str, Any],
+    runtime_goal: dict[str, Any],
+) -> tuple[bool, str | None, float]:
+    baseline = runtime_goal.get("baseline", {}) or {}
+    target = runtime_goal.get("target", {}) or {}
+    if not baseline:
+        return True, None, 0.0
+
+    profit_abs = _safe_float(train_metrics.get("profit_total_abs"))
+    profit_pct = _safe_float(train_metrics.get("profit_total_pct"))
+    pf = _safe_float(train_metrics.get("profit_factor"))
+    dd_pct = _safe_float(train_metrics.get("max_drawdown")) * 100.0
+    trades = _safe_int(train_metrics.get("total_trades"))
+
+    b_profit_abs = _safe_float(baseline.get("profit_total_abs"))
+    b_profit_pct = _safe_float(baseline.get("profit_total_pct"))
+    b_pf = _safe_float(baseline.get("profit_factor"))
+    b_dd_pct = _safe_float(baseline.get("max_drawdown_pct"))
+    b_trades = _safe_int(baseline.get("total_trades"))
+    target_max_dd = _safe_float(target.get("max_drawdown_pct"))
+
+    if trades <= 0:
+        return False, "交易数<=0", 0.0
+    if target_max_dd > 0 and dd_pct > target_max_dd:
+        return False, f"最大回撤超出目标({dd_pct:.2f}%>{target_max_dd:.2f}%)", 0.0
+    if profit_abs < b_profit_abs - 1e-9:
+        return False, "profit_total_abs 低于 baseline", 0.0
+
+    better_count = 0
+    if profit_abs >= b_profit_abs:
+        better_count += 1
+    if profit_pct >= b_profit_pct:
+        better_count += 1
+    if pf >= b_pf:
+        better_count += 1
+    if dd_pct <= b_dd_pct:
+        better_count += 1
+    if trades >= b_trades:
+        better_count += 1
+    if better_count < 3:
+        return False, "综合表现不优于 baseline", 0.0
+
+    dd_penalty = max(0.0, dd_pct - b_dd_pct) * 2.0
+    return True, None, dd_penalty
+
 def _build_periods(runtime_goal: dict[str, Any]) -> tuple[PeriodDef, list[PeriodDef]]:
     train_cfg = runtime_goal.get("train_period", {})
     train = PeriodDef(
@@ -353,21 +455,38 @@ def _build_periods(runtime_goal: dict[str, Any]) -> tuple[PeriodDef, list[Period
     return train, validations
 
 
-def _extract_metrics(data: dict[str, Any]) -> dict[str, Any]:
-    s = data.get("strategy", {})
-    first = next(iter(s.values()), {}) if isinstance(s, dict) else {}
-    t = first.get("total", {}) if isinstance(first, dict) else {}
-    results_per_pair = first.get("results_per_pair", [])
+def _extract_metrics(result: dict[str, Any]) -> dict[str, Any]:
+    required = ["total_trades", "profit_total_abs", "profit_total", "profit_factor", "max_drawdown_account"]
+    for key in required:
+        if key not in result:
+            raise RuntimeError(f"回测结果缺少字段 {key}")
+
+    total_trades = int(result["total_trades"])
+    profit_total_abs = float(result["profit_total_abs"])
+    profit_total = float(result["profit_total"])
+    profit_total_pct = profit_total * 100.0
+    profit_factor = float(result["profit_factor"])
+    max_drawdown = float(result["max_drawdown_account"])
+    max_drawdown_pct = max_drawdown * 100.0
+
+    print(f"total_trades: {total_trades}")
+    print(f"profit_total_abs: {profit_total_abs}")
+    print(f"profit_total_pct: {profit_total_pct}")
+    print(f"profit_factor: {profit_factor}")
+    print(f"max_drawdown_pct: {max_drawdown_pct}")
+
     return {
-        "total_trades": int(t.get("total_trades", 0) or 0),
-        "profit_total_abs": float(t.get("profit_total_abs", 0) or 0),
-        "profit_total_pct": float(t.get("profit_total_pct", 0) or 0),
-        "profit_factor": float(t.get("profit_factor", 0) or 0),
-        "max_drawdown": float(t.get("max_drawdown_account", t.get("max_drawdown", 0)) or 0),
-        "winrate": float(t.get("winrate", 0) or 0),
-        "roi_profit_total": float(t.get("profit_total_pct", 0) or 0),
-        "stop_loss_abs": float(t.get("stop_loss_abs", 0) or 0),
-        "pairs": results_per_pair,
+        "total_trades": total_trades,
+        "profit_total_abs": profit_total_abs,
+        "profit_total": profit_total,
+        "profit_total_pct": profit_total_pct,
+        "profit_factor": profit_factor,
+        "max_drawdown": max_drawdown,
+        "max_drawdown_pct": max_drawdown_pct,
+        "winrate": float(result.get("winrate", 0.0) or 0.0),
+        "roi_profit_total": profit_total_pct,
+        "stop_loss_abs": float(result.get("stop_loss_abs", 0.0) or 0.0),
+        "pairs": result.get("results_per_pair", []),
     }
 
 
@@ -547,6 +666,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
 
     best: dict[str, Any] | None = None
     prev_train_trades: int | None = None
+    previous_failure_reason: str | None = None
+    zero_trade_streak = 0
     leaderboard: list[dict[str, Any]] = []
     best_summary_path: Path | None = None
     for i in range(1, iterations + 1):
@@ -560,24 +681,29 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         baseline_cfg = runtime_goal.get("baseline", {}) or {}
         min_trades = int(target_cfg.get("min_trades", 80))
         max_trades = int(target_cfg.get("max_trades", 200))
-        relax_hint = (
-            "上一轮训练区间交易数为 0，本轮必须明显放宽入场条件（降低阈值、减少强趋势过滤叠加、避免过多与条件），"
-            "确保训练区间产生可观测交易。"
+        zero_trade_hint = (
+            "上一轮失败原因：训练区间和所有验证区间均为 0 交易，请放宽入场条件。"
             if prev_train_trades == 0 else
             "优先保证训练区间有稳定交易，不要把过滤条件堆得过严。"
         )
+        failure_context = f"上一轮失败原因：{previous_failure_reason}\n" if previous_failure_reason else ""
         prompt = (
             f"请生成完整 freqtrade 策略代码，只输出 Python 代码。类名必须为 {class_name}，继承 IStrategy，"
             f"timeframe='{timeframe}'，并实现 populate_indicators/populate_entry_trend/populate_exit_trend。\n"
             "硬性约束：\n"
             "1) 策略必须在训练区间产生合理交易，严禁生成完全无交易策略。\n"
             f"2) 目标交易数为 {min_trades}~{max_trades}。\n"
-            f"3) {relax_hint}\n"
-            "4) use_exit_signal 必须为 False。\n"
-            "5) 仅现货 long only：不做空、不杠杆、不马丁格尔、不无限补仓。\n"
-            "6) 入场条件不能过度依赖过强趋势过滤（例如要求多个强趋势条件同时成立）。\n"
-            "7) 允许并建议使用 RSI、EMA、MACD、成交量、布林带等常规指标构建中等强度的入场逻辑。\n"
-            "8) 目标不是追求 0 回撤，而是在足够交易数下综合表现优于 baseline。\n"
+            f"3) {zero_trade_hint}\n"
+            "4) 如果上一轮 total_trades=0，本轮必须大幅放宽入场条件，并确保训练区间产生交易。\n"
+            "5) 目标训练区间交易数至少 40 笔，理想目标 80~200 笔。\n"
+            "6) use_exit_signal 必须为 False。\n"
+            "7) 仅现货 long only：不做空、不杠杆、不马丁格尔、不无限补仓。\n"
+            "8) 不调用外部 API，不读取手动交易记录。\n"
+            "9) 禁止使用过强过滤的全 AND 叠加（如 close>ema200_1h、rsi_1h>55、ema20>ema50>ema100、volume>rolling_mean*1.5 同时成立）。\n"
+            "10) 入场逻辑可更宽松，鼓励用 OR 组合：RSI 回调反弹 / EMA 短周期金叉 / 布林带下轨反弹 / MACD 转强 / 成交量不极低。\n"
+            "11) 不允许生成完全无交易策略。\n"
+            "12) 目标不是追求 0 回撤，而是在足够交易数下综合表现优于 baseline。\n"
+            f"{failure_context}"
             "当前 baseline：\n"
             f"- 总收益(USDT)：{baseline_cfg.get('profit_total_abs', -7.43)}\n"
             f"- 收益率(%)：{baseline_cfg.get('profit_total_pct', -0.74)}\n"
@@ -602,6 +728,25 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             print(f"第 {i} 轮语法检查失败，跳过。")
             continue
         validate_strategy_class_name(strategy_file, class_name)
+        if not has_enter_long_assignment(strategy_file):
+            invalid_reason = "静态检查失败：populate_entry_trend 未设置 enter_long=1"
+            previous_failure_reason = invalid_reason
+            leaderboard.append({
+                "version": ver,
+                "strategy_class": class_name,
+                "final_score": 0.0,
+                "train_profit_pct": 0.0,
+                "avg_validation_profit_pct": 0.0,
+                "profit_factor": 0.0,
+                "max_drawdown_pct": 0.0,
+                "total_trades": 0,
+                "is_overfit": False,
+                "is_best": False,
+                "is_valid": False,
+                "invalid_reason": invalid_reason,
+            })
+            print(f"第 {i} 轮无效：{invalid_reason}")
+            continue
 
         print(f"正在回测训练区间：{train.timerange}")
         train_cmd = [
@@ -609,6 +754,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "--config", config, "--strategy", class_name, "--timeframe", timeframe,
             "--timerange", train.timerange, "--export", "trades", "--cache", "none",
         ]
+        results_dir = ROOT_DIR / "user_data" / "backtest_results"
+        train_before_zips = set(_list_backtest_zips(results_dir))
+        train_start_ts = time.time()
         train_cp = run_cmd(train_cmd, ROOT_DIR)
         (version_dir / "backtest_logs.txt").write_text(
             f"[Train {train.timerange}]\nSTDOUT:\n{train_cp.stdout}\n\nSTDERR:\n{train_cp.stderr}\n",
@@ -620,7 +768,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 raise RuntimeError(f"第 {i} 轮回测失败：Impossible to load Strategy（{class_name}）。已停止后续轮次。")
             continue
         print("正在解析回测结果……")
-        train_metrics = _extract_metrics(parse_backtest_from_zip(latest_backtest_zip(ROOT_DIR / "user_data" / "backtest_results")))
+        train_zip = _select_backtest_zip(results_dir, train_before_zips, train_start_ts)
+        train_result = parse_backtest_from_zip(train_zip, class_name)
+        train_metrics = _extract_metrics(train_result)
         prev_train_trades = int(train_metrics.get("total_trades", 0) or 0)
         write_json(version_dir / "train_metrics.json", train_metrics)
         train_score = _score(train_metrics, train)
@@ -632,6 +782,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             print(f"正在回测验证区间：{p.timerange}")
             vcmd = train_cmd.copy()
             vcmd[vcmd.index("--timerange") + 1] = p.timerange
+            val_before_zips = set(_list_backtest_zips(results_dir))
+            val_start_ts = time.time()
             val_cp = run_cmd(vcmd, ROOT_DIR)
             with (version_dir / "backtest_logs.txt").open("a", encoding="utf-8") as logf:
                 logf.write(f"\n[Validation {p.name} {p.timerange}]\nSTDOUT:\n{val_cp.stdout}\n\nSTDERR:\n{val_cp.stderr}\n")
@@ -639,7 +791,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 print(val_cp.stderr)
                 continue
             print("正在解析回测结果……")
-            vm = _extract_metrics(parse_backtest_from_zip(latest_backtest_zip(ROOT_DIR / "user_data" / "backtest_results")))
+            val_zip = _select_backtest_zip(results_dir, val_before_zips, val_start_ts)
+            vm = _extract_metrics(parse_backtest_from_zip(val_zip, class_name))
             validation_metrics.append({"period": p.name, "timerange": p.timerange, "metrics": vm})
             _print_round_table(ver, p.timerange, vm)
             val_scores.append(_score(vm, p))
@@ -652,25 +805,48 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             },
         )
         overfit_penalty = max(0.0, train_score - validation_score) * 0.3
-        final_score = train_score * 0.6 + validation_score * 0.4 - overfit_penalty
+        baseline_ok, baseline_reason, baseline_dd_penalty = _baseline_gate_and_penalty(train_metrics, runtime_goal)
+        final_score = train_score * 0.6 + validation_score * 0.4 - overfit_penalty - baseline_dd_penalty
         is_overfit = train_score > validation_score * 1.3 if validation_score else True
         zero_reason = _score_zero_reason(final_score, train_metrics, validation_metrics, validation_score)
         if zero_reason:
             print(f"第 {i} 轮 final_score 为 0，原因：{zero_reason}")
 
+        all_validation_zero = bool(validation_metrics) and all(
+            _safe_int(item.get("metrics", {}).get("total_trades")) == 0 for item in validation_metrics
+        )
+        if _safe_int(train_metrics.get("total_trades")) == 0 and all_validation_zero:
+            zero_trade_streak += 1
+            previous_failure_reason = "训练区间和所有验证区间均为 0 交易，请放宽入场条件。"
+        else:
+            zero_trade_streak = 0
+
+        is_valid, invalid_reason = _validate_round(train_metrics, validation_metrics, final_score)
+        if is_valid and not baseline_ok:
+            is_valid = False
+            invalid_reason = baseline_reason
+        if not is_valid:
+            previous_failure_reason = invalid_reason
+
         round_data = {
             "iteration": i, "class_name": class_name, "strategy_file": str(strategy_file),
             "train_metrics": train_metrics, "train_score": train_score, "validation_score": validation_score,
             "overfit_penalty": overfit_penalty, "final_score": final_score, "is_overfit": is_overfit,
+            "is_valid": is_valid, "invalid_reason": invalid_reason,
         }
         write_json(run_dir / f"round_{i:03d}.json", round_data)
-        is_best = best is None or final_score > float(best["final_score"])
+        is_best = is_valid and final_score > 0 and (best is None or final_score > float(best["final_score"]))
         score_breakdown = {
             "train_score": train_score,
             "validation_score": validation_score,
             "overfit_penalty": overfit_penalty,
-            "formula": "final_score = train_score*0.6 + validation_score*0.4 - overfit_penalty",
+            "baseline_dd_penalty": baseline_dd_penalty,
+            "formula": "final_score = train_score*0.6 + validation_score*0.4 - overfit_penalty - baseline_dd_penalty",
             "zero_score_reason": zero_reason,
+            "baseline_check": {
+                "passed": baseline_ok,
+                "reason": baseline_reason,
+            },
         }
         summary = {
             "strategy_class": class_name,
@@ -685,6 +861,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             },
             "final_score": final_score,
             "is_best": is_best,
+            "is_valid": is_valid,
+            "invalid_reason": invalid_reason,
         }
         summary_path = version_dir / "summary.json"
         write_json(summary_path, summary)
@@ -703,6 +881,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "total_trades": _safe_int(train_metrics.get("total_trades")),
             "is_overfit": is_overfit,
             "is_best": False,
+            "is_valid": is_valid,
+            "invalid_reason": invalid_reason,
         }
         leaderboard.append(leaderboard_entry)
         if is_best:
@@ -711,7 +891,12 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             write_json(run_dir / "best_strategy.json", best)
             shutil.copy2(strategy_file, GENERATED_DIR / f"BEST_{strategy_family}.py")
         print(f"第 {i} 轮完成")
+        if not is_valid:
+            print(f"本轮策略无效：{invalid_reason}")
         print(f"是否成为新最佳：{'是' if is_best else '否'}")
+        if zero_trade_streak >= 3:
+            print("连续 3 轮无交易，可能是 AI prompt 或策略模板过于保守，请检查生成策略代码。")
+            break
 
     leaderboard_sorted = sorted(leaderboard, key=lambda x: float(x["final_score"]), reverse=True)
     best_version = None
@@ -731,14 +916,14 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         if best_summary_path:
             print(f"- summary.json 路径: {best_summary_path}")
     else:
-        print("自动优化结束：没有可用策略通过流程。")
+        print("自动优化完成，但没有找到有效策略，当前最佳策略保持不变。")
 
 
 def main() -> None:
     load_project_env()
     parser = argparse.ArgumentParser()
     parser.add_argument("--goal", default="ai_tools/optimization_goal.json")
-    parser.add_argument("--iterations", type=int, default=5)
+    parser.add_argument("--iterations", type=int, default=None)
     parser.add_argument("--auto-approve", action="store_true")
     parser.add_argument("--skip-download", action="store_true")
     parser.add_argument("--force-download", action="store_true")
@@ -760,6 +945,11 @@ def main() -> None:
         args.auto_approve = True
     if runtime_goal.get("runtime_force_download", False):
         args.force_download = True
+
+
+    effective_iterations = args.iterations if args.iterations is not None else int(runtime_goal.get("max_iterations", 5))
+    runtime_goal["max_iterations"] = int(effective_iterations)
+    print(f"本次实际迭代轮数：{int(effective_iterations)}")
 
     if args.save_goal:
         write_json(goal_path, runtime_goal)
