@@ -55,9 +55,9 @@
   "target": {
     "min_profit_total_pct": 0,
     "max_drawdown_pct": 3,
-    "min_profit_factor": 1.0,
-    "min_trades": 80,
-    "max_trades": 200,
+    "min_profit_factor": 0.56,
+    "min_trades": 25,
+    "max_trades": 80,
     "prefer_exit_signal": false,
     "max_stoploss_loss_usdt": 15
   },
