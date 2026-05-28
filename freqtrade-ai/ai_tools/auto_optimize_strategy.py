@@ -254,8 +254,8 @@ def run_wizard(goal: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]
     runtime["target"]["min_profit_total_pct"] = ask_float("目标最低收益率", float(runtime["target"].get("min_profit_total_pct", 0)))
     runtime["target"]["max_drawdown_pct"] = ask_float("最大允许回撤(%)", float(runtime["target"].get("max_drawdown_pct", 3)))
     runtime["target"]["min_profit_factor"] = ask_float("最低 Profit factor", float(runtime["target"].get("min_profit_factor", 1.0)))
-    runtime["target"]["min_trades"] = ask_int("目标最小交易数", int(runtime["target"].get("min_trades", 80)))
-    runtime["target"]["max_trades"] = ask_int("目标最大交易数", int(runtime["target"].get("max_trades", 200)))
+    runtime["target"]["min_trades"] = ask_int("目标最小交易数", int(runtime["target"].get("min_trades", 25)))
+    runtime["target"]["max_trades"] = ask_int("目标最大交易数", int(runtime["target"].get("max_trades", 80)))
 
     runtime.setdefault("overfit_guard", {})
     runtime["overfit_guard"]["enabled"] = ask_bool("是否启用防过拟合", bool(runtime["overfit_guard"].get("enabled", True)))
@@ -394,6 +394,22 @@ def parse_backtest_from_zip(zip_path: Path, strategy_class: str) -> dict[str, An
 
 def run_cmd(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, cwd=cwd, text=True, capture_output=True)
+
+
+def run_single_backtest_metrics(config: str, class_name: str, timeframe: str, timerange: str) -> dict[str, Any]:
+    cmd = [
+        "docker", "compose", "run", "--rm", "freqtrade", "backtesting",
+        "--config", config, "--strategy", class_name, "--timeframe", timeframe,
+        "--timerange", timerange, "--export", "trades", "--cache", "none",
+    ]
+    results_dir = ROOT_DIR / "user_data" / "backtest_results"
+    before_zips = set(_list_backtest_zips(results_dir))
+    start_ts = time.time()
+    cp = run_cmd(cmd, ROOT_DIR)
+    if cp.returncode != 0:
+        raise RuntimeError(f"回测失败：{class_name}\n{cp.stderr}")
+    result_zip = _select_backtest_zip(results_dir, before_zips, start_ts)
+    return _extract_metrics(parse_backtest_from_zip(result_zip, class_name))
 
 
 def _safe_float(value: Any) -> float:
@@ -714,6 +730,15 @@ def _strategy_spec_prompt(class_name: str, runtime_goal: dict[str, Any], baselin
         f"last_failure={previous_failure_reason or '无'}\n"
         "JSON 必须包含: strategy_name,hypothesis,target_trades_min,target_trades_max,entry_design,exit_design,risk_controls,avoid_patterns,expected_improvement。"
     )
+
+
+def _extract_exit_profit_fields(metrics: dict[str, Any]) -> dict[str, float]:
+    return {
+        "roi_profit_abs": _safe_float(metrics.get("roi_profit_abs")),
+        "stop_loss_profit_abs": _safe_float(metrics.get("stop_loss_profit_abs")),
+        "trailing_stop_loss_profit_abs": _safe_float(metrics.get("trailing_stop_loss_profit_abs")),
+        "force_exit_profit_abs": _safe_float(metrics.get("force_exit_profit_abs")),
+    }
 
 
 def _is_true_or_one(node: ast.AST) -> bool:
@@ -1102,14 +1127,15 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         print(f"当前代码生成模型：{code_model}")
         target_cfg = runtime_goal.get("target", {}) or {}
         baseline_cfg = runtime_goal.get("baseline", {}) or {}
-        min_trades = int(target_cfg.get("min_trades", 80))
-        max_trades = int(target_cfg.get("max_trades", 200))
+        min_trades = int(target_cfg.get("min_trades", 25))
+        max_trades = int(target_cfg.get("max_trades", 80))
         zero_trade_hint = (
             "上一轮失败原因：训练区间和所有验证区间均为 0 交易，请放宽入场条件。"
             if prev_train_trades == 0 else
             "优先保证训练区间有稳定交易，不要把过滤条件堆得过严。"
         )
         failure_context = f"上一轮失败原因：{previous_failure_reason}\n" if previous_failure_reason else ""
+        failure_context += "最近失败策略共同原因通常不是没有盈利单，而是固定止损或 trailing_stop_loss 吃掉 ROI 收益。\n"
         compact_memory = build_compact_strategy_context(memory_items, baseline_cfg, memory_max_items, memory_max_chars) if memory_enabled else ""
         spec_prompt = _strategy_spec_prompt(class_name, runtime_goal, baseline_cfg, compact_memory, previous_failure_reason)
         print("正在调用策略顾问模型生成 strategy_spec……")
@@ -1146,7 +1172,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             f"2) 目标交易数为 {min_trades}~{max_trades}。\n"
             f"3) {zero_trade_hint}\n"
             "4) 如果上一轮 total_trades=0，本轮必须大幅放宽入场条件，并确保训练区间产生交易。\n"
-            "5) 目标训练区间交易数至少 40 笔，理想目标 80~200 笔。\n"
+            "5) 目标训练区间交易数至少 25 笔，理想目标 25~80 笔。\n"
             "6) use_exit_signal 必须为 False。\n"
             "7) 仅现货 long only：不做空、不杠杆、不马丁格尔、不无限补仓。\n"
             "8) 不调用外部 API，不读取手动交易记录。\n"
@@ -1208,6 +1234,13 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 continue
             yn = input("是否仍然执行回测？(y/n)\n").strip()
             if parse_yes_no(yn) is not True:
+                write_json(
+                    version_dir / "summary.json",
+                    {"is_valid": False, "invalid_reason": "用户拒绝回测相似失败策略。"},
+                )
+                leaderboard.append(
+                    {"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": "用户拒绝回测相似失败策略。"}
+                )
                 continue
         strategy_file.parent.mkdir(parents=True, exist_ok=True)
         strategy_file.write_text(code, encoding="utf-8")
@@ -1302,27 +1335,34 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         write_json(version_dir / "train_metrics.json", train_metrics)
         train_score = _score(train_metrics, train)
         _print_round_table(ver, train.timerange, train_metrics)
+        train_trades = _safe_int(train_metrics.get("total_trades"))
+        high_freq_risk = train_trades > max_trades * 1.5
 
         val_scores = []
         validation_metrics: list[dict[str, Any]] = []
-        for p in validations:
-            print(f"7. 正在回测验证区间：{p.timerange}")
-            vcmd = train_cmd.copy()
-            vcmd[vcmd.index("--timerange") + 1] = p.timerange
-            val_before_zips = set(_list_backtest_zips(results_dir))
-            val_start_ts = time.time()
-            val_cp = run_cmd(vcmd, ROOT_DIR)
-            with (version_dir / "backtest_logs.txt").open("a", encoding="utf-8") as logf:
-                logf.write(f"\n[Validation {p.name} {p.timerange}]\nSTDOUT:\n{val_cp.stdout}\n\nSTDERR:\n{val_cp.stderr}\n")
-            if val_cp.returncode != 0:
-                print(val_cp.stderr)
-                continue
-            print("正在解析回测结果……")
-            val_zip = _select_backtest_zip(results_dir, val_before_zips, val_start_ts)
-            vm = _extract_metrics(parse_backtest_from_zip(val_zip, class_name))
-            validation_metrics.append({"period": p.name, "timerange": p.timerange, "metrics": vm})
-            _print_round_table(ver, p.timerange, vm)
-            val_scores.append(_score(vm, p))
+        if train_trades == 0:
+            print("训练区间 total_trades=0，立即判无效并跳过所有验证区间回测。")
+        else:
+            if high_freq_risk:
+                print(f"训练区间交易数 {train_trades} > 目标上限 {max_trades} 的 1.5 倍，标记为高频风险（继续回测）。")
+            for p in validations:
+                print(f"7. 正在回测验证区间：{p.timerange}")
+                vcmd = train_cmd.copy()
+                vcmd[vcmd.index("--timerange") + 1] = p.timerange
+                val_before_zips = set(_list_backtest_zips(results_dir))
+                val_start_ts = time.time()
+                val_cp = run_cmd(vcmd, ROOT_DIR)
+                with (version_dir / "backtest_logs.txt").open("a", encoding="utf-8") as logf:
+                    logf.write(f"\n[Validation {p.name} {p.timerange}]\nSTDOUT:\n{val_cp.stdout}\n\nSTDERR:\n{val_cp.stderr}\n")
+                if val_cp.returncode != 0:
+                    print(val_cp.stderr)
+                    continue
+                print("正在解析回测结果……")
+                val_zip = _select_backtest_zip(results_dir, val_before_zips, val_start_ts)
+                vm = _extract_metrics(parse_backtest_from_zip(val_zip, class_name))
+                validation_metrics.append({"period": p.name, "timerange": p.timerange, "metrics": vm})
+                _print_round_table(ver, p.timerange, vm)
+                val_scores.append(_score(vm, p))
         validation_score = sum(val_scores) / len(val_scores) if val_scores else 0.0
         write_json(
             version_dir / "validation_metrics.json",
@@ -1361,8 +1401,17 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             failure_reasons.append("Profit factor 低于 baseline")
         if _safe_float(train_metrics.get("max_drawdown_pct")) > _safe_float((runtime_goal.get("target", {}) or {}).get("max_drawdown_pct")):
             failure_reasons.append("最大回撤超过目标")
-        if _safe_int(train_metrics.get("total_trades")) > int((runtime_goal.get("target", {}) or {}).get("max_trades", 200)) * 1.5:
+        if _safe_int(train_metrics.get("total_trades")) > int((runtime_goal.get("target", {}) or {}).get("max_trades", 80)) * 1.5:
             failure_reasons.append("交易数超过目标上限")
+        roi_profit_abs = _safe_float(train_metrics.get("roi_profit_abs"))
+        stop_loss_profit_abs = _safe_float(train_metrics.get("stop_loss_profit_abs"))
+        trailing_stop_loss_profit_abs = _safe_float(train_metrics.get("trailing_stop_loss_profit_abs"))
+        if abs(stop_loss_profit_abs) > max(0.0, roi_profit_abs) * 1.2:
+            failure_reasons.append("固定止损亏损吞噬 ROI 收益。")
+        if trailing_stop_loss_profit_abs < -20:
+            failure_reasons.append("移动止盈/止损结构造成大额亏损。")
+        if high_freq_risk:
+            failure_reasons.append("高频风险：交易数超过目标上限 1.5 倍")
         if not failure_reasons and invalid_reason:
             failure_reasons.append(invalid_reason)
         failure_reason = "；".join(failure_reasons) if failure_reasons else ("通过" if is_valid else "综合评分不达标")
@@ -1444,6 +1493,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "spec_hash": spec_hash,
             "failure_reason": failure_reason,
             "avoid_next": "降低高频宽松入场，控制回撤与止损亏损。",
+            **_extract_exit_profit_fields(train_metrics),
         }
         leaderboard.append(leaderboard_entry)
         memory_items.append({
@@ -1453,10 +1503,11 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 "profit_total_pct": avg_validation_profit_pct,
             },
             "train_metrics": train_metrics,
+            **_extract_exit_profit_fields(train_metrics),
         })
         if (final_score <= 0 or _safe_float(train_metrics.get("max_drawdown_pct")) > _safe_float((runtime_goal.get("target", {}) or {}).get("max_drawdown_pct"))
                 or avg_validation_profit_pct < _safe_float((runtime_goal.get("baseline", {}) or {}).get("profit_total_pct"))
-                or _safe_int(train_metrics.get("total_trades")) > int((runtime_goal.get("target", {}) or {}).get("max_trades", 200)) * 1.5):
+                or _safe_int(train_metrics.get("total_trades")) > int((runtime_goal.get("target", {}) or {}).get("max_trades", 80)) * 1.5):
             blacklist_items.append({
                 "code_hash": code_hash,
                 "feature_signature": signature,
@@ -1491,6 +1542,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     print("有效策略：" + ("、".join(f"{row['version']}:{row['strategy_class']}" for row in valid_rows) if valid_rows else "无"))
     print("无效策略：" + ("、".join(f"{row['version']}:{row['strategy_class']}({row.get('invalid_reason')})" for row in invalid_rows) if invalid_rows else "无"))
     print(f"当前最佳策略是否更新：{'是' if best else '否'}")
+    closest_failed = next((row for row in leaderboard_sorted if not row.get("is_valid")), None)
 
     historical_best = read_json(BEST_STRATEGY_FILE) if BEST_STRATEGY_FILE.exists() else None
     current_best_saved = None
@@ -1536,9 +1588,34 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         print("- PF 低")
         print("- 回撤超标")
         print("下一轮建议：")
-        print("- 降低目标交易数到 40~120")
+        print("- 降低目标交易数到 25~80")
         print("- 不要继续宽松高频入场")
         print("- 优先控制止损损失")
+    if closest_failed:
+        print("========== 本轮最接近目标的失败策略 ==========")
+        print(f"版本：{closest_failed.get('version')}")
+        print(f"策略：{closest_failed.get('strategy_class')}")
+        print(f"final_score：{_safe_float(closest_failed.get('final_score')):.4f}")
+        print(f"失败原因：{closest_failed.get('failure_reason') or closest_failed.get('invalid_reason') or '综合评分不达标'}")
+        print("为什么仍未成为 best：未通过有效性约束或综合得分不足。")
+
+    if args.retest_current_best_at_end:
+        print("\n========== 结束前复测 current best / baseline ==========")
+        train_timerange = train.timerange
+        candidate = current_best_saved or historical_best
+        if candidate and candidate.get("strategy_class") and candidate.get("strategy_class") != "baseline":
+            cls = str(candidate.get("strategy_class"))
+            print(f"复测 current best: {cls}")
+            try:
+                metrics = run_single_backtest_metrics(config, cls, timeframe, train_timerange)
+                _print_round_table("retest", train_timerange, metrics)
+            except RuntimeError as exc:
+                print(f"current best 复测失败：{exc}")
+        else:
+            print("current best 不可复测（仅 baseline 或缺少策略类名）。")
+        baseline_cfg = runtime_goal.get("baseline", {}) or {}
+        print("baseline 完整指标：")
+        _print_round_table("baseline", train_timerange, baseline_cfg)
     if args.print_current_best:
         print_current_best_summary(runtime_goal, historical_best, current_best_saved if best else None)
 
