@@ -29,9 +29,12 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 RESULT_ROOT = ROOT_DIR / "user_data" / "backtest_results" / "ai_optimization_runs"
 GENERATED_DIR = ROOT_DIR / "user_data" / "strategies" / "generated"
 STRATEGY_DIR = ROOT_DIR / "user_data" / "strategies"
-MEMORY_FILE = ROOT_DIR / "ai_tools" / "strategy_memory.json"
-BLACKLIST_FILE = ROOT_DIR / "ai_tools" / "strategy_blacklist.json"
-LESSONS_FILE = ROOT_DIR / "ai_tools" / "strategy_lessons.json"
+MEMORY_FILE = ROOT_DIR / "user_data" / "ai_memory" / "strategy_memory.json"
+BLACKLIST_FILE = ROOT_DIR / "user_data" / "ai_memory" / "strategy_blacklist.json"
+LESSONS_FILE = ROOT_DIR / "user_data" / "ai_memory" / "strategy_lessons.json"
+MEMORY_EXAMPLE_FILE = ROOT_DIR / "ai_tools" / "strategy_memory.example.json"
+BLACKLIST_EXAMPLE_FILE = ROOT_DIR / "ai_tools" / "strategy_blacklist.example.json"
+LESSONS_EXAMPLE_FILE = ROOT_DIR / "ai_tools" / "strategy_lessons.example.json"
 MODEL_CONFIG_FILE = ROOT_DIR / "ai_tools" / "model_config.json"
 MODEL_CONFIG_EXAMPLE_FILE = ROOT_DIR / "ai_tools" / "model_config.example.json"
 TIMERANGE_RE = re.compile(r"^\d{8}-\d{8}$")
@@ -80,6 +83,16 @@ def read_json(path: Path) -> dict[str, Any]:
 def write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def ensure_runtime_json_file(path: Path, example_path: Path) -> None:
+    if path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if example_path.exists():
+        shutil.copy2(example_path, path)
+    else:
+        write_json(path, {"items": []})
 
 
 def _read_json_list_file(path: Path) -> list[dict[str, Any]]:
@@ -921,6 +934,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
 
     best: dict[str, Any] | None = None
     run_id = run_dir.name.replace("run_", "")
+    ensure_runtime_json_file(MEMORY_FILE, MEMORY_EXAMPLE_FILE)
+    ensure_runtime_json_file(BLACKLIST_FILE, BLACKLIST_EXAMPLE_FILE)
+    ensure_runtime_json_file(LESSONS_FILE, LESSONS_EXAMPLE_FILE)
+
     memory_items = _read_json_list_file(MEMORY_FILE)
     blacklist_items = _read_json_list_file(BLACKLIST_FILE)
     lessons_items = _read_json_list_file(LESSONS_FILE)

@@ -1,8 +1,14 @@
 .env
+.env.bak.*
 user_data/config.json
+user_data/config*.json
 user_data/*.sqlite
 user_data/*.sqlite-shm
 user_data/*.sqlite-wal
+user_data/ai_memory/
+user_data/strategies/MultiCoin_AI_Strategy_*.py
+user_data/strategies/MultiCoin_AI_Strategy_v*.py
+user_data/strategies/generated/
 user_data/logs/
 user_data/backtest_results/
 user_data/data/
