@@ -40,6 +40,7 @@ MEMORY_FILE = ROOT_DIR / "user_data" / "ai_memory" / "strategy_memory.json"
 BLACKLIST_FILE = ROOT_DIR / "user_data" / "ai_memory" / "strategy_blacklist.json"
 LESSONS_FILE = ROOT_DIR / "user_data" / "ai_memory" / "strategy_lessons.json"
 BEST_STRATEGY_FILE = ROOT_DIR / "user_data" / "ai_memory" / "best_strategy.json"
+RESET_HISTORY_FILE = ROOT_DIR / "user_data" / "ai_memory" / "reset_history.json"
 NEAREST_CANDIDATE_FILE = ROOT_DIR / "user_data" / "ai_memory" / "nearest_candidate.json"
 MEMORY_EXAMPLE_FILE = ROOT_DIR / "ai_tools" / "strategy_memory.example.json"
 BLACKLIST_EXAMPLE_FILE = ROOT_DIR / "ai_tools" / "strategy_blacklist.example.json"
@@ -540,21 +541,53 @@ def _build_baseline_best(goal: dict[str, Any]) -> dict[str, Any]:
 
 def _load_champion(runtime_goal: dict[str, Any]) -> dict[str, Any]:
     if BEST_STRATEGY_FILE.exists():
-        data = read_json(BEST_STRATEGY_FILE)
-        sf = Path(str(data.get("strategy_file", "")))
+        try:
+            data = read_json(BEST_STRATEGY_FILE)
+        except json.JSONDecodeError:
+            print("警告：best_strategy.json 不是合法 JSON，已回退到 baseline champion。")
+            return {"meta": _build_baseline_best(runtime_goal), "code": "", "source": "baseline"}
+        if data.get("source") == "reset":
+            print("历史最佳策略处于 reset 状态，已回退到 baseline champion。")
+            return {"meta": _build_baseline_best(runtime_goal), "code": "", "source": "reset_empty"}
+
+        strategy_file_raw = str(data.get("strategy_file", "") or "").strip()
+        if not strategy_file_raw:
+            return {"meta": _build_baseline_best(runtime_goal), "code": "", "source": "baseline"}
+
+        sf = Path(strategy_file_raw)
         if not sf.is_absolute():
             sf = ROOT_DIR / sf
-        code = sf.read_text(encoding="utf-8") if sf.exists() else ""
-        return {"meta": data, "code": code}
-    baseline = runtime_goal.get("baseline", {}) or {}
-    baseline_cls = str(baseline.get("strategy_class", "") or "")
-    code = ""
-    if baseline_cls:
-        bf = STRATEGY_DIR / f"{baseline_cls}.py"
-        if bf.exists():
-            code = bf.read_text(encoding="utf-8")
-            return {"meta": {"strategy_class": baseline_cls, "strategy_file": str(bf), "train_metrics": baseline}, "code": code}
-    return {"meta": _build_baseline_best(runtime_goal), "code": ""}
+        code = ""
+        if sf.exists() and sf.is_file():
+            code = sf.read_text(encoding="utf-8")
+        else:
+            print("历史最佳策略文件无效或不是文件，已仅加载指标，不加载代码：")
+            print(f"strategy_file={strategy_file_raw}")
+        return {"meta": data, "code": code, "source": "historical_best"}
+    return {"meta": _build_baseline_best(runtime_goal), "code": "", "source": "baseline"}
+
+
+def _append_reset_history(reason: str) -> None:
+    items: list[dict[str, Any]] = []
+    if RESET_HISTORY_FILE.exists():
+        try:
+            raw = json.loads(RESET_HISTORY_FILE.read_text(encoding="utf-8"))
+            if isinstance(raw, list):
+                items = [x for x in raw if isinstance(x, dict)]
+            elif isinstance(raw, dict) and isinstance(raw.get("items"), list):
+                items = [x for x in raw.get("items", []) if isinstance(x, dict)]
+        except json.JSONDecodeError:
+            items = []
+    items.append({"source": "reset", "reset_at": datetime.utcnow().isoformat(), "reason": reason})
+    RESET_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    RESET_HISTORY_FILE.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _print_champion_source(champion: dict[str, Any]) -> None:
+    source = champion.get("source", "baseline")
+    sf = str((champion.get("meta", {}) or {}).get("strategy_file", "") or "").strip() or "无"
+    print(f"当前 champion 来源：{source}")
+    print(f"当前 champion 策略文件：{sf}")
 
 
 def print_current_best_summary(goal: dict[str, Any], memory: dict[str, Any] | None, current_best: dict[str, Any] | None) -> None:
@@ -818,14 +851,9 @@ def maybe_reset_best_strategy(reset_best: bool) -> bool:
         backup_path = backup_dir / f"best_strategy.{now}.json"
         shutil.copy2(BEST_STRATEGY_FILE, backup_path)
         print(f"已备份历史 best_strategy.json -> {backup_path}")
-    write_json(
-        BEST_STRATEGY_FILE,
-        {
-            "source": "reset",
-            "reset_at": datetime.utcnow().isoformat(),
-            "reason": "用户选择初始化历史最佳策略",
-        },
-    )
+    if BEST_STRATEGY_FILE.exists():
+        BEST_STRATEGY_FILE.unlink()
+    _append_reset_history("用户选择初始化历史最佳策略")
     print("已初始化历史最佳策略：当前 run 将从空 champion 开始。")
     return True
 
@@ -1197,7 +1225,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     best: dict[str, Any] | None = None
     session_best: dict[str, Any] | None = None
     reset_best_used = bool(getattr(args, "reset_best", False) or runtime_goal.get("runtime_reset_best", False))
-    champion = {"meta": _build_baseline_best(runtime_goal), "code": ""} if reset_best_used else _load_champion(runtime_goal)
+    champion = {"meta": _build_baseline_best(runtime_goal), "code": "", "source": "reset_empty"} if reset_best_used else _load_champion(runtime_goal)
+    _print_champion_source(champion)
     nearest_candidate: dict[str, Any] | None = None
     used_failed_mutations: set[str] = set()
     run_id = run_dir.name.replace("run_", "")
