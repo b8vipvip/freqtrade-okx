@@ -263,6 +263,7 @@ def run_wizard(goal: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]
 
     print("提示：当前项目历史回测中 exit_signal 曾造成大量亏损，建议保持关闭。")
     runtime["target"]["prefer_exit_signal"] = ask_bool("是否允许 exit_signal", bool(runtime["target"].get("prefer_exit_signal", False)))
+    runtime["runtime_reset_best"] = ask_bool("是否初始化历史最佳策略", bool(runtime.get("runtime_reset_best", False)))
 
     runtime.setdefault("baseline", {})
     b = runtime["baseline"]
@@ -742,6 +743,9 @@ def _build_model_client(model_cfg: dict[str, Any], role_name: str, timeout_sec: 
 
 
 def _strategy_spec_prompt(class_name: str, runtime_goal: dict[str, Any], baseline_cfg: dict[str, Any], compact_memory: str, previous_failure_reason: str | None) -> str:
+    target_cfg = runtime_goal.get("target", {}) or {}
+    min_trades = int(target_cfg.get("min_trades", 25))
+    max_trades = int(target_cfg.get("max_trades", 80))
     return (
         f"你是策略顾问模型。只输出 mutation_spec JSON，不要输出 Python 代码。建议 strategy_name={class_name}\n"
         f"goal={json.dumps(runtime_goal.get('target', {}), ensure_ascii=False)}\n"
@@ -749,8 +753,32 @@ def _strategy_spec_prompt(class_name: str, runtime_goal: dict[str, Any], baselin
         f"recent_failed={compact_memory}\n"
         f"last_failure={previous_failure_reason or '无'}\n"
         "必须只选择一个 mutation_type，允许值：adjust_roi,adjust_stoploss,reduce_trade_frequency,add_entry_filter,remove_bad_entry_condition,disable_or_adjust_trailing,tighten_volume_filter,pair_specific_filter,cooldown_or_protection。\n"
-        "JSON 必须包含: mutation_type,reason,expected_effect,changes,do_not_change。"
+        "JSON 必须包含: mutation_type,reason,expected_effect,changes,do_not_change。\n"
+        f"硬约束：本轮训练区间总交易数目标是 {min_trades}~{max_trades}（不是单币种）。超过 {max_trades} 不能成为 best，超过 {int(max_trades * 1.5)} 会直接跳过验证。\n"
+        "禁止连续状态型宽松入场；优先 crossed_above/crossed_below 事件触发；每个策略最多 1~2 个 entry_tag；不允许多个 OR 条件堆叠造成高频；不允许为了增加交易数而放宽入场。"
     )
+
+
+def maybe_reset_best_strategy(reset_best: bool) -> bool:
+    if not reset_best:
+        return False
+    now = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    backup_dir = BEST_STRATEGY_FILE.parent / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    if BEST_STRATEGY_FILE.exists():
+        backup_path = backup_dir / f"best_strategy.{now}.json"
+        shutil.copy2(BEST_STRATEGY_FILE, backup_path)
+        print(f"已备份历史 best_strategy.json -> {backup_path}")
+    write_json(
+        BEST_STRATEGY_FILE,
+        {
+            "source": "reset",
+            "reset_at": datetime.utcnow().isoformat(),
+            "reason": "用户选择初始化历史最佳策略",
+        },
+    )
+    print("已初始化历史最佳策略：当前 run 将从空 champion 开始。")
+    return True
 
 
 def _extract_exit_profit_fields(metrics: dict[str, Any]) -> dict[str, float]:
@@ -1118,7 +1146,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             print(f"未检测到 {advisor_cfg.get('api_key_env')}，策略顾问模型将使用 {code_model} 代替。")
 
     best: dict[str, Any] | None = None
-    champion = _load_champion(runtime_goal)
+    session_best: dict[str, Any] | None = None
+    reset_best_used = bool(getattr(args, "reset_best", False) or runtime_goal.get("runtime_reset_best", False))
+    champion = {"meta": _build_baseline_best(runtime_goal), "code": ""} if reset_best_used else _load_champion(runtime_goal)
     nearest_candidate: dict[str, Any] | None = None
     used_failed_mutations: set[str] = set()
     run_id = run_dir.name.replace("run_", "")
@@ -1199,7 +1229,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "硬性约束：\n"
             "1) 仅允许在 champion 基础上一次小改动，不允许完全重写。\n"
             "2) 策略必须在训练区间产生合理交易，严禁生成完全无交易策略。\n"
-            f"2) 目标交易数为 {min_trades}~{max_trades}。\n"
+            f"2) 训练区间总交易数目标为 {min_trades}~{max_trades}（不是单币种）。超过 {max_trades} 不能成为 best；超过 {int(max_trades * 1.5)} 直接跳过验证。\n"
+            "3) 禁止连续状态型宽松入场；优先 crossed_above/crossed_below 事件触发；每个策略最多 1~2 个 entry_tag。\n"
+            "4) 不允许多个 OR 条件堆叠造成高频；不允许为了增加交易数而放宽入场。\n"
             f"3) {zero_trade_hint}\n"
             "4) 如果上一轮 total_trades=0，本轮必须大幅放宽入场条件，并确保训练区间产生交易。\n"
             "5) 目标训练区间交易数至少 25 笔，理想目标 25~80 笔。\n"
@@ -1363,15 +1395,24 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         train_score = _score(train_metrics, train)
         _print_round_table(ver, train.timerange, train_metrics)
         train_trades = _safe_int(train_metrics.get("total_trades"))
-        high_freq_risk = train_trades > max_trades * 1.5
+        severe_trade_excess = train_trades > max_trades * 1.5
+        mild_trade_excess = max_trades < train_trades <= max_trades * 1.5
+        high_freq_risk = train_trades > max_trades
 
         val_scores = []
         validation_metrics: list[dict[str, Any]] = []
+        hard_invalid_reason: str | None = None
         if train_trades == 0:
-            print("训练区间 total_trades=0，立即判无效并跳过所有验证区间回测。")
+            hard_invalid_reason = "训练区间无交易"
+        elif train_trades < min_trades:
+            hard_invalid_reason = "训练区间交易数低于目标下限"
+        elif severe_trade_excess:
+            hard_invalid_reason = "训练区间交易数严重超过目标上限"
+        if hard_invalid_reason:
+            print(f"训练区间触发硬约束：{hard_invalid_reason}，跳过所有验证区间回测。")
         else:
-            if high_freq_risk:
-                print(f"训练区间交易数 {train_trades} > 目标上限 {max_trades} 的 1.5 倍，标记为高频风险（继续回测）。")
+            if mild_trade_excess:
+                print(f"训练区间交易数 {train_trades} 超过目标上限 {max_trades}，允许继续验证但本轮不可成为有效 best。")
             for p in validations:
                 print(f"7. 正在回测验证区间：{p.timerange}")
                 vcmd = train_cmd.copy()
@@ -1401,6 +1442,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         overfit_penalty = max(0.0, train_score - validation_score) * 0.3
         baseline_ok, baseline_reason, baseline_dd_penalty = _baseline_gate_and_penalty(train_metrics, runtime_goal)
         final_score = train_score * 0.6 + validation_score * 0.4 - overfit_penalty - baseline_dd_penalty
+        if train_trades > max_trades:
+            final_score = min(final_score, 0.0)
         is_overfit = train_score > validation_score * 1.3 if validation_score else True
         zero_reason = _score_zero_reason(final_score, train_metrics, validation_metrics, validation_score)
         if zero_reason:
@@ -1416,6 +1459,12 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             zero_trade_streak = 0
 
         is_valid, invalid_reason = _validate_round(train_metrics, validation_metrics, final_score)
+        if hard_invalid_reason:
+            is_valid = False
+            invalid_reason = hard_invalid_reason
+        elif mild_trade_excess:
+            is_valid = False
+            invalid_reason = "训练区间交易数超过目标上限"
         if is_valid and not baseline_ok:
             is_valid = False
             invalid_reason = baseline_reason
@@ -1451,6 +1500,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         }
         write_json(run_dir / f"round_{i:03d}.json", round_data)
         is_best = is_valid and final_score > 0 and (best is None or final_score > float(best["final_score"]))
+        if session_best is None or final_score > float(session_best.get("final_score", -1e18)):
+            session_best = {"version": ver, "class_name": class_name, "final_score": final_score, "is_valid": is_valid, "invalid_reason": invalid_reason}
         score_breakdown = {
             "train_score": train_score,
             "validation_score": validation_score,
@@ -1590,12 +1641,15 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     max_trades_target = _safe_int(target_cfg.get("max_trades", 80))
     baseline_profit_pct = _safe_float(baseline_cfg.get("profit_total_pct"))
 
-    def _is_eligible_nearest(row: dict[str, Any]) -> bool:
+    def _is_eligible_nearest(row: dict[str, Any], allow_oversized: bool) -> bool:
         total_trades = _safe_int(row.get("total_trades"))
         if total_trades <= 0:
             return False
-        final_score_val = _safe_float(row.get("final_score"))
-        if final_score_val <= 0 and total_trades == 0:
+        if total_trades < _safe_int(target_cfg.get("min_trades", 25)):
+            return False
+        if total_trades > int(max_trades_target * 1.5):
+            return False
+        if total_trades > max_trades_target and not allow_oversized:
             return False
         return not row.get("is_valid")
 
@@ -1610,7 +1664,11 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         trade_penalty = max(0, total_trades - max_trades_target)
         return (profit_gap, drawdown_penalty, -profit_factor, float(trade_penalty))
 
-    nearest_failed_candidates = [row for row in leaderboard_sorted if _is_eligible_nearest(row)]
+    nearest_failed_candidates = [row for row in leaderboard_sorted if _is_eligible_nearest(row, allow_oversized=False)]
+    oversized_fallback = False
+    if not nearest_failed_candidates:
+        nearest_failed_candidates = [row for row in leaderboard_sorted if _is_eligible_nearest(row, allow_oversized=True)]
+        oversized_fallback = True
     closest_failed = sorted(nearest_failed_candidates, key=_nearest_sort_key)[0] if nearest_failed_candidates else None
     nearest_candidate = None
     if closest_failed:
@@ -1630,6 +1688,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 "profit_factor_delta": _safe_float(closest_failed.get("profit_factor")) - _safe_float(baseline_cfg.get("profit_factor")),
             },
         }
+        if oversized_fallback and _safe_int(closest_failed.get("total_trades")) > max_trades_target:
+            nearest_candidate["trade_over_limit"] = True
+            nearest_candidate["why_nearest"] += "（本轮无 25~80 笔候选，使用 81~120 笔超标候选仅作参考）"
         write_json(NEAREST_CANDIDATE_FILE, nearest_candidate)
 
     historical_best = read_json(BEST_STRATEGY_FILE) if BEST_STRATEGY_FILE.exists() else None
@@ -1669,6 +1730,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         current_best_saved = {"strategy_class": best["class_name"], "strategy_file": str(best_strategy_file), "source_run_id": run_id, "version": best_version, "train_metrics": best["train_metrics"], "validation_metrics": [], "avg_validation_metrics": {"profit_total_pct": next((r.get("avg_validation_profit_pct", 0.0) for r in leaderboard_sorted if r.get("version") == best_version), 0.0)}, "score_breakdown": {}, "final_score": best["final_score"], "created_at": datetime.utcnow().isoformat(), "why_best": "本轮 final_score 最高。", "is_overfit": bool(best.get("is_overfit"))}
         write_json(BEST_STRATEGY_FILE, current_best_saved)
     else:
+        if args.force_session_best and session_best:
+            write_json(run_dir / "session_best.json", session_best)
         print("本次没有找到有效新策略，当前最佳策略保持不变。")
         print("本轮失败策略共同原因：")
         print("- 交易数过高")
@@ -1679,6 +1742,19 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         print("- 降低目标交易数到 25~80")
         print("- 不要继续宽松高频入场")
         print("- 优先控制止损损失")
+        if reset_best_used:
+            print("已初始化历史最佳策略，但本轮没有产生有效新 best。")
+            print("正式 best 暂为空，nearest_candidate 已保存。")
+    print("\n========== 结束状态 ==========")
+    if current_best_saved:
+        print(f"当前正式 best：来源=本轮新 best；策略名={current_best_saved.get('strategy_class')}；final_score={_safe_float(current_best_saved.get('final_score')):.4f}")
+    elif historical_best and historical_best.get("strategy_class") and historical_best.get("source") != "reset":
+        print(f"当前正式 best：来源=历史 best；策略名={historical_best.get('strategy_class')}；final_score={_safe_float(historical_best.get('final_score')):.4f}")
+    else:
+        print("当前正式 best：来源=无")
+    if session_best:
+        reason = session_best.get("invalid_reason") or ("通过" if session_best.get("is_valid") else "未通过有效性约束")
+        print(f"本轮 session best：策略名={session_best.get('class_name')}；final_score={_safe_float(session_best.get('final_score')):.4f}；未成为正式 best 原因：{reason}")
     if closest_failed:
         print("========== 本轮最接近目标的失败策略 ==========")
         print(f"版本：{closest_failed.get('version')}")
@@ -1737,6 +1813,8 @@ def main() -> None:
     parser.add_argument("--print-current-best", dest="print_current_best", action="store_true", default=True)
     parser.add_argument("--no-print-current-best", dest="print_current_best", action="store_false")
     parser.add_argument("--retest-current-best-at-end", action="store_true", default=False)
+    parser.add_argument("--reset-best", action="store_true", default=False)
+    parser.add_argument("--force-session-best", action="store_true", default=False)
     args = parser.parse_args()
 
     goal_path = ROOT_DIR / args.goal
@@ -1749,7 +1827,10 @@ def main() -> None:
         args.auto_approve = True
     if runtime_goal.get("runtime_force_download", False):
         args.force_download = True
+    if runtime_goal.get("runtime_reset_best", False):
+        args.reset_best = True
 
+    maybe_reset_best_strategy(args.reset_best)
 
     effective_iterations = args.iterations if args.iterations is not None else int(runtime_goal.get("max_iterations", 5))
     runtime_goal["max_iterations"] = int(effective_iterations)
