@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import re
@@ -385,19 +386,60 @@ def ask_ai(client: OpenAI, model: str, messages: list[dict[str, str]], timeout_s
 
 
 
-def has_enter_long_assignment(strategy_file: Path) -> bool:
+def _is_true_or_one(node: ast.AST) -> bool:
+    if isinstance(node, ast.Constant):
+        return node.value in {1, True}
+    if isinstance(node, ast.NameConstant):
+        return node.value in {1, True}
+    if isinstance(node, ast.Tuple):
+        return any(_is_true_or_one(el) for el in node.elts)
+    if isinstance(node, ast.List):
+        return any(_is_true_or_one(el) for el in node.elts)
+    return False
+
+
+def _target_contains_enter_long(target: ast.AST) -> bool:
+    if isinstance(target, ast.Subscript):
+        segment = ast.unparse(target)
+        return "enter_long" in segment
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return any(_target_contains_enter_long(el) for el in target.elts)
+    return False
+
+
+def check_entry_long_static(strategy_file: Path) -> tuple[bool, str | None]:
     content = strategy_file.read_text(encoding="utf-8")
-    if "populate_entry_trend" not in content:
-        return False
-    entry_func = re.search(
-        r"def\s+populate_entry_trend\s*\(.*?\):(?P<body>.*?)(?:\n\s*def\s+|\Z)",
-        content,
-        flags=re.DOTALL,
-    )
-    if not entry_func:
-        return False
-    body = entry_func.group("body")
-    return bool(re.search(r"enter_long\s*\]\s*=\s*1|enter_long\s*=\s*1", body))
+    try:
+        tree = ast.parse(content)
+    except SyntaxError as exc:
+        return False, f"静态检查失败：策略代码语法解析失败（{exc.msg}）"
+
+    target_func: ast.FunctionDef | ast.AsyncFunctionDef | None = None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "populate_entry_trend":
+            target_func = node
+            break
+    if target_func is None:
+        return False, "静态检查失败：缺少 populate_entry_trend 函数"
+
+    body_text = "\n".join(ast.unparse(stmt) for stmt in target_func.body)
+    if "enter_long" not in body_text:
+        return False, "静态检查失败：populate_entry_trend 函数体未出现 enter_long"
+
+    for stmt in ast.walk(target_func):
+        if isinstance(stmt, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+            value = stmt.value if hasattr(stmt, "value") else None
+            if value is None:
+                continue
+            targets = []
+            if isinstance(stmt, ast.Assign):
+                targets = stmt.targets
+            else:
+                targets = [stmt.target]
+            if any(_target_contains_enter_long(t) for t in targets) and _is_true_or_one(value):
+                return True, None
+
+    return False, "静态检查失败：populate_entry_trend 中未检测到 enter_long 被赋值为 1 或 True"
 
 
 def _validate_round(train_metrics: dict[str, Any], validation_metrics: list[dict[str, Any]], final_score: float) -> tuple[bool, str | None]:
@@ -778,12 +820,14 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             print(f"第 {i} 轮语法检查失败，跳过。")
             continue
         validate_strategy_class_name(strategy_file, class_name)
-        if not has_enter_long_assignment(strategy_file):
-            invalid_reason = "静态检查失败：populate_entry_trend 未设置 enter_long=1"
+        static_ok, static_reason = check_entry_long_static(strategy_file)
+        if not static_ok:
+            invalid_reason = static_reason or "静态检查失败"
             previous_failure_reason = invalid_reason
             leaderboard.append({
                 "version": ver,
                 "strategy_class": class_name,
+                "strategy_file": str(strategy_file),
                 "final_score": 0.0,
                 "train_profit_pct": 0.0,
                 "avg_validation_profit_pct": 0.0,
@@ -796,6 +840,20 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 "invalid_reason": invalid_reason,
             })
             print(f"第 {i} 轮无效：{invalid_reason}")
+            print(f"策略文件路径：{strategy_file}")
+            print(f"策略类名：{class_name}")
+            print(f"失败原因：{invalid_reason}")
+            print("本轮策略未通过静态检查，没有执行回测。")
+            print("生成策略已保存，可手动查看：")
+            print(f"sed -n '1,260p' {strategy_file}")
+            print("建议手动回测命令：")
+            print("docker compose run --rm freqtrade backtesting \\")
+            print(f"  --config {config} \\")
+            print(f"  --strategy {class_name} \\")
+            print(f"  --timeframe {timeframe} \\")
+            print(f"  --timerange {train.timerange} \\")
+            print("  --export trades \\")
+            print("  --cache none")
             continue
 
         print(f"正在回测训练区间：{train.timerange}")
@@ -950,6 +1008,16 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
 
     leaderboard_sorted = sorted(leaderboard, key=lambda x: float(x["final_score"]), reverse=True)
     best_version = None
+    valid_rows = [row for row in leaderboard_sorted if row.get("is_valid")]
+    invalid_rows = [row for row in leaderboard_sorted if not row.get("is_valid")]
+    generated_rows = [f"{row.get('version')}:{row.get('strategy_class')}" for row in leaderboard_sorted]
+    print("\n===== 本次运行摘要 =====")
+    print(f"运行目录：{run_dir}")
+    print("生成策略：" + ("、".join(generated_rows) if generated_rows else "无"))
+    print("有效策略：" + ("、".join(f"{row['version']}:{row['strategy_class']}" for row in valid_rows) if valid_rows else "无"))
+    print("无效策略：" + ("、".join(f"{row['version']}:{row['strategy_class']}({row.get('invalid_reason')})" for row in invalid_rows) if invalid_rows else "无"))
+    print(f"当前最佳策略是否更新：{'是' if best else '否'}")
+
     if best:
         best_version = f"v{int(best['iteration']):03d}"
     for row in leaderboard_sorted:
@@ -965,8 +1033,22 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         print(f"- leaderboard.json 路径: {run_dir / 'leaderboard.json'}")
         if best_summary_path:
             print(f"- summary.json 路径: {best_summary_path}")
+        print("最佳策略简述：")
+        print(f"- 策略名：{best['class_name']}")
+        print(f"- 策略文件路径：{best_strategy_file}")
+        print(f"- 训练区间收益：{_safe_float(best['train_metrics'].get('profit_total_pct')):.2f}%")
+        avg_val_profit = next((r.get('avg_validation_profit_pct', 0.0) for r in leaderboard_sorted if r.get('version') == best_version), 0.0)
+        print(f"- 验证区间平均收益：{_safe_float(avg_val_profit):.2f}%")
+        print(f"- 交易数：{_safe_int(best['train_metrics'].get('total_trades'))}")
+        print(f"- 胜率：{_safe_float(best['train_metrics'].get('winrate')) * 100:.2f}%")
+        print(f"- Profit Factor：{_safe_float(best['train_metrics'].get('profit_factor')):.4f}")
+        print(f"- 最大回撤：{_safe_float(best['train_metrics'].get('max_drawdown')) * 100:.2f}%")
+        print(f"- 是否疑似过拟合：{'是' if best.get('is_overfit') else '否'}")
+        stop_loss_abs = _safe_float(best['train_metrics'].get('stop_loss_abs'))
+        issue = "stop_loss 亏损过大" if stop_loss_abs < 0 else "暂无明显止损亏损异常"
+        print(f"- 主要问题：{issue}")
     else:
-        print("自动优化完成，但没有找到有效策略，当前最佳策略保持不变。")
+        print("本次没有找到有效新策略，当前最佳策略保持不变。")
 
 
 def main() -> None:
