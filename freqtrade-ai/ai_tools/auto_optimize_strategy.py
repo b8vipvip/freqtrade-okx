@@ -43,6 +43,7 @@ BEST_STRATEGY_FILE = ROOT_DIR / "user_data" / "ai_memory" / "best_strategy.json"
 RESET_HISTORY_FILE = ROOT_DIR / "user_data" / "ai_memory" / "reset_history.json"
 NEAREST_CANDIDATE_FILE = ROOT_DIR / "user_data" / "ai_memory" / "nearest_candidate.json"
 LAST_RUN_SUMMARY_FILE = ROOT_DIR / "user_data" / "ai_memory" / "last_run_summary.json"
+ITERATION_STATS_FILE_NAME = "iteration_stats.json"
 MEMORY_EXAMPLE_FILE = ROOT_DIR / "ai_tools" / "strategy_memory.example.json"
 BLACKLIST_EXAMPLE_FILE = ROOT_DIR / "ai_tools" / "strategy_blacklist.example.json"
 LESSONS_EXAMPLE_FILE = ROOT_DIR / "ai_tools" / "strategy_lessons.example.json"
@@ -1360,12 +1361,50 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     best_summary_path: Path | None = None
     stop_on_ai_error = bool(runtime_goal.get("stop_on_ai_error", False))
     ai_runtime_state = {"last_ai_call_time": 0.0, "ai_call_cooldown_seconds": float(args.ai_call_cooldown_seconds)}
+    iteration_stats_path = run_dir / ITERATION_STATS_FILE_NAME
+    version_statuses: list[dict[str, Any]] = []
+    iteration_stats: dict[str, Any] = {
+        "planned_iterations": int(runtime_goal.get("max_iterations", args.iterations)),
+        "advisor_success_count": 0,
+        "codegen_success_count": 0,
+        "generated_versions_count": 0,
+        "train_backtest_count": 0,
+        "validation_backtest_count": 0,
+        "validation_backtest_total_count": 0,
+        "skipped_validation_count": 0,
+        "valid_strategy_count": 0,
+        "invalid_strategy_count": 0,
+        "new_best_update_count": 0,
+        "current_iteration_version": "",
+        "history_strategy_total_count": 0,
+        "version_statuses": version_statuses,
+    }
+
+    def flush_iteration_stats() -> None:
+        iteration_stats["history_strategy_total_count"] = len(_read_json_list_file(MEMORY_FILE)) if MEMORY_FILE.exists() else 0
+        write_json(iteration_stats_path, iteration_stats)
     for i in range(1, iterations + 1):
         ver = f"v{i:03d}"
+        iteration_stats["current_iteration_version"] = ver
         class_name = f"{strategy_family}_{run_id}_{ver}"
         strategy_file = STRATEGY_DIR / f"{class_name}.py"
         version_dir = run_dir / ver
         version_dir.mkdir(parents=True, exist_ok=True)
+        status = {
+            "version": ver,
+            "strategy_class": class_name,
+            "advisor_status": "未执行",
+            "codegen_status": "未执行",
+            "syntax_check_status": "未执行",
+            "static_check_status": "未执行",
+            "train_backtest_status": "未执行",
+            "validation_backtest_status": "未执行",
+            "is_valid": False,
+            "is_best": False,
+            "invalid_reason": "",
+            "final_score": 0.0,
+        }
+        version_statuses.append(status)
         print(f"\n========== 第 {i} 轮 / {ver} ==========")
         print("1. 正在生成 mutation_spec（冠军-挑战者小步改动）……")
         print(f"当前策略顾问模型：{advisor_model}{' (fallback)' if advisor_fallback else ''}")
@@ -1408,6 +1447,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 max_retries=max(0, int(args.ai_max_retries)),
             )
             print("策略顾问模型返回完成。")
+            status["advisor_status"] = "成功"
+            iteration_stats["advisor_success_count"] += 1
             delay_sec = max(0.0, float(args.advisor_to_codegen_delay_seconds))
             if delay_sec > 0:
                 print(f"策略顾问模型完成，将等待 {int(delay_sec)} 秒后调用代码生成模型，避免中转站请求过快。")
@@ -1419,7 +1460,11 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             invalid_reason = previous_failure_reason
             write_json(version_dir / "summary.json", {"is_valid": False, "invalid_reason": invalid_reason})
             leaderboard.append({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": invalid_reason})
+            status["advisor_status"] = "AI 调用失败"
+            status["invalid_reason"] = invalid_reason
+            iteration_stats["invalid_strategy_count"] += 1
             print(previous_failure_reason)
+            flush_iteration_stats()
             if stop_on_ai_error:
                 print("已设置 stop_on_ai_error=true，停止后续轮次。")
                 break
@@ -1505,6 +1550,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             leaderboard.append({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": invalid_reason})
             continue
         (version_dir / "codegen.raw.txt").write_text(response_text, encoding="utf-8")
+        status["codegen_status"] = "成功"
+        iteration_stats["codegen_success_count"] += 1
         code = extract_python_code(response_text)
         features = extract_strategy_features(code)
         signature = _feature_signature(features)
@@ -1529,6 +1576,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         shutil.copy2(strategy_file, version_dir / "strategy.py")
         GENERATED_DIR.mkdir(parents=True, exist_ok=True)
         shutil.copy2(strategy_file, GENERATED_DIR / strategy_file.name)
+        iteration_stats["generated_versions_count"] += 1
         print(f"4. 策略代码已保存：{version_dir / 'strategy.py'}")
 
         print("5. 正在检查 Python 语法……")
@@ -1625,6 +1673,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         train_zip = _select_backtest_zip(results_dir, train_before_zips, train_start_ts)
         train_result = parse_backtest_from_zip(train_zip, class_name)
         train_metrics = _extract_metrics(train_result)
+        status["train_backtest_status"] = "已训练回测"
+        iteration_stats["train_backtest_count"] += 1
         prev_train_trades = int(train_metrics.get("total_trades", 0) or 0)
         write_json(version_dir / "train_metrics.json", train_metrics)
         train_score = _score(train_metrics, train)
@@ -1645,6 +1695,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             hard_invalid_reason = "训练区间交易数严重超过目标上限"
         if hard_invalid_reason:
             print(f"训练区间触发硬约束：{hard_invalid_reason}，跳过所有验证区间回测。")
+            status["validation_backtest_status"] = "跳过验证"
+            iteration_stats["skipped_validation_count"] += 1
         else:
             if mild_trade_excess:
                 print(f"训练区间交易数 {train_trades} 超过目标上限 {max_trades}，允许继续验证但本轮不可成为有效 best。")
@@ -1664,8 +1716,12 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 val_zip = _select_backtest_zip(results_dir, val_before_zips, val_start_ts)
                 vm = _extract_metrics(parse_backtest_from_zip(val_zip, class_name))
                 validation_metrics.append({"period": p.name, "timerange": p.timerange, "metrics": vm})
+                iteration_stats["validation_backtest_total_count"] += 1
                 _print_round_table(ver, p.timerange, vm)
                 val_scores.append(_score(vm, p))
+            if validation_metrics:
+                status["validation_backtest_status"] = "已验证回测"
+                iteration_stats["validation_backtest_count"] += 1
         validation_score = sum(val_scores) / len(val_scores) if val_scores else 0.0
         write_json(
             version_dir / "validation_metrics.json",
@@ -1735,6 +1791,20 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         }
         write_json(run_dir / f"round_{i:03d}.json", round_data)
         is_best = is_valid and final_score > 0 and (best is None or final_score > float(best["final_score"]))
+        status["is_valid"] = bool(is_valid)
+        status["is_best"] = bool(is_best)
+        status["invalid_reason"] = str(invalid_reason or "")
+        status["final_score"] = float(final_score)
+        if validation_metrics:
+            status["validation_backtest_status"] = "已完成"
+            iteration_stats["validation_backtest_count"] += 1
+        elif "跳过" in str(invalid_reason or "") or _safe_int(train_metrics.get("total_trades")) == 0:
+            status["validation_backtest_status"] = "跳过"
+            iteration_stats["skipped_validation_count"] += 1
+        if is_valid:
+            iteration_stats["valid_strategy_count"] += 1
+        else:
+            iteration_stats["invalid_strategy_count"] += 1
         if session_best is None or final_score > float(session_best.get("final_score", -1e18)):
             session_best = {"version": ver, "class_name": class_name, "final_score": final_score, "is_valid": is_valid, "invalid_reason": invalid_reason}
         score_breakdown = {
@@ -1856,12 +1926,14 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             })
         if is_best:
             best = round_data
+            iteration_stats["new_best_update_count"] += 1
             best_summary_path = summary_path
             write_json(run_dir / "best_strategy.json", best)
             shutil.copy2(strategy_file, GENERATED_DIR / f"BEST_{strategy_family}.py")
             champion = {"meta": {"strategy_class": class_name, "strategy_file": str(strategy_file), "train_metrics": train_metrics}, "code": code}
         print(f"8. 第 {i} 轮完成：{'有效' if is_valid else '无效'}，原因：{invalid_reason or '通过'}")
         print(f"是否成为新最佳：{'是' if is_best else '否'}")
+        flush_iteration_stats()
         if zero_trade_streak >= 3:
             print("连续 3 轮无交易，可能是 AI prompt 或策略模板过于保守，请检查生成策略代码。")
             break
@@ -2059,6 +2131,27 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     print(f"下一轮 advisor prompt 将加载 last_run_summary：{'是' if LAST_RUN_SUMMARY_FILE.exists() else '否'}")
     print(f"下一轮 advisor prompt 将加载 nearest_candidate：{'是' if NEAREST_CANDIDATE_FILE.exists() else '否'}")
     print(f"下一轮 advisor prompt 将加载 historical_best：{'是' if BEST_STRATEGY_FILE.exists() else '否'}")
+    flush_iteration_stats()
+    print("\n========== 本次迭代统计 ==========")
+    print(f"计划迭代轮数：{iteration_stats.get('planned_iterations')}")
+    print(f"策略顾问成功次数：{iteration_stats.get('advisor_success_count')}")
+    print(f"代码生成成功次数：{iteration_stats.get('codegen_success_count')}")
+    print(f"实际生成策略版本数：{iteration_stats.get('generated_versions_count')}")
+    print(f"训练回测版本数：{iteration_stats.get('train_backtest_count')}")
+    print(f"验证回测版本数：{iteration_stats.get('validation_backtest_count')}")
+    print(f"验证区间回测总次数：{iteration_stats.get('validation_backtest_total_count')}")
+    print(f"跳过验证版本数：{iteration_stats.get('skipped_validation_count')}")
+    print(f"有效策略数：{iteration_stats.get('valid_strategy_count')}")
+    print(f"无效策略数：{iteration_stats.get('invalid_strategy_count')}")
+    print(f"新 best 更新次数：{iteration_stats.get('new_best_update_count')}")
+    print(f"当前策略迭代版本：{iteration_stats.get('current_iteration_version')}")
+    print(f"累计历史策略版本数：{iteration_stats.get('history_strategy_total_count')}")
+    print(f"统计文件：{iteration_stats_path}")
+    print("详细状态：")
+    for row in version_statuses:
+        print(
+            f"{row.get('version')}：顾问={row.get('advisor_status')} / 代码={row.get('codegen_status')} / 语法={row.get('syntax_check_status')} / 静态={row.get('static_check_status')} / 训练={row.get('train_backtest_status')} / 验证={row.get('validation_backtest_status')} / 有效={'是' if row.get('is_valid') else '否'} / 新best={'是' if row.get('is_best') else '否'} / 原因={row.get('invalid_reason') or '通过'}"
+        )
     print("\n========== Prompt 审计文件 ==========")
     for p in sorted(run_dir.glob('v*/advisor_prompt.txt')):
         print(p)
