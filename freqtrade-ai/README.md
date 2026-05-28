@@ -155,6 +155,14 @@ python3 ai_tools/auto_optimize_strategy.py \
 ```
 说明：遇到风险提示时自动继续，不再人工确认。
 
+如果 AI 生成策略等待时间较长，可以增加超时时间，例如：
+```bash
+python3 ai_tools/auto_optimize_strategy.py \
+  --goal ai_tools/optimization_goal.json \
+  --iterations 5 \
+  --ai-timeout 600
+```
+
 ### 18.5 历史数据下载策略（默认）
 - 脚本启动后会先检查 `user_data/data/<exchange>/` 本地历史数据。
 - 检查维度包括：交易所、`pair_whitelist`、`timeframes`、下载区间/训练区间/验证区间。
