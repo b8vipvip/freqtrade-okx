@@ -1567,19 +1567,6 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             write_json(run_dir / "best_strategy.json", best)
             shutil.copy2(strategy_file, GENERATED_DIR / f"BEST_{strategy_family}.py")
             champion = {"meta": {"strategy_class": class_name, "strategy_file": str(strategy_file), "train_metrics": train_metrics}, "code": code}
-        elif improvement_vs_champion["profit_total_pct_delta"] > 0:
-            nearest_candidate = {
-                "strategy_class": class_name,
-                "strategy_file": str(strategy_file),
-                "why_nearest": "较 champion 有部分改进但未达到最终目标。",
-                "train_metrics": train_metrics,
-                "validation_metrics": validation_metrics,
-                "improvement_vs_baseline": {
-                    "profit_total_pct_delta": _safe_float(train_metrics.get("profit_total_pct")) - _safe_float(baseline_cfg.get("profit_total_pct")),
-                    "profit_factor_delta": _safe_float(train_metrics.get("profit_factor")) - _safe_float(baseline_cfg.get("profit_factor")),
-                },
-            }
-            write_json(NEAREST_CANDIDATE_FILE, nearest_candidate)
         print(f"8. 第 {i} 轮完成：{'有效' if is_valid else '无效'}，原因：{invalid_reason or '通过'}")
         print(f"是否成为新最佳：{'是' if is_best else '否'}")
         if zero_trade_streak >= 3:
@@ -1597,7 +1584,53 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     print("有效策略：" + ("、".join(f"{row['version']}:{row['strategy_class']}" for row in valid_rows) if valid_rows else "无"))
     print("无效策略：" + ("、".join(f"{row['version']}:{row['strategy_class']}({row.get('invalid_reason')})" for row in invalid_rows) if invalid_rows else "无"))
     print(f"当前最佳策略是否更新：{'是' if best else '否'}")
-    closest_failed = next((row for row in leaderboard_sorted if not row.get("is_valid")), None)
+    target_cfg = (runtime_goal.get("target", {}) or {})
+    baseline_cfg = (runtime_goal.get("baseline", {}) or {})
+    max_drawdown_target = _safe_float(target_cfg.get("max_drawdown_pct", 3.0))
+    max_trades_target = _safe_int(target_cfg.get("max_trades", 80))
+    baseline_profit_pct = _safe_float(baseline_cfg.get("profit_total_pct"))
+
+    def _is_eligible_nearest(row: dict[str, Any]) -> bool:
+        total_trades = _safe_int(row.get("total_trades"))
+        if total_trades <= 0:
+            return False
+        final_score_val = _safe_float(row.get("final_score"))
+        if final_score_val <= 0 and total_trades == 0:
+            return False
+        return not row.get("is_valid")
+
+    def _nearest_sort_key(row: dict[str, Any]) -> tuple[float, float, float, float]:
+        profit_pct = _safe_float(row.get("train_profit_pct"))
+        drawdown_pct = _safe_float(row.get("max_drawdown_pct"))
+        profit_factor = _safe_float(row.get("profit_factor"))
+        total_trades = _safe_int(row.get("total_trades"))
+
+        profit_gap = abs(profit_pct - baseline_profit_pct)
+        drawdown_penalty = max(0.0, drawdown_pct - max_drawdown_target)
+        trade_penalty = max(0, total_trades - max_trades_target)
+        return (profit_gap, drawdown_penalty, -profit_factor, float(trade_penalty))
+
+    nearest_failed_candidates = [row for row in leaderboard_sorted if _is_eligible_nearest(row)]
+    closest_failed = sorted(nearest_failed_candidates, key=_nearest_sort_key)[0] if nearest_failed_candidates else None
+    nearest_candidate = None
+    if closest_failed:
+        nearest_candidate = {
+            "strategy_class": closest_failed.get("strategy_class"),
+            "strategy_file": closest_failed.get("strategy_file"),
+            "why_nearest": "在有交易失败策略中，收益最接近 baseline，且回撤/交易数惩罚更低、PF 更优。",
+            "train_metrics": {
+                "profit_total_pct": closest_failed.get("train_profit_pct"),
+                "profit_factor": closest_failed.get("profit_factor"),
+                "max_drawdown_pct": closest_failed.get("max_drawdown_pct"),
+                "total_trades": closest_failed.get("total_trades"),
+            },
+            "validation_metrics": [],
+            "improvement_vs_baseline": {
+                "profit_total_pct_delta": _safe_float(closest_failed.get("train_profit_pct")) - baseline_profit_pct,
+                "profit_factor_delta": _safe_float(closest_failed.get("profit_factor")) - _safe_float(baseline_cfg.get("profit_factor")),
+            },
+        }
+        write_json(NEAREST_CANDIDATE_FILE, nearest_candidate)
 
     historical_best = read_json(BEST_STRATEGY_FILE) if BEST_STRATEGY_FILE.exists() else None
     current_best_saved = None
@@ -1661,7 +1694,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             print(f"比 baseline 差异：{nearest_candidate.get('improvement_vs_baseline')}")
             print("下一轮应该怎么改：优先选择未失败过的 mutation_type，继续单点小步调整。")
         else:
-            print("本轮最接近目标 challenger：无")
+            print("本轮没有可参考 challenger。")
         print("本轮失败模式总结：高频风险 / 止损吞噬利润 / trailing 结构失败 / 相似失败策略。")
 
     if args.retest_current_best_at_end:
