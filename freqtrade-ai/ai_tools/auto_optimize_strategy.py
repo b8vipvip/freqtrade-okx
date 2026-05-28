@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import zipfile
 from dataclasses import dataclass
@@ -20,7 +21,7 @@ from typing import Any
 
 import pandas as pd
 
-from openai import OpenAI
+from openai import APITimeoutError, OpenAI
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 RESULT_ROOT = ROOT_DIR / "user_data" / "backtest_results" / "ai_optimization_runs"
@@ -354,9 +355,33 @@ def validate_strategy_class_name(strategy_file: Path, class_name: str) -> None:
         raise RuntimeError(f"策略文件类名校验失败：{strategy_file.name} 中未找到 class {class_name}(IStrategy):")
 
 
-def ask_ai(client: OpenAI, model: str, messages: list[dict[str, str]]) -> str:
-    res = client.chat.completions.create(model=model, messages=messages, temperature=0.2)
-    return (res.choices[0].message.content or "").strip()
+def ask_ai(client: OpenAI, model: str, messages: list[dict[str, str]], timeout_sec: int) -> str | None:
+    print("正在调用 AI 生成策略，请稍等……")
+    start_ts = time.time()
+    stop_event = threading.Event()
+
+    def _heartbeat() -> None:
+        while not stop_event.wait(10):
+            waited = int(time.time() - start_ts)
+            print(f"AI 正在生成策略中，已等待 {waited} 秒……")
+            if waited > timeout_sec:
+                print(f"AI 调用超过 {timeout_sec} 秒，可能是中转站响应过慢。")
+
+    heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
+    heartbeat_thread.start()
+    try:
+        res = client.chat.completions.create(model=model, messages=messages, temperature=0.2)
+    except APITimeoutError:
+        print("AI 调用超时，本轮策略生成失败。")
+        return None
+    finally:
+        stop_event.set()
+        heartbeat_thread.join(timeout=1)
+
+    content = (res.choices[0].message.content or "").strip()
+    elapsed = int(time.time() - start_ts)
+    print(f"AI 策略生成完成，用时 {elapsed} 秒，返回字符数 {len(content)}。")
+    return content
 
 
 
@@ -662,7 +687,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         raise RuntimeError("未检测到 OPENAI_API_KEY，请检查 .env。")
     base_url = (os.getenv("OPENAI_BASE_URL") or "").strip() or None
     model = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
-    client = OpenAI(api_key=api_key, base_url=base_url)
+    client = OpenAI(api_key=api_key, base_url=base_url, timeout=args.ai_timeout)
 
     best: dict[str, Any] | None = None
     prev_train_trades: int | None = None
@@ -677,6 +702,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         version_dir = run_dir / ver
         version_dir.mkdir(parents=True, exist_ok=True)
         print(f"正在生成第 {i} 版策略……")
+        print(f"当前 AI 模型：{model}")
         target_cfg = runtime_goal.get("target", {}) or {}
         baseline_cfg = runtime_goal.get("baseline", {}) or {}
         min_trades = int(target_cfg.get("min_trades", 80))
@@ -714,7 +740,31 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "- 只输出可运行的完整 Python 策略代码，不要解释。\n"
             "- 避免把入场条件写成几乎永远不触发的苛刻组合。\n"
         )
-        code = extract_python_code(ask_ai(client, model, [{"role": "user", "content": prompt}]))
+        max_attempts = max(1, int(args.ai_max_retries))
+        response_text: str | None = None
+        for attempt in range(1, max_attempts + 1):
+            if attempt > 1:
+                print(f"正在第 {attempt - 1} 次重试 AI 生成策略……")
+            response_text = ask_ai(client, model, [{"role": "user", "content": prompt}], timeout_sec=args.ai_timeout)
+            if response_text:
+                break
+
+            if attempt >= max_attempts:
+                break
+            if args.auto_approve and attempt == 1:
+                continue
+            if args.auto_approve:
+                break
+
+            retry_answer = input("是否重试？y/n\n").strip()
+            if parse_yes_no(retry_answer) is not True:
+                break
+
+        if not response_text:
+            previous_failure_reason = "AI 调用失败或超时，未生成策略代码。"
+            print("本轮停止：AI 多次失败，跳过本轮回测。")
+            continue
+        code = extract_python_code(response_text)
         strategy_file.parent.mkdir(parents=True, exist_ok=True)
         strategy_file.write_text(code, encoding="utf-8")
         shutil.copy2(strategy_file, version_dir / "strategy.py")
@@ -927,6 +977,8 @@ def main() -> None:
     parser.add_argument("--auto-approve", action="store_true")
     parser.add_argument("--skip-download", action="store_true")
     parser.add_argument("--force-download", action="store_true")
+    parser.add_argument("--ai-timeout", type=int, default=360, help="AI API 调用超时时间（秒）")
+    parser.add_argument("--ai-max-retries", type=int, default=2, help="AI 调用失败时最多尝试次数（含首次）")
     parser.add_argument("--no-wizard", action="store_true")
     parser.add_argument("--save-goal", action="store_true")
     parser.add_argument("--config", default="user_data/config.5coins.json")
