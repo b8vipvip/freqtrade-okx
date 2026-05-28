@@ -734,7 +734,54 @@ def _format_ai_error(exc: Exception) -> tuple[str, int | None]:
     return msg.strip(), status_code
 
 
-def ask_ai(client: OpenAI, model: str, messages: list[dict[str, str]], timeout_sec: int, max_retries: int = 3) -> str:
+def _should_retry_ai_error(error_message: str, status_code: int | None) -> bool:
+    msg = (error_message or "").lower()
+    retry_status_codes = {429, 502, 503, 504}
+    retry_keywords = [
+        "system_cpu_overloaded",
+        "system cpu overloaded",
+        "auth_unavailable",
+        "no auth available",
+        "rate limit",
+        "timeout",
+    ]
+    if status_code in retry_status_codes:
+        return True
+    return any(k in msg for k in retry_keywords)
+
+
+def _print_auth_unavailable_hint(error_message: str) -> None:
+    msg = (error_message or "").lower()
+    if "auth_unavailable" in msg or "no auth available" in msg or "providers=codex" in msg:
+        print("检测到中转站 provider 鉴权/通道不可用，这通常不是本地代码错误。")
+        print("建议稍后重试，或更换 OPENAI_MODEL / OPENAI_BASE_URL / 中转站分组。")
+
+
+def safe_ask_ai(
+    client: OpenAI,
+    model: str,
+    messages: list[dict[str, str]],
+    timeout_sec: int,
+    role_name: str,
+    state: dict[str, Any],
+    max_retries: int = 5,
+) -> str:
+    now = time.time()
+    last_call = float(state.get("last_ai_call_time", 0.0) or 0.0)
+    cooldown = max(0.0, float(state.get("ai_call_cooldown_seconds", 0.0) or 0.0))
+    elapsed_since_last = now - last_call if last_call > 0 else -1.0
+    wait_before_call = max(0.0, cooldown - elapsed_since_last) if elapsed_since_last >= 0 else 0.0
+    print("准备调用 AI：")
+    print(f"角色：{role_name}")
+    print(f"模型：{model}")
+    if elapsed_since_last < 0:
+        print("距离上次 AI 请求：首次调用")
+    else:
+        print(f"距离上次 AI 请求：{elapsed_since_last:.1f} 秒")
+    print(f"本次请求前等待：{wait_before_call:.1f} 秒")
+    if wait_before_call > 0:
+        time.sleep(wait_before_call)
+
     print("正在调用 AI 生成策略，请稍等……")
     start_ts = time.time()
     stop_event = threading.Event()
@@ -748,12 +795,11 @@ def ask_ai(client: OpenAI, model: str, messages: list[dict[str, str]], timeout_s
 
     heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
     heartbeat_thread.start()
-    retry_status_codes = {429, 502, 503, 504}
-    retry_waits = [15, 30, 60]
+    retry_waits = [5, 10, 30]
     res = None
     error_message = "未知错误"
     try:
-        for attempt in range(max_retries + 1):
+        for attempt in range(max(0, max_retries) + 1):
             try:
                 res = client.chat.completions.create(model=model, messages=messages, temperature=0.2)
                 break
@@ -761,7 +807,11 @@ def ask_ai(client: OpenAI, model: str, messages: list[dict[str, str]], timeout_s
                 error_message, status_code = _format_ai_error(exc)
                 if status_code == 503 and "system cpu overloaded" in error_message.lower():
                     print("提示：这是模型服务/中转站负载过高，不是本地代码错误。")
-                can_retry = attempt < max_retries and (status_code in retry_status_codes or isinstance(exc, (APITimeoutError, APIConnectionError, TimeoutError)))
+                _print_auth_unavailable_hint(error_message)
+                can_retry = attempt < max_retries and (
+                    _should_retry_ai_error(error_message, status_code)
+                    or isinstance(exc, (APITimeoutError, APIConnectionError, TimeoutError))
+                )
                 if can_retry:
                     wait_sec = retry_waits[min(attempt, len(retry_waits) - 1)]
                     print(f"AI 调用失败：{error_message}")
@@ -769,6 +819,8 @@ def ask_ai(client: OpenAI, model: str, messages: list[dict[str, str]], timeout_s
                     time.sleep(wait_sec)
                     continue
                 raise AIRequestFailed(error_message, status_code=status_code) from exc
+            finally:
+                state["last_ai_call_time"] = time.time()
     finally:
         stop_event.set()
         heartbeat_thread.join(timeout=1)
@@ -1219,6 +1271,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     leaderboard: list[dict[str, Any]] = []
     best_summary_path: Path | None = None
     stop_on_ai_error = bool(runtime_goal.get("stop_on_ai_error", False))
+    ai_runtime_state = {"last_ai_call_time": 0.0, "ai_call_cooldown_seconds": float(args.ai_call_cooldown_seconds)}
     for i in range(1, iterations + 1):
         ver = f"v{i:03d}"
         class_name = f"{strategy_family}_{run_id}_{ver}"
@@ -1246,14 +1299,20 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         spec_prompt += f"\n已失败 mutation_type（避免重复）={sorted(used_failed_mutations)}\n"
         print("正在调用策略顾问模型生成 mutation_spec……")
         try:
-            spec_text = ask_ai(
+            spec_text = safe_ask_ai(
                 advisor_client,
                 advisor_model,
                 [{"role": "user", "content": spec_prompt}],
                 timeout_sec=args.ai_timeout,
+                role_name="strategy_advisor",
+                state=ai_runtime_state,
                 max_retries=max(0, int(args.ai_max_retries)),
             )
             print("策略顾问模型返回完成。")
+            delay_sec = max(0.0, float(args.advisor_to_codegen_delay_seconds))
+            if delay_sec > 0:
+                print(f"策略顾问模型完成，将等待 {int(delay_sec)} 秒后调用代码生成模型，避免中转站请求过快。")
+                time.sleep(delay_sec)
         except AIRequestFailed as exc:
             spec_text = ""
             err_msg = str(exc)
@@ -1327,16 +1386,18 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         print("3. 正在调用 GPT-5.5 生成 Freqtrade 策略代码……")
         response_text = ""
         try:
-            response_text = ask_ai(
+            response_text = safe_ask_ai(
                 code_client,
                 code_model,
                 [{"role": "user", "content": prompt}],
                 timeout_sec=args.ai_timeout,
+                role_name="code_generator",
+                state=ai_runtime_state,
                 max_retries=max(0, int(args.ai_max_retries)),
             )
         except AIRequestFailed as exc:
             previous_failure_reason = f"代码生成模型调用失败：{str(exc)}"
-            invalid_reason = "代码生成模型调用失败"
+            invalid_reason = previous_failure_reason
             print("本轮停止：代码生成模型多次失败，跳过本轮回测。")
             if response_text:
                 (version_dir / "codegen.raw.txt").write_text(response_text, encoding="utf-8")
@@ -1376,11 +1437,13 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             print("策略代码语法错误，尝试修复一次。")
             repair_prompt = f"请修复以下策略代码，仅输出可运行 Python：\n错误信息:\n{pyc.stderr}\n代码:\n{code}"
             try:
-                repaired = ask_ai(
+                repaired = safe_ask_ai(
                     repair_client,
                     repair_model,
                     [{"role": "user", "content": repair_prompt}],
                     timeout_sec=args.ai_timeout,
+                    role_name="code_repair",
+                    state=ai_runtime_state,
                     max_retries=max(0, int(args.ai_max_retries)),
                 )
             except AIRequestFailed as exc:
@@ -1875,7 +1938,9 @@ def main() -> None:
     parser.add_argument("--skip-download", action="store_true")
     parser.add_argument("--force-download", action="store_true")
     parser.add_argument("--ai-timeout", type=int, default=360, help="AI API 调用超时时间（秒）")
-    parser.add_argument("--ai-max-retries", type=int, default=3, help="AI 调用失败时最多重试次数（不含首次）")
+    parser.add_argument("--ai-max-retries", type=int, default=int(os.getenv("AI_MAX_RETRIES", "5")), help="AI 调用失败时最多重试次数（不含首次）")
+    parser.add_argument("--ai-call-cooldown-seconds", type=float, default=float(os.getenv("AI_CALL_COOLDOWN_SECONDS", "5")), help="每次 AI 调用后到下一次调用前最小间隔秒数")
+    parser.add_argument("--advisor-to-codegen-delay-seconds", type=float, default=float(os.getenv("ADVISOR_TO_CODEGEN_DELAY_SECONDS", "5")), help="策略顾问成功后到代码生成前额外等待秒数")
     parser.add_argument("--no-wizard", action="store_true")
     parser.add_argument("--save-goal", action="store_true")
     parser.add_argument("--config", default="user_data/config.5coins.json")
