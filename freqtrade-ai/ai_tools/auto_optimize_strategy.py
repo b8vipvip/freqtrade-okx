@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import json
 import os
 import re
@@ -28,6 +29,9 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 RESULT_ROOT = ROOT_DIR / "user_data" / "backtest_results" / "ai_optimization_runs"
 GENERATED_DIR = ROOT_DIR / "user_data" / "strategies" / "generated"
 STRATEGY_DIR = ROOT_DIR / "user_data" / "strategies"
+MEMORY_FILE = ROOT_DIR / "ai_tools" / "strategy_memory.json"
+BLACKLIST_FILE = ROOT_DIR / "ai_tools" / "strategy_blacklist.json"
+LESSONS_FILE = ROOT_DIR / "ai_tools" / "strategy_lessons.json"
 TIMERANGE_RE = re.compile(r"^\d{8}-\d{8}$")
 
 
@@ -46,6 +50,21 @@ def read_json(path: Path) -> dict[str, Any]:
 def write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _read_json_list_file(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(raw, dict):
+        items = raw.get("items", [])
+        return items if isinstance(items, list) else []
+    return raw if isinstance(raw, list) else []
+
+
+def _write_json_list_file(path: Path, items: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"items": items}, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def parse_yes_no(value: str) -> bool | None:
@@ -308,13 +327,87 @@ def _print_round_table(version: str, interval: str, metrics: dict[str, Any]) -> 
     winrate = _safe_float(metrics.get("winrate")) * 100.0
     pf = _safe_float(metrics.get("profit_factor"))
     max_dd = _safe_float(metrics.get("max_drawdown")) * 100.0
-    roi_profit = _safe_float(metrics.get("roi_profit_total"))
-    stop_loss_abs = _safe_float(metrics.get("stop_loss_abs"))
+    roi_profit = _safe_float(metrics.get("roi_profit_abs"))
+    stop_loss_abs = _safe_float(metrics.get("stop_loss_profit_abs"))
     print("版本 | 区间 | 交易数 | 收益率 | 收益USDT | 胜率 | PF | 最大回撤 | ROI收益 | 止损亏损")
     print(
         f"{version} | {interval} | {trades} | {_format_pct(profit_pct)} | {profit_abs:.4f} | "
-        f"{_format_pct(winrate)} | {pf:.4f} | {_format_pct(max_dd)} | {_format_pct(roi_profit)} | {stop_loss_abs:.4f}"
+        f"{_format_pct(winrate)} | {pf:.4f} | {_format_pct(max_dd)} | {roi_profit:.4f} | {stop_loss_abs:.4f}"
     )
+
+
+def extract_strategy_features(strategy_code: str) -> dict[str, Any]:
+    lc = strategy_code.lower()
+    def _extract(pattern: str) -> str | None:
+        m = re.search(pattern, strategy_code, flags=re.IGNORECASE)
+        return m.group(1).strip() if m else None
+    indicators = [x for x in ["rsi", "ema", "macd", "bbands", "adx", "atr", "volume"] if x in lc]
+    keywords = []
+    mapping = [("RSI rebound", ["rsi", "rebound"]), ("EMA cross", ["ema", "cross"]), ("BB bounce", ["bb", "bounce"]),
+               ("MACD momentum", ["macd", "momentum"]), ("pullback", ["pullback"]), ("volume filter", ["volume"])]
+    for name, keys in mapping:
+        if all(k in lc for k in keys):
+            keywords.append(name)
+    return {
+        "minimal_roi": _extract(r"minimal_roi\s*=\s*(\{.*?\})"),
+        "stoploss": _extract(r"stoploss\s*=\s*([-\d\.]+)"),
+        "trailing_stop": _extract(r"trailing_stop\s*=\s*(True|False)"),
+        "use_exit_signal": _extract(r"use_exit_signal\s*=\s*(True|False)"),
+        "startup_candle_count": _extract(r"startup_candle_count\s*=\s*(\d+)"),
+        "indicators": indicators,
+        "uses_informative_1h": "1h" in lc and "informative" in lc,
+        "uses_position_adjustment": "position_adjustment" in lc,
+        "has_custom_stoploss": "def custom_stoploss" in lc,
+        "has_custom_exit": "def custom_exit" in lc,
+        "entry_keywords": keywords,
+    }
+
+
+def _feature_signature(features: dict[str, Any]) -> str:
+    key = {
+        "minimal_roi": features.get("minimal_roi"),
+        "stoploss": features.get("stoploss"),
+        "trailing_stop": features.get("trailing_stop"),
+        "use_exit_signal": features.get("use_exit_signal"),
+        "entry_keywords": sorted(features.get("entry_keywords", [])),
+    }
+    return hashlib.sha256(json.dumps(key, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+
+def strategy_similarity(sig_a: str, sig_b: str) -> float:
+    if sig_a == sig_b:
+        return 1.0
+    a, b = set(sig_a), set(sig_b)
+    return len(a & b) / max(1, len(a | b))
+
+
+def build_compact_strategy_context(memory: list[dict[str, Any]], baseline: dict[str, Any], max_items: int = 5, max_chars: int = 2500) -> str:
+    failed = [x for x in memory if not x.get("is_valid")]
+    failed = failed[-max_items:]
+    lines = [
+        "当前最佳基准：",
+        f"- profit_total_pct={_safe_float(baseline.get('profit_total_pct')):.2f}",
+        f"- profit_factor={_safe_float(baseline.get('profit_factor')):.4f}",
+        f"- max_drawdown_pct={_safe_float(baseline.get('max_drawdown_pct')):.2f}",
+        f"- total_trades={_safe_int(baseline.get('total_trades'))}",
+        "最近失败策略摘要：",
+    ]
+    for item in failed[-5:]:
+        tm = item.get("train_metrics", {})
+        lines.append(
+            f"- {item.get('version')}：交易数{_safe_int(tm.get('total_trades'))}，收益率{_safe_float(tm.get('profit_total_pct')):.2f}%"
+            f"，PF{_safe_float(tm.get('profit_factor')):.2f}，回撤{_safe_float(tm.get('max_drawdown_pct')):.2f}%，失败={item.get('failure_reason', '未知')}"
+        )
+    lines.extend([
+        "禁止重复：",
+        "- 不要生成与失败策略相同的 stoploss / ROI / trailing_stop 组合",
+        "- 不要继续生成 300+ 交易的高频策略",
+        "- 不要继续宽松 RSI/EMA/momentum 高频结构",
+        "- 不要为了满足 min_trades 而过度放宽入场",
+        "- 优先减少 stop_loss 损失和验证区间回撤",
+    ])
+    text = "\n".join(lines)
+    return text[:max_chars]
 
 
 def _score_zero_reason(
@@ -542,6 +635,15 @@ def _extract_metrics(result: dict[str, Any]) -> dict[str, Any]:
     print(f"profit_factor: {profit_factor}")
     print(f"max_drawdown_pct: {max_drawdown_pct}")
 
+    ers = result.get("exit_reason_summary")
+    if not isinstance(ers, list):
+        print("提示：无法解析 exit_reason_summary，相关字段将为 None。")
+        ers = []
+    exit_map: dict[str, dict[str, Any]] = {str(x.get("exit_reason")): x for x in ers if isinstance(x, dict)}
+    def _exit_count(name: str) -> int | None:
+        return None if not exit_map else _safe_int(exit_map.get(name, {}).get("trades"))
+    def _exit_profit(name: str) -> float | None:
+        return None if not exit_map else _safe_float(exit_map.get(name, {}).get("profit_abs"))
     return {
         "total_trades": total_trades,
         "profit_total_abs": profit_total_abs,
@@ -551,8 +653,14 @@ def _extract_metrics(result: dict[str, Any]) -> dict[str, Any]:
         "max_drawdown": max_drawdown,
         "max_drawdown_pct": max_drawdown_pct,
         "winrate": float(result.get("winrate", 0.0) or 0.0),
-        "roi_profit_total": profit_total_pct,
-        "stop_loss_abs": float(result.get("stop_loss_abs", 0.0) or 0.0),
+        "roi_count": _exit_count("roi"),
+        "roi_profit_abs": _exit_profit("roi"),
+        "stop_loss_count": _exit_count("stop_loss"),
+        "stop_loss_profit_abs": _exit_profit("stop_loss"),
+        "force_exit_count": _exit_count("force_exit"),
+        "force_exit_profit_abs": _exit_profit("force_exit"),
+        "trailing_stop_loss_count": _exit_count("trailing_stop_loss"),
+        "trailing_stop_loss_profit_abs": _exit_profit("trailing_stop_loss"),
         "pairs": result.get("results_per_pair", []),
     }
 
@@ -732,6 +840,15 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     client = OpenAI(api_key=api_key, base_url=base_url, timeout=args.ai_timeout)
 
     best: dict[str, Any] | None = None
+    run_id = run_dir.name.replace("run_", "")
+    memory_items = _read_json_list_file(MEMORY_FILE)
+    blacklist_items = _read_json_list_file(BLACKLIST_FILE)
+    lessons_items = _read_json_list_file(LESSONS_FILE)
+    memory_cfg = runtime_goal.get("memory", {}) or {}
+    memory_enabled = bool(memory_cfg.get("enabled", True))
+    memory_max_items = int(memory_cfg.get("max_items", 5))
+    memory_max_chars = int(memory_cfg.get("max_prompt_chars", 2500))
+    avoid_similar = bool(memory_cfg.get("avoid_similar_failed_strategies", True))
     prev_train_trades: int | None = None
     previous_failure_reason: str | None = None
     zero_trade_streak = 0
@@ -739,7 +856,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     best_summary_path: Path | None = None
     for i in range(1, iterations + 1):
         ver = f"v{i:03d}"
-        class_name = f"{strategy_family}_{ver}"
+        class_name = f"{strategy_family}_{run_id}_{ver}"
         strategy_file = STRATEGY_DIR / f"{class_name}.py"
         version_dir = run_dir / ver
         version_dir.mkdir(parents=True, exist_ok=True)
@@ -755,6 +872,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "优先保证训练区间有稳定交易，不要把过滤条件堆得过严。"
         )
         failure_context = f"上一轮失败原因：{previous_failure_reason}\n" if previous_failure_reason else ""
+        compact_memory = build_compact_strategy_context(memory_items, baseline_cfg, memory_max_items, memory_max_chars) if memory_enabled else ""
         prompt = (
             f"请生成完整 freqtrade 策略代码，只输出 Python 代码。类名必须为 {class_name}，继承 IStrategy，"
             f"timeframe='{timeframe}'，并实现 populate_indicators/populate_entry_trend/populate_exit_trend。\n"
@@ -772,6 +890,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "11) 不允许生成完全无交易策略。\n"
             "12) 目标不是追求 0 回撤，而是在足够交易数下综合表现优于 baseline。\n"
             f"{failure_context}"
+            f"{compact_memory}\n"
             "当前 baseline：\n"
             f"- 总收益(USDT)：{baseline_cfg.get('profit_total_abs', -7.43)}\n"
             f"- 收益率(%)：{baseline_cfg.get('profit_total_pct', -0.74)}\n"
@@ -807,6 +926,20 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             print("本轮停止：AI 多次失败，跳过本轮回测。")
             continue
         code = extract_python_code(response_text)
+        features = extract_strategy_features(code)
+        signature = _feature_signature(features)
+        code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
+        similar_failed = next((x for x in blacklist_items if strategy_similarity(signature, str(x.get("feature_signature", ""))) >= 0.95), None)
+        duplicated_hash = next((x for x in blacklist_items if str(x.get("code_hash", "")) == code_hash), None)
+        if avoid_similar and (similar_failed or duplicated_hash):
+            msg = "新策略与历史失败策略高度相似，建议重新生成。"
+            print(msg)
+            previous_failure_reason = msg
+            if args.auto_approve:
+                continue
+            yn = input("是否仍然执行回测？(y/n)\n").strip()
+            if parse_yes_no(yn) is not True:
+                continue
         strategy_file.parent.mkdir(parents=True, exist_ok=True)
         strategy_file.write_text(code, encoding="utf-8")
         shutil.copy2(strategy_file, version_dir / "strategy.py")
@@ -824,10 +957,16 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         if not static_ok:
             invalid_reason = static_reason or "静态检查失败"
             previous_failure_reason = invalid_reason
-            leaderboard.append({
+            card = {
                 "version": ver,
+                "run_id": run_id,
                 "strategy_class": class_name,
                 "strategy_file": str(strategy_file),
+                "code_hash": code_hash,
+                "created_at": datetime.utcnow().isoformat(),
+                "main_strategy_features": features,
+                "failure_reason": invalid_reason,
+                "avoid_next": "确保 populate_entry_trend 对 enter_long 赋值为 1/True。",
                 "final_score": 0.0,
                 "train_profit_pct": 0.0,
                 "avg_validation_profit_pct": 0.0,
@@ -838,7 +977,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 "is_best": False,
                 "is_valid": False,
                 "invalid_reason": invalid_reason,
-            })
+            }
+            leaderboard.append(card)
+            memory_items.append(card)
             print(f"第 {i} 轮无效：{invalid_reason}")
             print(f"策略文件路径：{strategy_file}")
             print(f"策略类名：{class_name}")
@@ -935,6 +1076,18 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             invalid_reason = baseline_reason
         if not is_valid:
             previous_failure_reason = invalid_reason
+        failure_reasons = []
+        if _safe_float(train_metrics.get("profit_total_pct")) < _safe_float((runtime_goal.get("baseline", {}) or {}).get("profit_total_pct")):
+            failure_reasons.append("训练区间亏损超过 baseline")
+        if _safe_float(train_metrics.get("profit_factor")) < _safe_float((runtime_goal.get("baseline", {}) or {}).get("profit_factor")):
+            failure_reasons.append("Profit factor 低于 baseline")
+        if _safe_float(train_metrics.get("max_drawdown_pct")) > _safe_float((runtime_goal.get("target", {}) or {}).get("max_drawdown_pct")):
+            failure_reasons.append("最大回撤超过目标")
+        if _safe_int(train_metrics.get("total_trades")) > int((runtime_goal.get("target", {}) or {}).get("max_trades", 200)) * 1.5:
+            failure_reasons.append("交易数超过目标上限")
+        if not failure_reasons and invalid_reason:
+            failure_reasons.append(invalid_reason)
+        failure_reason = "；".join(failure_reasons) if failure_reasons else ("通过" if is_valid else "综合评分不达标")
 
         round_data = {
             "iteration": i, "class_name": class_name, "strategy_file": str(strategy_file),
@@ -980,7 +1133,11 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         )
         leaderboard_entry = {
             "version": ver,
+            "run_id": run_id,
             "strategy_class": class_name,
+            "strategy_file": str(strategy_file),
+            "code_hash": code_hash,
+            "created_at": datetime.utcnow().isoformat(),
             "final_score": final_score,
             "train_profit_pct": _safe_float(train_metrics.get("profit_total_pct")),
             "avg_validation_profit_pct": avg_validation_profit_pct,
@@ -991,8 +1148,34 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "is_best": False,
             "is_valid": is_valid,
             "invalid_reason": invalid_reason,
+            "overfit_result": {"is_overfit": is_overfit},
+            "main_strategy_features": features,
+            "failure_reason": failure_reason,
+            "avoid_next": "降低高频宽松入场，控制回撤与止损亏损。",
         }
         leaderboard.append(leaderboard_entry)
+        memory_items.append({
+            **leaderboard_entry,
+            "validation_metrics": validation_metrics,
+            "avg_validation_metrics": {
+                "profit_total_pct": avg_validation_profit_pct,
+            },
+            "train_metrics": train_metrics,
+        })
+        if (final_score <= 0 or _safe_float(train_metrics.get("max_drawdown_pct")) > _safe_float((runtime_goal.get("target", {}) or {}).get("max_drawdown_pct"))
+                or avg_validation_profit_pct < _safe_float((runtime_goal.get("baseline", {}) or {}).get("profit_total_pct"))
+                or _safe_int(train_metrics.get("total_trades")) > int((runtime_goal.get("target", {}) or {}).get("max_trades", 200)) * 1.5):
+            blacklist_items.append({
+                "code_hash": code_hash,
+                "feature_signature": signature,
+                "failure_reason": failure_reason,
+                "avoid_next": "避免重复高频宽松且亏损放大的结构。",
+            })
+            lessons_items.append({
+                "version": ver,
+                "failure_reason": failure_reason,
+                "avoid_next": "减少 stoploss 损失，验证区间优先稳健。",
+            })
         if is_best:
             best = round_data
             best_summary_path = summary_path
@@ -1023,6 +1206,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     for row in leaderboard_sorted:
         row["is_best"] = row["version"] == best_version
     write_json(run_dir / "leaderboard.json", {"items": leaderboard_sorted})
+    _write_json_list_file(MEMORY_FILE, memory_items[-200:])
+    _write_json_list_file(BLACKLIST_FILE, blacklist_items[-200:])
+    _write_json_list_file(LESSONS_FILE, lessons_items[-200:])
 
     if best:
         best_strategy_file = run_dir / best_version / "strategy.py" if best_version else Path(best["strategy_file"])
@@ -1049,6 +1235,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         print(f"- 主要问题：{issue}")
     else:
         print("本次没有找到有效新策略，当前最佳策略保持不变。")
+        print("- 本轮所有失败策略的共同原因：高频交易、低PF、验证区间亏损、回撤偏大。")
+        print("- 下一轮建议：收紧入场质量，限制交易频率，重点控制 stop_loss 与验证回撤。")
 
 
 def main() -> None:
