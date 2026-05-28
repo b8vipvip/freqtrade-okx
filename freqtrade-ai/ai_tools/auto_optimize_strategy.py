@@ -423,13 +423,77 @@ def _print_round_table(version: str, interval: str, metrics: dict[str, Any]) -> 
     max_dd = _safe_float(metrics.get("max_drawdown")) * 100.0
     roi_profit = metrics.get("roi_profit_abs")
     stop_loss_abs = metrics.get("stop_loss_profit_abs")
+    trailing_abs = metrics.get("trailing_stop_loss_profit_abs")
+    force_exit_abs = metrics.get("force_exit_profit_abs")
     roi_text = f"{_safe_float(roi_profit):.4f}" if roi_profit is not None else "无法解析 exit reason 明细"
     stop_text = f"{_safe_float(stop_loss_abs):.4f}" if stop_loss_abs is not None else "无法解析 exit reason 明细"
-    print("版本 | 区间 | 交易数 | 收益率 | 收益USDT | 胜率 | PF | 最大回撤 | ROI收益 | 止损亏损")
+    trailing_text = f"{_safe_float(trailing_abs):.4f}" if trailing_abs is not None else "无法解析 exit reason 明细"
+    force_exit_text = f"{_safe_float(force_exit_abs):.4f}" if force_exit_abs is not None else "无法解析 exit reason 明细"
+    print("版本 | 区间 | 交易数 | 收益率 | 收益USDT | 胜率 | PF | 最大回撤 | ROI收益USDT | 固定止损USDT | 移动止盈/止损USDT | 强制退出USDT")
     print(
         f"{version} | {interval} | {trades} | {_format_pct(profit_pct)} | {profit_abs:.4f} | "
-        f"{_format_pct(winrate)} | {pf:.4f} | {_format_pct(max_dd)} | {roi_text} | {stop_text}"
+        f"{_format_pct(winrate)} | {pf:.4f} | {_format_pct(max_dd)} | {roi_text} | {stop_text} | "
+        f"{trailing_text} | {force_exit_text}"
     )
+
+
+def parse_exit_reason_details(result: dict[str, Any]) -> dict[str, Any]:
+    details: dict[str, Any] = {
+        "parsed": True,
+        "roi_count": 0,
+        "roi_profit_abs": 0.0,
+        "stop_loss_count": 0,
+        "stop_loss_profit_abs": 0.0,
+        "trailing_stop_loss_count": 0,
+        "trailing_stop_loss_profit_abs": 0.0,
+        "force_exit_count": 0,
+        "force_exit_profit_abs": 0.0,
+        "exit_signal_count": 0,
+        "exit_signal_profit_abs": 0.0,
+    }
+    alias_to_bucket = {
+        "roi": "roi",
+        "stop_loss": "stop_loss",
+        "stoploss": "stop_loss",
+        "stop_loss_on_exchange": "stop_loss",
+        "trailing_stop_loss": "trailing_stop_loss",
+        "force_exit": "force_exit",
+        "exit_signal": "exit_signal",
+    }
+
+    def _accumulate(reason: str, count: Any, profit_abs: Any) -> bool:
+        bucket = alias_to_bucket.get(str(reason).strip().lower())
+        if not bucket:
+            return False
+        details[f"{bucket}_count"] += _safe_int(count)
+        details[f"{bucket}_profit_abs"] += _safe_float(profit_abs)
+        return True
+
+    ers = result.get("exit_reason_summary")
+    if isinstance(ers, list):
+        for row in ers:
+            if not isinstance(row, dict):
+                continue
+            _accumulate(row.get("key"), row.get("trades"), row.get("profit_total_abs"))
+        return details
+
+    trades = result.get("trades")
+    if isinstance(trades, list):
+        parsed_any = False
+        for trade in trades:
+            if not isinstance(trade, dict):
+                continue
+            if _accumulate(trade.get("exit_reason"), 1, trade.get("profit_abs")):
+                parsed_any = True
+        details["parsed"] = parsed_any
+        return details
+
+    details["parsed"] = False
+    print(f"[debug] exit_reason_summary 类型: {type(ers).__name__}")
+    print(f"[debug] exit_reason_summary 前3项: {ers[:3] if isinstance(ers, list) else ers}")
+    print(f"[debug] result 可用字段列表: {sorted(result.keys())}")
+    print(f"[debug] trades 数量: {len(trades) if isinstance(trades, list) else 0}")
+    return details
 
 
 def _build_baseline_best(goal: dict[str, Any]) -> dict[str, Any]:
@@ -808,15 +872,9 @@ def _extract_metrics(result: dict[str, Any]) -> dict[str, Any]:
     print(f"profit_factor: {profit_factor}")
     print(f"max_drawdown_pct: {max_drawdown_pct}")
 
-    ers = result.get("exit_reason_summary")
-    if not isinstance(ers, list):
+    exit_reason_details = parse_exit_reason_details(result)
+    if not exit_reason_details.get("parsed", False):
         print("无法解析 exit reason 明细。")
-        ers = []
-    exit_map: dict[str, dict[str, Any]] = {str(x.get("exit_reason")): x for x in ers if isinstance(x, dict)}
-    def _exit_count(name: str) -> int | None:
-        return _safe_int(exit_map.get(name, {}).get("trades")) if name in exit_map else None
-    def _exit_profit(name: str) -> float | None:
-        return _safe_float(exit_map.get(name, {}).get("profit_abs")) if name in exit_map else None
     return {
         "total_trades": total_trades,
         "profit_total_abs": profit_total_abs,
@@ -826,14 +884,7 @@ def _extract_metrics(result: dict[str, Any]) -> dict[str, Any]:
         "max_drawdown": max_drawdown,
         "max_drawdown_pct": max_drawdown_pct,
         "winrate": float(result.get("winrate", 0.0) or 0.0),
-        "roi_count": _exit_count("roi"),
-        "roi_profit_abs": _exit_profit("roi"),
-        "stop_loss_count": _exit_count("stop_loss"),
-        "stop_loss_profit_abs": _exit_profit("stop_loss"),
-        "force_exit_count": _exit_count("force_exit"),
-        "force_exit_profit_abs": _exit_profit("force_exit"),
-        "trailing_stop_loss_count": _exit_count("trailing_stop_loss"),
-        "trailing_stop_loss_profit_abs": _exit_profit("trailing_stop_loss"),
+        **exit_reason_details,
         "pairs": result.get("results_per_pair", []),
     }
 
@@ -1340,6 +1391,19 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "strategy_class": class_name,
             "strategy_file": str(strategy_file),
             "train_metrics": train_metrics,
+            "exit_reason_details": {
+                "train": {k: v for k, v in train_metrics.items() if k.startswith(("roi_", "stop_loss_", "trailing_stop_loss_", "force_exit_", "exit_signal_")) or k == "parsed"},
+                "validation": [
+                    {
+                        "period_name": item.get("period_name"),
+                        "details": {
+                            k: v for k, v in (item.get("metrics", {}) or {}).items()
+                            if k.startswith(("roi_", "stop_loss_", "trailing_stop_loss_", "force_exit_", "exit_signal_")) or k == "parsed"
+                        },
+                    }
+                    for item in validation_metrics
+                ],
+            },
             "validation_metrics": validation_metrics,
             "score_breakdown": score_breakdown,
             "overfit_result": {
