@@ -32,6 +32,7 @@ STRATEGY_DIR = ROOT_DIR / "user_data" / "strategies"
 MEMORY_FILE = ROOT_DIR / "user_data" / "ai_memory" / "strategy_memory.json"
 BLACKLIST_FILE = ROOT_DIR / "user_data" / "ai_memory" / "strategy_blacklist.json"
 LESSONS_FILE = ROOT_DIR / "user_data" / "ai_memory" / "strategy_lessons.json"
+BEST_STRATEGY_FILE = ROOT_DIR / "user_data" / "ai_memory" / "best_strategy.json"
 MEMORY_EXAMPLE_FILE = ROOT_DIR / "ai_tools" / "strategy_memory.example.json"
 BLACKLIST_EXAMPLE_FILE = ROOT_DIR / "ai_tools" / "strategy_blacklist.example.json"
 LESSONS_EXAMPLE_FILE = ROOT_DIR / "ai_tools" / "strategy_lessons.example.json"
@@ -387,6 +388,51 @@ def _print_round_table(version: str, interval: str, metrics: dict[str, Any]) -> 
         f"{version} | {interval} | {trades} | {_format_pct(profit_pct)} | {profit_abs:.4f} | "
         f"{_format_pct(winrate)} | {pf:.4f} | {_format_pct(max_dd)} | {roi_text} | {stop_text}"
     )
+
+
+def _build_baseline_best(goal: dict[str, Any]) -> dict[str, Any]:
+    baseline = goal.get("baseline", {}) or {}
+    return {
+        "strategy_class": "baseline",
+        "strategy_file": "baseline",
+        "source_run_id": "baseline",
+        "version": "baseline",
+        "train_metrics": baseline,
+        "validation_metrics": [],
+        "avg_validation_metrics": {},
+        "score_breakdown": {},
+        "final_score": 0.0,
+        "created_at": datetime.utcnow().isoformat(),
+        "why_best": "无历史 best，使用 baseline。",
+    }
+
+
+def print_current_best_summary(goal: dict[str, Any], memory: dict[str, Any] | None, current_best: dict[str, Any] | None) -> None:
+    source = "baseline"
+    data = current_best or memory or _build_baseline_best(goal)
+    if current_best:
+        source = "本轮新策略"
+    elif memory:
+        source = "历史 best"
+    tm = data.get("train_metrics", {}) or {}
+    av = data.get("avg_validation_metrics", {}) or {}
+    print("\n========== 当前最佳策略简述 ==========")
+    print(f"来源：{source}")
+    print(f"策略名：{data.get('strategy_class', '-')}")
+    print(f"策略文件：{data.get('strategy_file', '-')}")
+    print(f"训练区间：{goal.get('train_period', {}).get('timerange', '-')}")
+    print(f"交易数：{_safe_int(tm.get('total_trades'))}")
+    print(f"收益USDT：{_safe_float(tm.get('profit_total_abs')):.4f}")
+    print(f"收益率：{_safe_float(tm.get('profit_total_pct')):.2f}%")
+    print(f"胜率：{_safe_float(tm.get('winrate')) * 100:.2f}%")
+    print(f"Profit Factor：{_safe_float(tm.get('profit_factor')):.4f}")
+    print(f"最大回撤：{_safe_float(tm.get('max_drawdown_pct') or _safe_float(tm.get('max_drawdown')) * 100):.2f}%")
+    print(f"验证区间平均收益率：{_safe_float(av.get('profit_total_pct')):.2f}%")
+    print(f"验证区间平均 PF：{_safe_float(av.get('profit_factor')):.4f}")
+    print(f"验证区间最大回撤：{_safe_float(av.get('max_drawdown_pct')):.2f}%")
+    print(f"是否疑似过拟合：{'是' if data.get('is_overfit') else '否'}")
+    print(f"主要优势：{data.get('why_best', '综合指标相对更优。')}")
+    print("主要风险：仍需更多区间复验。")
 
 
 def extract_strategy_features(strategy_code: str) -> dict[str, Any]:
@@ -957,7 +1003,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         strategy_file = STRATEGY_DIR / f"{class_name}.py"
         version_dir = run_dir / ver
         version_dir.mkdir(parents=True, exist_ok=True)
-        print(f"正在生成第 {i} 版策略……")
+        print(f"\n========== 第 {i} 轮 / {ver} ==========")
+        print("1. 正在生成策略方案 strategy_spec……")
         print(f"当前策略顾问模型：{advisor_model}{' (fallback)' if advisor_fallback else ''}")
         print(f"当前代码生成模型：{code_model}")
         target_cfg = runtime_goal.get("target", {}) or {}
@@ -972,16 +1019,30 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         failure_context = f"上一轮失败原因：{previous_failure_reason}\n" if previous_failure_reason else ""
         compact_memory = build_compact_strategy_context(memory_items, baseline_cfg, memory_max_items, memory_max_chars) if memory_enabled else ""
         spec_prompt = _strategy_spec_prompt(class_name, runtime_goal, baseline_cfg, compact_memory, previous_failure_reason)
+        print("正在调用策略顾问模型生成 strategy_spec……")
         spec_text = ask_ai(advisor_client, advisor_model, [{"role": "user", "content": spec_prompt}], timeout_sec=args.ai_timeout)
+        print("策略顾问模型返回完成。")
+        (version_dir / "strategy_spec.raw.txt").write_text(spec_text or "", encoding="utf-8")
         if not spec_text:
             previous_failure_reason = "strategy_advisor 生成 strategy_spec 失败。"
+            invalid_reason = "strategy_spec JSON 解析失败"
+            write_json(version_dir / "summary.json", {"is_valid": False, "invalid_reason": invalid_reason})
+            leaderboard.append({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": invalid_reason})
+            print(f"strategy_spec 原始返回已保存：{version_dir / 'strategy_spec.raw.txt'}")
+            print(f"8. 第 {i} 轮完成：无效，原因：{invalid_reason}")
             continue
         try:
             strategy_spec = json.loads(spec_text)
         except json.JSONDecodeError:
             previous_failure_reason = "strategy_spec 不是有效 JSON。"
+            invalid_reason = "strategy_spec JSON 解析失败"
+            write_json(version_dir / "summary.json", {"is_valid": False, "invalid_reason": invalid_reason})
+            leaderboard.append({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": invalid_reason})
+            print(f"strategy_spec 解析失败，请检查：{version_dir / 'strategy_spec.raw.txt'}")
+            print(f"8. 第 {i} 轮完成：无效，原因：{invalid_reason}")
             continue
         write_json(version_dir / "strategy_spec.json", strategy_spec)
+        print(f"2. strategy_spec 已保存：{version_dir / 'strategy_spec.json'}")
         spec_hash = hashlib.sha256(json.dumps(strategy_spec, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
         prompt = (
             f"请根据 strategy_spec 生成完整 freqtrade 策略代码，只输出 Python 代码。类名必须为 {class_name}，继承 IStrategy，"
@@ -1012,6 +1073,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "- 只输出可运行的完整 Python 策略代码，不要解释。\n"
             "- 避免把入场条件写成几乎永远不触发的苛刻组合。\n"
         )
+        print("3. 正在调用 GPT-5.5 生成 Freqtrade 策略代码……")
         max_attempts = max(1, int(args.ai_max_retries))
         response_text: str | None = None
         for attempt in range(1, max_attempts + 1):
@@ -1035,7 +1097,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         if not response_text:
             previous_failure_reason = "AI 调用失败或超时，未生成策略代码。"
             print("本轮停止：AI 多次失败，跳过本轮回测。")
+            write_json(version_dir / "summary.json", {"is_valid": False, "invalid_reason": previous_failure_reason})
+            leaderboard.append({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": previous_failure_reason})
             continue
+        (version_dir / "codegen.raw.txt").write_text(response_text, encoding="utf-8")
         code = extract_python_code(response_text)
         features = extract_strategy_features(code)
         signature = _feature_signature(features)
@@ -1056,8 +1121,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         shutil.copy2(strategy_file, version_dir / "strategy.py")
         GENERATED_DIR.mkdir(parents=True, exist_ok=True)
         shutil.copy2(strategy_file, GENERATED_DIR / strategy_file.name)
+        print(f"4. 策略代码已保存：{version_dir / 'strategy.py'}")
 
-        print("正在检查 Python 语法……")
+        print("5. 正在检查 Python 语法……")
         pyc = run_cmd([sys.executable, "-m", "py_compile", str(strategy_file)], ROOT_DIR)
         if pyc.returncode != 0:
             print("策略代码语法错误，尝试修复一次。")
@@ -1116,7 +1182,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             print("  --cache none")
             continue
 
-        print(f"正在回测训练区间：{train.timerange}")
+        print(f"6. 正在回测训练区间：{train.timerange}")
         train_cmd = [
             "docker", "compose", "run", "--rm", "freqtrade", "backtesting",
             "--config", config, "--strategy", class_name, "--timeframe", timeframe,
@@ -1147,7 +1213,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         val_scores = []
         validation_metrics: list[dict[str, Any]] = []
         for p in validations:
-            print(f"正在回测验证区间：{p.timerange}")
+            print(f"7. 正在回测验证区间：{p.timerange}")
             vcmd = train_cmd.copy()
             vcmd[vcmd.index("--timerange") + 1] = p.timerange
             val_before_zips = set(_list_backtest_zips(results_dir))
@@ -1302,9 +1368,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             best_summary_path = summary_path
             write_json(run_dir / "best_strategy.json", best)
             shutil.copy2(strategy_file, GENERATED_DIR / f"BEST_{strategy_family}.py")
-        print(f"第 {i} 轮完成")
-        if not is_valid:
-            print(f"本轮策略无效：{invalid_reason}")
+        print(f"8. 第 {i} 轮完成：{'有效' if is_valid else '无效'}，原因：{invalid_reason or '通过'}")
         print(f"是否成为新最佳：{'是' if is_best else '否'}")
         if zero_trade_streak >= 3:
             print("连续 3 轮无交易，可能是 AI prompt 或策略模板过于保守，请检查生成策略代码。")
@@ -1322,6 +1386,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     print("无效策略：" + ("、".join(f"{row['version']}:{row['strategy_class']}({row.get('invalid_reason')})" for row in invalid_rows) if invalid_rows else "无"))
     print(f"当前最佳策略是否更新：{'是' if best else '否'}")
 
+    historical_best = read_json(BEST_STRATEGY_FILE) if BEST_STRATEGY_FILE.exists() else None
+    current_best_saved = None
     if best:
         best_version = f"v{int(best['iteration']):03d}"
     for row in leaderboard_sorted:
@@ -1354,6 +1420,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         print("主要优势：训练与验证综合评分最高。")
         print("主要风险：仍需更多样本周期验证稳健性。")
         print("为什么成为 best：在满足有效性约束下 final_score 最高。")
+        current_best_saved = {"strategy_class": best["class_name"], "strategy_file": str(best_strategy_file), "source_run_id": run_id, "version": best_version, "train_metrics": best["train_metrics"], "validation_metrics": [], "avg_validation_metrics": {"profit_total_pct": next((r.get("avg_validation_profit_pct", 0.0) for r in leaderboard_sorted if r.get("version") == best_version), 0.0)}, "score_breakdown": {}, "final_score": best["final_score"], "created_at": datetime.utcnow().isoformat(), "why_best": "本轮 final_score 最高。", "is_overfit": bool(best.get("is_overfit"))}
+        write_json(BEST_STRATEGY_FILE, current_best_saved)
     else:
         print("本次没有找到有效新策略，当前最佳策略保持不变。")
         print("本轮失败策略共同原因：")
@@ -1365,6 +1433,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         print("- 降低目标交易数到 40~120")
         print("- 不要继续宽松高频入场")
         print("- 优先控制止损损失")
+    if args.print_current_best:
+        print_current_best_summary(runtime_goal, historical_best, current_best_saved if best else None)
 
 
 def main() -> None:
@@ -1383,6 +1453,9 @@ def main() -> None:
     parser.add_argument("--base-strategy", default="MultiCoin_AI_Strategy")
     parser.add_argument("--timeframe", default="5m")
     parser.add_argument("--timerange", default=None, help="训练回测区间，例如 20260501-20260525")
+    parser.add_argument("--print-current-best", dest="print_current_best", action="store_true", default=True)
+    parser.add_argument("--no-print-current-best", dest="print_current_best", action="store_false")
+    parser.add_argument("--retest-current-best-at-end", action="store_true", default=False)
     args = parser.parse_args()
 
     goal_path = ROOT_DIR / args.goal
