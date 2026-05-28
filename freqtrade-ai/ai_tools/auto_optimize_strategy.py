@@ -33,6 +33,7 @@ MEMORY_FILE = ROOT_DIR / "user_data" / "ai_memory" / "strategy_memory.json"
 BLACKLIST_FILE = ROOT_DIR / "user_data" / "ai_memory" / "strategy_blacklist.json"
 LESSONS_FILE = ROOT_DIR / "user_data" / "ai_memory" / "strategy_lessons.json"
 BEST_STRATEGY_FILE = ROOT_DIR / "user_data" / "ai_memory" / "best_strategy.json"
+NEAREST_CANDIDATE_FILE = ROOT_DIR / "user_data" / "ai_memory" / "nearest_candidate.json"
 MEMORY_EXAMPLE_FILE = ROOT_DIR / "ai_tools" / "strategy_memory.example.json"
 BLACKLIST_EXAMPLE_FILE = ROOT_DIR / "ai_tools" / "strategy_blacklist.example.json"
 LESSONS_EXAMPLE_FILE = ROOT_DIR / "ai_tools" / "strategy_lessons.example.json"
@@ -529,6 +530,25 @@ def _build_baseline_best(goal: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _load_champion(runtime_goal: dict[str, Any]) -> dict[str, Any]:
+    if BEST_STRATEGY_FILE.exists():
+        data = read_json(BEST_STRATEGY_FILE)
+        sf = Path(str(data.get("strategy_file", "")))
+        if not sf.is_absolute():
+            sf = ROOT_DIR / sf
+        code = sf.read_text(encoding="utf-8") if sf.exists() else ""
+        return {"meta": data, "code": code}
+    baseline = runtime_goal.get("baseline", {}) or {}
+    baseline_cls = str(baseline.get("strategy_class", "") or "")
+    code = ""
+    if baseline_cls:
+        bf = STRATEGY_DIR / f"{baseline_cls}.py"
+        if bf.exists():
+            code = bf.read_text(encoding="utf-8")
+            return {"meta": {"strategy_class": baseline_cls, "strategy_file": str(bf), "train_metrics": baseline}, "code": code}
+    return {"meta": _build_baseline_best(runtime_goal), "code": ""}
+
+
 def print_current_best_summary(goal: dict[str, Any], memory: dict[str, Any] | None, current_best: dict[str, Any] | None) -> None:
     source = "baseline"
     data = current_best or memory or _build_baseline_best(goal)
@@ -723,12 +743,13 @@ def _build_model_client(model_cfg: dict[str, Any], role_name: str, timeout_sec: 
 
 def _strategy_spec_prompt(class_name: str, runtime_goal: dict[str, Any], baseline_cfg: dict[str, Any], compact_memory: str, previous_failure_reason: str | None) -> str:
     return (
-        f"你是策略顾问模型。只输出 strategy_spec JSON，不要输出 Python 代码。建议 strategy_name={class_name}\n"
+        f"你是策略顾问模型。只输出 mutation_spec JSON，不要输出 Python 代码。建议 strategy_name={class_name}\n"
         f"goal={json.dumps(runtime_goal.get('target', {}), ensure_ascii=False)}\n"
         f"baseline={json.dumps(baseline_cfg, ensure_ascii=False)}\n"
         f"recent_failed={compact_memory}\n"
         f"last_failure={previous_failure_reason or '无'}\n"
-        "JSON 必须包含: strategy_name,hypothesis,target_trades_min,target_trades_max,entry_design,exit_design,risk_controls,avoid_patterns,expected_improvement。"
+        "必须只选择一个 mutation_type，允许值：adjust_roi,adjust_stoploss,reduce_trade_frequency,add_entry_filter,remove_bad_entry_condition,disable_or_adjust_trailing,tighten_volume_filter,pair_specific_filter,cooldown_or_protection。\n"
+        "JSON 必须包含: mutation_type,reason,expected_effect,changes,do_not_change。"
     )
 
 
@@ -1097,6 +1118,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             print(f"未检测到 {advisor_cfg.get('api_key_env')}，策略顾问模型将使用 {code_model} 代替。")
 
     best: dict[str, Any] | None = None
+    champion = _load_champion(runtime_goal)
+    nearest_candidate: dict[str, Any] | None = None
+    used_failed_mutations: set[str] = set()
     run_id = run_dir.name.replace("run_", "")
     ensure_runtime_json_file(MEMORY_FILE, MEMORY_EXAMPLE_FILE)
     ensure_runtime_json_file(BLACKLIST_FILE, BLACKLIST_EXAMPLE_FILE)
@@ -1122,7 +1146,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         version_dir = run_dir / ver
         version_dir.mkdir(parents=True, exist_ok=True)
         print(f"\n========== 第 {i} 轮 / {ver} ==========")
-        print("1. 正在生成策略方案 strategy_spec……")
+        print("1. 正在生成 mutation_spec（冠军-挑战者小步改动）……")
         print(f"当前策略顾问模型：{advisor_model}{' (fallback)' if advisor_fallback else ''}")
         print(f"当前代码生成模型：{code_model}")
         target_cfg = runtime_goal.get("target", {}) or {}
@@ -1138,13 +1162,15 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         failure_context += "最近失败策略共同原因通常不是没有盈利单，而是固定止损或 trailing_stop_loss 吃掉 ROI 收益。\n"
         compact_memory = build_compact_strategy_context(memory_items, baseline_cfg, memory_max_items, memory_max_chars) if memory_enabled else ""
         spec_prompt = _strategy_spec_prompt(class_name, runtime_goal, baseline_cfg, compact_memory, previous_failure_reason)
-        print("正在调用策略顾问模型生成 strategy_spec……")
+        spec_prompt += f"\nchampion_strategy_class={champion.get('meta', {}).get('strategy_class', 'baseline')}\n"
+        spec_prompt += f"\n已失败 mutation_type（避免重复）={sorted(used_failed_mutations)}\n"
+        print("正在调用策略顾问模型生成 mutation_spec……")
         spec_text = ask_ai(advisor_client, advisor_model, [{"role": "user", "content": spec_prompt}], timeout_sec=args.ai_timeout)
         print("策略顾问模型返回完成。")
         (version_dir / "strategy_spec.raw.txt").write_text(spec_text or "", encoding="utf-8")
         if not spec_text:
-            previous_failure_reason = "strategy_advisor 生成 strategy_spec 失败。"
-            invalid_reason = "strategy_spec JSON 解析失败"
+            previous_failure_reason = "strategy_advisor 生成 mutation_spec 失败。"
+            invalid_reason = "mutation_spec JSON 解析失败"
             write_json(version_dir / "summary.json", {"is_valid": False, "invalid_reason": invalid_reason})
             leaderboard.append({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": invalid_reason})
             print(f"strategy_spec 原始返回已保存：{version_dir / 'strategy_spec.raw.txt'}")
@@ -1153,32 +1179,36 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         try:
             strategy_spec = extract_json_object(spec_text)
         except (ValueError, json.JSONDecodeError):
-            previous_failure_reason = "strategy_spec 不是有效 JSON object。"
-            invalid_reason = "strategy_spec JSON 解析失败"
+            previous_failure_reason = "mutation_spec 不是有效 JSON object。"
+            invalid_reason = "mutation_spec JSON 解析失败"
             write_json(version_dir / "summary.json", {"is_valid": False, "invalid_reason": invalid_reason})
             leaderboard.append({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": invalid_reason})
             print(f"strategy_spec 解析失败，请检查：{version_dir / 'strategy_spec.raw.txt'}")
             print(f"8. 第 {i} 轮完成：无效，原因：{invalid_reason}")
             continue
-        write_json(version_dir / "strategy_spec.json", strategy_spec)
-        print(f"2. strategy_spec 已保存：{version_dir / 'strategy_spec.json'}")
+        write_json(version_dir / "mutation_spec.json", strategy_spec)
+        print(f"2. mutation_spec 已保存：{version_dir / 'mutation_spec.json'}")
         spec_hash = hashlib.sha256(json.dumps(strategy_spec, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        mutation_type = str(strategy_spec.get("mutation_type", "") or "")
         prompt = (
-            f"请根据 strategy_spec 生成完整 freqtrade 策略代码，只输出 Python 代码。类名必须为 {class_name}，继承 IStrategy，"
+            f"请基于 champion 策略代码进行一次最小修改生成 challenger，只输出 Python 代码。类名必须为 {class_name}，继承 IStrategy，"
             f"timeframe='{timeframe}'，并实现 populate_indicators/populate_entry_trend/populate_exit_trend。\n"
-            f"strategy_spec={json.dumps(strategy_spec, ensure_ascii=False)}\n"
+            f"champion_strategy_code=\n{champion.get('code', '')}\n"
+            f"mutation_spec={json.dumps(strategy_spec, ensure_ascii=False)}\n"
+            f"当前失败摘要={previous_failure_reason or '无'}\n"
             "硬性约束：\n"
-            "1) 策略必须在训练区间产生合理交易，严禁生成完全无交易策略。\n"
+            "1) 仅允许在 champion 基础上一次小改动，不允许完全重写。\n"
+            "2) 策略必须在训练区间产生合理交易，严禁生成完全无交易策略。\n"
             f"2) 目标交易数为 {min_trades}~{max_trades}。\n"
             f"3) {zero_trade_hint}\n"
             "4) 如果上一轮 total_trades=0，本轮必须大幅放宽入场条件，并确保训练区间产生交易。\n"
             "5) 目标训练区间交易数至少 25 笔，理想目标 25~80 笔。\n"
-            "6) use_exit_signal 必须为 False。\n"
-            "7) 仅现货 long only：不做空、不杠杆、不马丁格尔、不无限补仓。\n"
+            "6) use_exit_signal 必须为 False，不允许改为 True。\n"
+            "7) 仅现货 long only：不做空、不杠杆、不马丁格尔、不无限补仓，不允许 conditions_short。\n"
             "8) 不调用外部 API，不读取手动交易记录。\n"
             "9) 禁止使用过强过滤的全 AND 叠加（如 close>ema200_1h、rsi_1h>55、ema20>ema50>ema100、volume>rolling_mean*1.5 同时成立）。\n"
             "10) 入场逻辑可更宽松，鼓励用 OR 组合：RSI 回调反弹 / EMA 短周期金叉 / 布林带下轨反弹 / MACD 转强 / 成交量不极低。\n"
-            "11) 不允许生成完全无交易策略。\n"
+            "11) 不允许生成完全无交易策略，也不允许 200+ 训练交易。\n"
             "12) 目标不是追求 0 回撤，而是在足够交易数下综合表现优于 baseline。\n"
             f"{failure_context}"
             f"{compact_memory}\n"
@@ -1234,10 +1264,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 continue
             yn = input("是否仍然执行回测？(y/n)\n").strip()
             if parse_yes_no(yn) is not True:
-                write_json(
-                    version_dir / "summary.json",
-                    {"is_valid": False, "invalid_reason": "用户拒绝回测相似失败策略。"},
-                )
+                write_json(version_dir / "summary.json", {"is_valid": False, "invalid_reason": "用户拒绝回测相似失败策略。", "mutation_type": mutation_type})
                 leaderboard.append(
                     {"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": "用户拒绝回测相似失败策略。"}
                 )
@@ -1436,9 +1463,19 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 "reason": baseline_reason,
             },
         }
+        champion_metrics = champion.get("meta", {}).get("train_metrics", {}) or {}
+        improvement_vs_champion = {
+            "profit_total_pct_delta": _safe_float(train_metrics.get("profit_total_pct")) - _safe_float(champion_metrics.get("profit_total_pct")),
+            "profit_factor_delta": _safe_float(train_metrics.get("profit_factor")) - _safe_float(champion_metrics.get("profit_factor")),
+            "drawdown_pct_delta": _safe_float(train_metrics.get("max_drawdown_pct")) - _safe_float(champion_metrics.get("max_drawdown_pct")),
+            "trades_delta": _safe_int(train_metrics.get("total_trades")) - _safe_int(champion_metrics.get("total_trades")),
+        }
         summary = {
             "strategy_class": class_name,
             "strategy_file": str(strategy_file),
+            "parent_strategy": champion.get("meta", {}).get("strategy_class", "baseline"),
+            "mutation_type": mutation_type,
+            "changed_items": strategy_spec.get("changes", []),
             "train_metrics": train_metrics,
             "exit_reason_details": {
                 "train": {k: v for k, v in train_metrics.items() if k.startswith(("roi_", "stop_loss_", "trailing_stop_loss_", "force_exit_", "exit_signal_")) or k == "parsed"},
@@ -1461,6 +1498,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 "validation_score": validation_score,
             },
             "final_score": final_score,
+            "improvement_vs_champion": improvement_vs_champion,
+            "failure_reason": failure_reason,
             "is_best": is_best,
             "is_valid": is_valid,
             "invalid_reason": invalid_reason,
@@ -1508,6 +1547,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         if (final_score <= 0 or _safe_float(train_metrics.get("max_drawdown_pct")) > _safe_float((runtime_goal.get("target", {}) or {}).get("max_drawdown_pct"))
                 or avg_validation_profit_pct < _safe_float((runtime_goal.get("baseline", {}) or {}).get("profit_total_pct"))
                 or _safe_int(train_metrics.get("total_trades")) > int((runtime_goal.get("target", {}) or {}).get("max_trades", 80)) * 1.5):
+            if mutation_type:
+                used_failed_mutations.add(mutation_type)
             blacklist_items.append({
                 "code_hash": code_hash,
                 "feature_signature": signature,
@@ -1525,6 +1566,20 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             best_summary_path = summary_path
             write_json(run_dir / "best_strategy.json", best)
             shutil.copy2(strategy_file, GENERATED_DIR / f"BEST_{strategy_family}.py")
+            champion = {"meta": {"strategy_class": class_name, "strategy_file": str(strategy_file), "train_metrics": train_metrics}, "code": code}
+        elif improvement_vs_champion["profit_total_pct_delta"] > 0:
+            nearest_candidate = {
+                "strategy_class": class_name,
+                "strategy_file": str(strategy_file),
+                "why_nearest": "较 champion 有部分改进但未达到最终目标。",
+                "train_metrics": train_metrics,
+                "validation_metrics": validation_metrics,
+                "improvement_vs_baseline": {
+                    "profit_total_pct_delta": _safe_float(train_metrics.get("profit_total_pct")) - _safe_float(baseline_cfg.get("profit_total_pct")),
+                    "profit_factor_delta": _safe_float(train_metrics.get("profit_factor")) - _safe_float(baseline_cfg.get("profit_factor")),
+                },
+            }
+            write_json(NEAREST_CANDIDATE_FILE, nearest_candidate)
         print(f"8. 第 {i} 轮完成：{'有效' if is_valid else '无效'}，原因：{invalid_reason or '通过'}")
         print(f"是否成为新最佳：{'是' if is_best else '否'}")
         if zero_trade_streak >= 3:
@@ -1598,6 +1653,16 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         print(f"final_score：{_safe_float(closest_failed.get('final_score')):.4f}")
         print(f"失败原因：{closest_failed.get('failure_reason') or closest_failed.get('invalid_reason') or '综合评分不达标'}")
         print("为什么仍未成为 best：未通过有效性约束或综合得分不足。")
+    if not best:
+        print("========== 冠军-挑战者状态 ==========")
+        print(f"当前最佳策略 champion：{champion.get('meta', {}).get('strategy_class', 'baseline')}")
+        if nearest_candidate:
+            print(f"本轮最接近目标 challenger：{nearest_candidate.get('strategy_class')}")
+            print(f"比 baseline 差异：{nearest_candidate.get('improvement_vs_baseline')}")
+            print("下一轮应该怎么改：优先选择未失败过的 mutation_type，继续单点小步调整。")
+        else:
+            print("本轮最接近目标 challenger：无")
+        print("本轮失败模式总结：高频风险 / 止损吞噬利润 / trailing 结构失败 / 相似失败策略。")
 
     if args.retest_current_best_at_end:
         print("\n========== 结束前复测 current best / baseline ==========")
