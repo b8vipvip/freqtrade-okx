@@ -32,6 +32,8 @@ STRATEGY_DIR = ROOT_DIR / "user_data" / "strategies"
 MEMORY_FILE = ROOT_DIR / "ai_tools" / "strategy_memory.json"
 BLACKLIST_FILE = ROOT_DIR / "ai_tools" / "strategy_blacklist.json"
 LESSONS_FILE = ROOT_DIR / "ai_tools" / "strategy_lessons.json"
+MODEL_CONFIG_FILE = ROOT_DIR / "ai_tools" / "model_config.json"
+MODEL_CONFIG_EXAMPLE_FILE = ROOT_DIR / "ai_tools" / "model_config.example.json"
 TIMERANGE_RE = re.compile(r"^\d{8}-\d{8}$")
 
 
@@ -41,6 +43,34 @@ class PeriodDef:
     timerange: str
     weight: float
     kind: str
+
+
+DEFAULT_MODEL_CONFIG: dict[str, Any] = {
+    "strategy_advisor": {
+        "enabled": True,
+        "provider": "openai_compatible",
+        "base_url_env": "CLAUDE_BASE_URL",
+        "api_key_env": "CLAUDE_API_KEY",
+        "model_env": "CLAUDE_MODEL",
+        "default_model": "claude-opus-4-7",
+    },
+    "code_generator": {
+        "enabled": True,
+        "provider": "openai_compatible",
+        "base_url_env": "OPENAI_BASE_URL",
+        "api_key_env": "OPENAI_API_KEY",
+        "model_env": "OPENAI_MODEL",
+        "default_model": "gpt-5.5",
+    },
+    "code_repair": {
+        "enabled": True,
+        "provider": "openai_compatible",
+        "base_url_env": "OPENAI_BASE_URL",
+        "api_key_env": "OPENAI_API_KEY",
+        "model_env": "OPENAI_MODEL",
+        "default_model": "gpt-5.5",
+    },
+}
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -133,6 +163,14 @@ def ensure_goal_file(goal_path: Path) -> None:
     goal_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(example, goal_path)
     print(f"未找到目标文件，已从示例生成：{goal_path}")
+
+
+def ensure_model_config_files() -> dict[str, Any]:
+    if not MODEL_CONFIG_EXAMPLE_FILE.exists():
+        write_json(MODEL_CONFIG_EXAMPLE_FILE, DEFAULT_MODEL_CONFIG)
+    if not MODEL_CONFIG_FILE.exists():
+        write_json(MODEL_CONFIG_FILE, DEFAULT_MODEL_CONFIG)
+    return read_json(MODEL_CONFIG_FILE)
 
 
 def run_wizard(goal: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
@@ -327,12 +365,14 @@ def _print_round_table(version: str, interval: str, metrics: dict[str, Any]) -> 
     winrate = _safe_float(metrics.get("winrate")) * 100.0
     pf = _safe_float(metrics.get("profit_factor"))
     max_dd = _safe_float(metrics.get("max_drawdown")) * 100.0
-    roi_profit = _safe_float(metrics.get("roi_profit_abs"))
-    stop_loss_abs = _safe_float(metrics.get("stop_loss_profit_abs"))
+    roi_profit = metrics.get("roi_profit_abs")
+    stop_loss_abs = metrics.get("stop_loss_profit_abs")
+    roi_text = f"{_safe_float(roi_profit):.4f}" if roi_profit is not None else "无法解析 exit reason 明细"
+    stop_text = f"{_safe_float(stop_loss_abs):.4f}" if stop_loss_abs is not None else "无法解析 exit reason 明细"
     print("版本 | 区间 | 交易数 | 收益率 | 收益USDT | 胜率 | PF | 最大回撤 | ROI收益 | 止损亏损")
     print(
         f"{version} | {interval} | {trades} | {_format_pct(profit_pct)} | {profit_abs:.4f} | "
-        f"{_format_pct(winrate)} | {pf:.4f} | {_format_pct(max_dd)} | {roi_profit:.4f} | {stop_loss_abs:.4f}"
+        f"{_format_pct(winrate)} | {pf:.4f} | {_format_pct(max_dd)} | {roi_text} | {stop_text}"
     )
 
 
@@ -374,11 +414,21 @@ def _feature_signature(features: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(key, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
 
-def strategy_similarity(sig_a: str, sig_b: str) -> float:
-    if sig_a == sig_b:
-        return 1.0
-    a, b = set(sig_a), set(sig_b)
-    return len(a & b) / max(1, len(a | b))
+def strategy_similarity(a: dict[str, Any], b: dict[str, Any]) -> float:
+    score = 0.0
+    total = 7.0
+    for k in ["stoploss", "minimal_roi", "trailing_stop", "use_exit_signal"]:
+        if str(a.get(k)) == str(b.get(k)):
+            score += 1.0
+    if set(a.get("indicators", [])) == set(b.get("indicators", [])):
+        score += 1.0
+    if set(a.get("entry_keywords", [])) == set(b.get("entry_keywords", [])):
+        score += 1.0
+    freq_a = "high" if "high" in str(a.get("trade_frequency", "")).lower() else "normal"
+    freq_b = "high" if "high" in str(b.get("trade_frequency", "")).lower() else "normal"
+    if freq_a == freq_b:
+        score += 1.0
+    return score / total
 
 
 def build_compact_strategy_context(memory: list[dict[str, Any]], baseline: dict[str, Any], max_items: int = 5, max_chars: int = 2500) -> str:
@@ -392,11 +442,14 @@ def build_compact_strategy_context(memory: list[dict[str, Any]], baseline: dict[
         f"- total_trades={_safe_int(baseline.get('total_trades'))}",
         "最近失败策略摘要：",
     ]
-    for item in failed[-5:]:
+    for item in failed[-max_items:]:
         tm = item.get("train_metrics", {})
+        avoid_next = item.get("avoid_next", [])
+        if isinstance(avoid_next, str):
+            avoid_next = [avoid_next]
         lines.append(
             f"- {item.get('version')}：交易数{_safe_int(tm.get('total_trades'))}，收益率{_safe_float(tm.get('profit_total_pct')):.2f}%"
-            f"，PF{_safe_float(tm.get('profit_factor')):.2f}，回撤{_safe_float(tm.get('max_drawdown_pct')):.2f}%，失败={item.get('failure_reason', '未知')}"
+            f"，PF{_safe_float(tm.get('profit_factor')):.2f}，回撤{_safe_float(tm.get('max_drawdown_pct')):.2f}%，失败={item.get('failure_reason', '未知')}，avoid_next={avoid_next}"
         )
     lines.extend([
         "禁止重复：",
@@ -477,6 +530,25 @@ def ask_ai(client: OpenAI, model: str, messages: list[dict[str, str]], timeout_s
     print(f"AI 策略生成完成，用时 {elapsed} 秒，返回字符数 {len(content)}。")
     return content
 
+
+def _build_model_client(model_cfg: dict[str, Any], role_name: str, timeout_sec: int) -> tuple[OpenAI, str]:
+    base_url = (os.getenv(str(model_cfg.get("base_url_env", ""))) or "").strip() or None
+    api_key = (os.getenv(str(model_cfg.get("api_key_env", ""))) or "").strip()
+    model = (os.getenv(str(model_cfg.get("model_env", ""))) or str(model_cfg.get("default_model", ""))).strip()
+    if not api_key:
+        raise RuntimeError(f"未检测到 {model_cfg.get('api_key_env')}，无法初始化 {role_name} 模型。")
+    return OpenAI(api_key=api_key, base_url=base_url, timeout=timeout_sec), model
+
+
+def _strategy_spec_prompt(class_name: str, runtime_goal: dict[str, Any], baseline_cfg: dict[str, Any], compact_memory: str, previous_failure_reason: str | None) -> str:
+    return (
+        f"你是策略顾问模型。只输出 strategy_spec JSON，不要输出 Python 代码。建议 strategy_name={class_name}\n"
+        f"goal={json.dumps(runtime_goal.get('target', {}), ensure_ascii=False)}\n"
+        f"baseline={json.dumps(baseline_cfg, ensure_ascii=False)}\n"
+        f"recent_failed={compact_memory}\n"
+        f"last_failure={previous_failure_reason or '无'}\n"
+        "JSON 必须包含: strategy_name,hypothesis,target_trades_min,target_trades_max,entry_design,exit_design,risk_controls,avoid_patterns,expected_improvement。"
+    )
 
 
 def _is_true_or_one(node: ast.AST) -> bool:
@@ -637,13 +709,13 @@ def _extract_metrics(result: dict[str, Any]) -> dict[str, Any]:
 
     ers = result.get("exit_reason_summary")
     if not isinstance(ers, list):
-        print("提示：无法解析 exit_reason_summary，相关字段将为 None。")
+        print("无法解析 exit reason 明细。")
         ers = []
     exit_map: dict[str, dict[str, Any]] = {str(x.get("exit_reason")): x for x in ers if isinstance(x, dict)}
     def _exit_count(name: str) -> int | None:
-        return None if not exit_map else _safe_int(exit_map.get(name, {}).get("trades"))
+        return _safe_int(exit_map.get(name, {}).get("trades")) if name in exit_map else None
     def _exit_profit(name: str) -> float | None:
-        return None if not exit_map else _safe_float(exit_map.get(name, {}).get("profit_abs"))
+        return _safe_float(exit_map.get(name, {}).get("profit_abs")) if name in exit_map else None
     return {
         "total_trades": total_trades,
         "profit_total_abs": profit_total_abs,
@@ -832,12 +904,20 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
 
     maybe_download_data(runtime_goal, args, train.timerange)
 
-    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
-    if not api_key:
-        raise RuntimeError("未检测到 OPENAI_API_KEY，请检查 .env。")
-    base_url = (os.getenv("OPENAI_BASE_URL") or "").strip() or None
-    model = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
-    client = OpenAI(api_key=api_key, base_url=base_url, timeout=args.ai_timeout)
+    model_config = ensure_model_config_files()
+    advisor_cfg = model_config.get("strategy_advisor", {})
+    generator_cfg = model_config.get("code_generator", {})
+    repair_cfg = model_config.get("code_repair", {})
+    code_client, code_model = _build_model_client(generator_cfg, "code_generator", args.ai_timeout)
+    repair_client, repair_model = _build_model_client(repair_cfg, "code_repair", args.ai_timeout)
+    advisor_client, advisor_model = code_client, code_model
+    advisor_fallback = False
+    if bool(advisor_cfg.get("enabled", True)):
+        try:
+            advisor_client, advisor_model = _build_model_client(advisor_cfg, "strategy_advisor", args.ai_timeout)
+        except RuntimeError:
+            advisor_fallback = True
+            print(f"未检测到 {advisor_cfg.get('api_key_env')}，策略顾问模型将使用 {code_model} 代替。")
 
     best: dict[str, Any] | None = None
     run_id = run_dir.name.replace("run_", "")
@@ -861,7 +941,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         version_dir = run_dir / ver
         version_dir.mkdir(parents=True, exist_ok=True)
         print(f"正在生成第 {i} 版策略……")
-        print(f"当前 AI 模型：{model}")
+        print(f"当前策略顾问模型：{advisor_model}{' (fallback)' if advisor_fallback else ''}")
+        print(f"当前代码生成模型：{code_model}")
         target_cfg = runtime_goal.get("target", {}) or {}
         baseline_cfg = runtime_goal.get("baseline", {}) or {}
         min_trades = int(target_cfg.get("min_trades", 80))
@@ -873,9 +954,22 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         )
         failure_context = f"上一轮失败原因：{previous_failure_reason}\n" if previous_failure_reason else ""
         compact_memory = build_compact_strategy_context(memory_items, baseline_cfg, memory_max_items, memory_max_chars) if memory_enabled else ""
+        spec_prompt = _strategy_spec_prompt(class_name, runtime_goal, baseline_cfg, compact_memory, previous_failure_reason)
+        spec_text = ask_ai(advisor_client, advisor_model, [{"role": "user", "content": spec_prompt}], timeout_sec=args.ai_timeout)
+        if not spec_text:
+            previous_failure_reason = "strategy_advisor 生成 strategy_spec 失败。"
+            continue
+        try:
+            strategy_spec = json.loads(spec_text)
+        except json.JSONDecodeError:
+            previous_failure_reason = "strategy_spec 不是有效 JSON。"
+            continue
+        write_json(version_dir / "strategy_spec.json", strategy_spec)
+        spec_hash = hashlib.sha256(json.dumps(strategy_spec, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
         prompt = (
-            f"请生成完整 freqtrade 策略代码，只输出 Python 代码。类名必须为 {class_name}，继承 IStrategy，"
+            f"请根据 strategy_spec 生成完整 freqtrade 策略代码，只输出 Python 代码。类名必须为 {class_name}，继承 IStrategy，"
             f"timeframe='{timeframe}'，并实现 populate_indicators/populate_entry_trend/populate_exit_trend。\n"
+            f"strategy_spec={json.dumps(strategy_spec, ensure_ascii=False)}\n"
             "硬性约束：\n"
             "1) 策略必须在训练区间产生合理交易，严禁生成完全无交易策略。\n"
             f"2) 目标交易数为 {min_trades}~{max_trades}。\n"
@@ -906,7 +1000,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         for attempt in range(1, max_attempts + 1):
             if attempt > 1:
                 print(f"正在第 {attempt - 1} 次重试 AI 生成策略……")
-            response_text = ask_ai(client, model, [{"role": "user", "content": prompt}], timeout_sec=args.ai_timeout)
+            response_text = ask_ai(code_client, code_model, [{"role": "user", "content": prompt}], timeout_sec=args.ai_timeout)
             if response_text:
                 break
 
@@ -929,7 +1023,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         features = extract_strategy_features(code)
         signature = _feature_signature(features)
         code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
-        similar_failed = next((x for x in blacklist_items if strategy_similarity(signature, str(x.get("feature_signature", ""))) >= 0.95), None)
+        similar_failed = next((x for x in blacklist_items if strategy_similarity(features, x.get("features", {})) >= 0.85), None)
         duplicated_hash = next((x for x in blacklist_items if str(x.get("code_hash", "")) == code_hash), None)
         if avoid_similar and (similar_failed or duplicated_hash):
             msg = "新策略与历史失败策略高度相似，建议重新生成。"
@@ -949,9 +1043,17 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         print("正在检查 Python 语法……")
         pyc = run_cmd([sys.executable, "-m", "py_compile", str(strategy_file)], ROOT_DIR)
         if pyc.returncode != 0:
-            print(pyc.stderr)
-            print(f"第 {i} 轮语法检查失败，跳过。")
-            continue
+            print("策略代码语法错误，尝试修复一次。")
+            repair_prompt = f"请修复以下策略代码，仅输出可运行 Python：\n错误信息:\n{pyc.stderr}\n代码:\n{code}"
+            repaired = ask_ai(repair_client, repair_model, [{"role": "user", "content": repair_prompt}], timeout_sec=args.ai_timeout)
+            if repaired:
+                code = extract_python_code(repaired)
+                strategy_file.write_text(code, encoding="utf-8")
+                pyc = run_cmd([sys.executable, "-m", "py_compile", str(strategy_file)], ROOT_DIR)
+            if pyc.returncode != 0:
+                print(pyc.stderr)
+                print(f"第 {i} 轮语法检查失败，跳过。")
+                continue
         validate_strategy_class_name(strategy_file, class_name)
         static_ok, static_reason = check_entry_long_static(strategy_file)
         if not static_ok:
@@ -964,7 +1066,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 "strategy_file": str(strategy_file),
                 "code_hash": code_hash,
                 "created_at": datetime.utcnow().isoformat(),
-                "main_strategy_features": features,
+                "features": features,
                 "failure_reason": invalid_reason,
                 "avoid_next": "确保 populate_entry_trend 对 enter_long 赋值为 1/True。",
                 "final_score": 0.0,
@@ -1149,7 +1251,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "is_valid": is_valid,
             "invalid_reason": invalid_reason,
             "overfit_result": {"is_overfit": is_overfit},
-            "main_strategy_features": features,
+            "features": features,
+            "spec_hash": spec_hash,
             "failure_reason": failure_reason,
             "avoid_next": "降低高频宽松入场，控制回撤与止损亏损。",
         }
@@ -1168,6 +1271,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             blacklist_items.append({
                 "code_hash": code_hash,
                 "feature_signature": signature,
+                "features": features,
                 "failure_reason": failure_reason,
                 "avoid_next": "避免重复高频宽松且亏损放大的结构。",
             })
@@ -1219,24 +1323,31 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         print(f"- leaderboard.json 路径: {run_dir / 'leaderboard.json'}")
         if best_summary_path:
             print(f"- summary.json 路径: {best_summary_path}")
-        print("最佳策略简述：")
-        print(f"- 策略名：{best['class_name']}")
-        print(f"- 策略文件路径：{best_strategy_file}")
-        print(f"- 训练区间收益：{_safe_float(best['train_metrics'].get('profit_total_pct')):.2f}%")
+        print("========== 最佳策略简述 ==========")
+        print(f"策略名：{best['class_name']}")
+        print(f"策略文件：{best_strategy_file}")
+        print(f"训练区间收益：{_safe_float(best['train_metrics'].get('profit_total_pct')):.2f}%")
         avg_val_profit = next((r.get('avg_validation_profit_pct', 0.0) for r in leaderboard_sorted if r.get('version') == best_version), 0.0)
-        print(f"- 验证区间平均收益：{_safe_float(avg_val_profit):.2f}%")
-        print(f"- 交易数：{_safe_int(best['train_metrics'].get('total_trades'))}")
-        print(f"- 胜率：{_safe_float(best['train_metrics'].get('winrate')) * 100:.2f}%")
-        print(f"- Profit Factor：{_safe_float(best['train_metrics'].get('profit_factor')):.4f}")
-        print(f"- 最大回撤：{_safe_float(best['train_metrics'].get('max_drawdown')) * 100:.2f}%")
-        print(f"- 是否疑似过拟合：{'是' if best.get('is_overfit') else '否'}")
-        stop_loss_abs = _safe_float(best['train_metrics'].get('stop_loss_abs'))
-        issue = "stop_loss 亏损过大" if stop_loss_abs < 0 else "暂无明显止损亏损异常"
-        print(f"- 主要问题：{issue}")
+        print(f"验证区间平均收益：{_safe_float(avg_val_profit):.2f}%")
+        print(f"交易数：{_safe_int(best['train_metrics'].get('total_trades'))}")
+        print(f"胜率：{_safe_float(best['train_metrics'].get('winrate')) * 100:.2f}%")
+        print(f"Profit Factor：{_safe_float(best['train_metrics'].get('profit_factor')):.4f}")
+        print(f"最大回撤：{_safe_float(best['train_metrics'].get('max_drawdown')) * 100:.2f}%")
+        print(f"是否疑似过拟合：{'是' if best.get('is_overfit') else '否'}")
+        print("主要优势：训练与验证综合评分最高。")
+        print("主要风险：仍需更多样本周期验证稳健性。")
+        print("为什么成为 best：在满足有效性约束下 final_score 最高。")
     else:
         print("本次没有找到有效新策略，当前最佳策略保持不变。")
-        print("- 本轮所有失败策略的共同原因：高频交易、低PF、验证区间亏损、回撤偏大。")
-        print("- 下一轮建议：收紧入场质量，限制交易频率，重点控制 stop_loss 与验证回撤。")
+        print("本轮失败策略共同原因：")
+        print("- 交易数过高")
+        print("- 验证区间全部亏损")
+        print("- PF 低")
+        print("- 回撤超标")
+        print("下一轮建议：")
+        print("- 降低目标交易数到 40~120")
+        print("- 不要继续宽松高频入场")
+        print("- 优先控制止损损失")
 
 
 def main() -> None:
