@@ -310,6 +310,48 @@ def extract_python_code(content: str) -> str:
     return (m.group(1) if m else content).strip() + "\n"
 
 
+def extract_json_object(raw_text: str) -> dict[str, Any]:
+    text = (raw_text or "").strip()
+    if not text:
+        raise ValueError("strategy_spec 为空")
+
+    # 1) 优先处理 markdown fenced code block（```json ... ``` / ``` ... ```）
+    fence_patterns = [
+        r"```json\s*(\{.*?\})\s*```",
+        r"```\s*(\{.*?\})\s*```",
+    ]
+    for pattern in fence_patterns:
+        m = re.search(pattern, text, flags=re.DOTALL | re.IGNORECASE)
+        if m:
+            payload = m.group(1).strip()
+            obj = json.loads(payload)
+            if isinstance(obj, dict):
+                return obj
+            raise ValueError("strategy_spec 顶层必须是 JSON object")
+
+    # 2) 纯 JSON（直接是对象文本）
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    # 3) 文本中混有前后缀说明，尝试提取首个 {...} 对象并解码
+    decoder = json.JSONDecoder()
+    for idx, ch in enumerate(text):
+        if ch != "{":
+            continue
+        try:
+            parsed, _ = decoder.raw_decode(text[idx:])
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            continue
+
+    raise ValueError("未能从 strategy_spec 文本中提取 JSON object")
+
+
 def _list_backtest_zips(results_dir: Path) -> list[Path]:
     return sorted(results_dir.glob("backtest-result-*.zip"), key=lambda p: p.stat().st_mtime)
 
@@ -1032,9 +1074,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             print(f"8. 第 {i} 轮完成：无效，原因：{invalid_reason}")
             continue
         try:
-            strategy_spec = json.loads(spec_text)
-        except json.JSONDecodeError:
-            previous_failure_reason = "strategy_spec 不是有效 JSON。"
+            strategy_spec = extract_json_object(spec_text)
+        except (ValueError, json.JSONDecodeError):
+            previous_failure_reason = "strategy_spec 不是有效 JSON object。"
             invalid_reason = "strategy_spec JSON 解析失败"
             write_json(version_dir / "summary.json", {"is_valid": False, "invalid_reason": invalid_reason})
             leaderboard.append({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": invalid_reason})
@@ -1374,7 +1416,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             print("连续 3 轮无交易，可能是 AI prompt 或策略模板过于保守，请检查生成策略代码。")
             break
 
-    leaderboard_sorted = sorted(leaderboard, key=lambda x: float(x["final_score"]), reverse=True)
+    leaderboard_sorted = sorted(leaderboard, key=lambda x: float(x.get("final_score", 0.0) or 0.0), reverse=True)
     best_version = None
     valid_rows = [row for row in leaderboard_sorted if row.get("is_valid")]
     invalid_rows = [row for row in leaderboard_sorted if not row.get("is_valid")]
