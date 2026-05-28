@@ -23,7 +23,14 @@ from typing import Any
 
 import pandas as pd
 
-from openai import APITimeoutError, OpenAI
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    InternalServerError,
+    OpenAI,
+    RateLimitError,
+)
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 RESULT_ROOT = ROOT_DIR / "user_data" / "backtest_results" / "ai_optimization_runs"
@@ -704,7 +711,30 @@ def validate_strategy_class_name(strategy_file: Path, class_name: str) -> None:
         raise RuntimeError(f"策略文件类名校验失败：{strategy_file.name} 中未找到 class {class_name}(IStrategy):")
 
 
-def ask_ai(client: OpenAI, model: str, messages: list[dict[str, str]], timeout_sec: int) -> str | None:
+class AIRequestFailed(RuntimeError):
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _format_ai_error(exc: Exception) -> tuple[str, int | None]:
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+    detail = ""
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            detail = str(err.get("message") or "")
+    if not detail:
+        detail = str(exc)
+    msg = f"{status_code} {detail}".strip() if status_code else detail
+    return msg.strip(), status_code
+
+
+def ask_ai(client: OpenAI, model: str, messages: list[dict[str, str]], timeout_sec: int, max_retries: int = 3) -> str:
     print("正在调用 AI 生成策略，请稍等……")
     start_ts = time.time()
     stop_event = threading.Event()
@@ -718,14 +748,33 @@ def ask_ai(client: OpenAI, model: str, messages: list[dict[str, str]], timeout_s
 
     heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
     heartbeat_thread.start()
+    retry_status_codes = {429, 502, 503, 504}
+    retry_waits = [15, 30, 60]
+    res = None
+    error_message = "未知错误"
     try:
-        res = client.chat.completions.create(model=model, messages=messages, temperature=0.2)
-    except APITimeoutError:
-        print("AI 调用超时，本轮策略生成失败。")
-        return None
+        for attempt in range(max_retries + 1):
+            try:
+                res = client.chat.completions.create(model=model, messages=messages, temperature=0.2)
+                break
+            except (InternalServerError, RateLimitError, APITimeoutError, APIConnectionError, APIStatusError, TimeoutError, Exception) as exc:
+                error_message, status_code = _format_ai_error(exc)
+                if status_code == 503 and "system cpu overloaded" in error_message.lower():
+                    print("提示：这是模型服务/中转站负载过高，不是本地代码错误。")
+                can_retry = attempt < max_retries and (status_code in retry_status_codes or isinstance(exc, (APITimeoutError, APIConnectionError, TimeoutError)))
+                if can_retry:
+                    wait_sec = retry_waits[min(attempt, len(retry_waits) - 1)]
+                    print(f"AI 调用失败：{error_message}")
+                    print(f"将在 {wait_sec} 秒后重试，第 {attempt + 1}/{max_retries} 次。")
+                    time.sleep(wait_sec)
+                    continue
+                raise AIRequestFailed(error_message, status_code=status_code) from exc
     finally:
         stop_event.set()
         heartbeat_thread.join(timeout=1)
+
+    if res is None:
+        raise AIRequestFailed(error_message)
 
     content = (res.choices[0].message.content or "").strip()
     elapsed = int(time.time() - start_ts)
@@ -1169,6 +1218,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     zero_trade_streak = 0
     leaderboard: list[dict[str, Any]] = []
     best_summary_path: Path | None = None
+    stop_on_ai_error = bool(runtime_goal.get("stop_on_ai_error", False))
     for i in range(1, iterations + 1):
         ver = f"v{i:03d}"
         class_name = f"{strategy_family}_{run_id}_{ver}"
@@ -1195,8 +1245,28 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         spec_prompt += f"\nchampion_strategy_class={champion.get('meta', {}).get('strategy_class', 'baseline')}\n"
         spec_prompt += f"\n已失败 mutation_type（避免重复）={sorted(used_failed_mutations)}\n"
         print("正在调用策略顾问模型生成 mutation_spec……")
-        spec_text = ask_ai(advisor_client, advisor_model, [{"role": "user", "content": spec_prompt}], timeout_sec=args.ai_timeout)
-        print("策略顾问模型返回完成。")
+        try:
+            spec_text = ask_ai(
+                advisor_client,
+                advisor_model,
+                [{"role": "user", "content": spec_prompt}],
+                timeout_sec=args.ai_timeout,
+                max_retries=max(0, int(args.ai_max_retries)),
+            )
+            print("策略顾问模型返回完成。")
+        except AIRequestFailed as exc:
+            spec_text = ""
+            err_msg = str(exc)
+            previous_failure_reason = f"策略顾问模型调用失败：{err_msg}"
+            invalid_reason = previous_failure_reason
+            write_json(version_dir / "summary.json", {"is_valid": False, "invalid_reason": invalid_reason})
+            leaderboard.append({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": invalid_reason})
+            print(previous_failure_reason)
+            if stop_on_ai_error:
+                print("已设置 stop_on_ai_error=true，停止后续轮次。")
+                break
+            print(f"8. 第 {i} 轮完成：无效，原因：{invalid_reason}")
+            continue
         (version_dir / "strategy_spec.raw.txt").write_text(spec_text or "", encoding="utf-8")
         if not spec_text:
             previous_failure_reason = "strategy_advisor 生成 mutation_spec 失败。"
@@ -1255,31 +1325,23 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "- 避免把入场条件写成几乎永远不触发的苛刻组合。\n"
         )
         print("3. 正在调用 GPT-5.5 生成 Freqtrade 策略代码……")
-        max_attempts = max(1, int(args.ai_max_retries))
-        response_text: str | None = None
-        for attempt in range(1, max_attempts + 1):
-            if attempt > 1:
-                print(f"正在第 {attempt - 1} 次重试 AI 生成策略……")
-            response_text = ask_ai(code_client, code_model, [{"role": "user", "content": prompt}], timeout_sec=args.ai_timeout)
+        response_text = ""
+        try:
+            response_text = ask_ai(
+                code_client,
+                code_model,
+                [{"role": "user", "content": prompt}],
+                timeout_sec=args.ai_timeout,
+                max_retries=max(0, int(args.ai_max_retries)),
+            )
+        except AIRequestFailed as exc:
+            previous_failure_reason = f"代码生成模型调用失败：{str(exc)}"
+            invalid_reason = "代码生成模型调用失败"
+            print("本轮停止：代码生成模型多次失败，跳过本轮回测。")
             if response_text:
-                break
-
-            if attempt >= max_attempts:
-                break
-            if args.auto_approve and attempt == 1:
-                continue
-            if args.auto_approve:
-                break
-
-            retry_answer = input("是否重试？y/n\n").strip()
-            if parse_yes_no(retry_answer) is not True:
-                break
-
-        if not response_text:
-            previous_failure_reason = "AI 调用失败或超时，未生成策略代码。"
-            print("本轮停止：AI 多次失败，跳过本轮回测。")
-            write_json(version_dir / "summary.json", {"is_valid": False, "invalid_reason": previous_failure_reason})
-            leaderboard.append({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": previous_failure_reason})
+                (version_dir / "codegen.raw.txt").write_text(response_text, encoding="utf-8")
+            write_json(version_dir / "summary.json", {"is_valid": False, "invalid_reason": invalid_reason})
+            leaderboard.append({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": invalid_reason})
             continue
         (version_dir / "codegen.raw.txt").write_text(response_text, encoding="utf-8")
         code = extract_python_code(response_text)
@@ -1313,7 +1375,17 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         if pyc.returncode != 0:
             print("策略代码语法错误，尝试修复一次。")
             repair_prompt = f"请修复以下策略代码，仅输出可运行 Python：\n错误信息:\n{pyc.stderr}\n代码:\n{code}"
-            repaired = ask_ai(repair_client, repair_model, [{"role": "user", "content": repair_prompt}], timeout_sec=args.ai_timeout)
+            try:
+                repaired = ask_ai(
+                    repair_client,
+                    repair_model,
+                    [{"role": "user", "content": repair_prompt}],
+                    timeout_sec=args.ai_timeout,
+                    max_retries=max(0, int(args.ai_max_retries)),
+                )
+            except AIRequestFailed as exc:
+                repaired = ""
+                print(f"代码修复模型调用失败：{exc}")
             if repaired:
                 code = extract_python_code(repaired)
                 strategy_file.write_text(code, encoding="utf-8")
@@ -1803,7 +1875,7 @@ def main() -> None:
     parser.add_argument("--skip-download", action="store_true")
     parser.add_argument("--force-download", action="store_true")
     parser.add_argument("--ai-timeout", type=int, default=360, help="AI API 调用超时时间（秒）")
-    parser.add_argument("--ai-max-retries", type=int, default=2, help="AI 调用失败时最多尝试次数（含首次）")
+    parser.add_argument("--ai-max-retries", type=int, default=3, help="AI 调用失败时最多重试次数（不含首次）")
     parser.add_argument("--no-wizard", action="store_true")
     parser.add_argument("--save-goal", action="store_true")
     parser.add_argument("--config", default="user_data/config.5coins.json")
