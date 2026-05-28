@@ -42,6 +42,7 @@ LESSONS_FILE = ROOT_DIR / "user_data" / "ai_memory" / "strategy_lessons.json"
 BEST_STRATEGY_FILE = ROOT_DIR / "user_data" / "ai_memory" / "best_strategy.json"
 RESET_HISTORY_FILE = ROOT_DIR / "user_data" / "ai_memory" / "reset_history.json"
 NEAREST_CANDIDATE_FILE = ROOT_DIR / "user_data" / "ai_memory" / "nearest_candidate.json"
+LAST_RUN_SUMMARY_FILE = ROOT_DIR / "user_data" / "ai_memory" / "last_run_summary.json"
 MEMORY_EXAMPLE_FILE = ROOT_DIR / "ai_tools" / "strategy_memory.example.json"
 BLACKLIST_EXAMPLE_FILE = ROOT_DIR / "ai_tools" / "strategy_blacklist.example.json"
 LESSONS_EXAMPLE_FILE = ROOT_DIR / "ai_tools" / "strategy_lessons.example.json"
@@ -521,6 +522,51 @@ def parse_exit_reason_details(result: dict[str, Any]) -> dict[str, Any]:
     print(f"[debug] trades 数量: {len(trades) if isinstance(trades, list) else 0}")
     return details
 
+
+
+
+def _memory_presence(path: Path) -> str:
+    return "存在" if path.exists() else "不存在"
+
+
+def _load_json_or_none(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        return read_json(path)
+    except json.JSONDecodeError:
+        return None
+
+
+def _is_reset_best(data: dict[str, Any] | None) -> bool:
+    return bool(data and data.get("source") == "reset")
+
+
+def _strategy_file_valid(path_raw: str | None) -> str:
+    if not path_raw:
+        return "不存在"
+    sf = Path(path_raw)
+    if not sf.is_absolute():
+        sf = ROOT_DIR / sf
+    return "有效" if sf.exists() and sf.is_file() else "无效"
+
+
+def _normalize_validation_metric(item: dict[str, Any], fallback_label: str = "validation") -> dict[str, Any]:
+    m = item.get("metrics", item) if isinstance(item, dict) else {}
+    return {
+        "label": item.get("period") or item.get("period_name") or fallback_label,
+        "timerange": item.get("timerange", ""),
+        "total_trades": _safe_int(m.get("total_trades")),
+        "profit_total_abs": _safe_float(m.get("profit_total_abs")),
+        "profit_total_pct": _safe_float(m.get("profit_total_pct")),
+        "profit_factor": _safe_float(m.get("profit_factor")),
+        "max_drawdown_pct": _safe_float(m.get("max_drawdown_pct")),
+        "winrate": _safe_float(m.get("winrate")),
+        "roi_profit_abs": _safe_float(m.get("roi_profit_abs")),
+        "stop_loss_profit_abs": _safe_float(m.get("stop_loss_profit_abs")),
+        "trailing_stop_loss_profit_abs": _safe_float(m.get("trailing_stop_loss_profit_abs")),
+        "force_exit_profit_abs": _safe_float(m.get("force_exit_profit_abs")),
+    }
 
 def _build_baseline_best(goal: dict[str, Any]) -> dict[str, Any]:
     baseline = goal.get("baseline", {}) or {}
@@ -1280,6 +1326,16 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     champion = {"meta": _build_baseline_best(runtime_goal), "code": "", "source": "reset_empty"} if reset_best_used else _load_champion(runtime_goal)
     _print_champion_source(champion)
     nearest_candidate: dict[str, Any] | None = None
+    historical_best_mem = _load_json_or_none(BEST_STRATEGY_FILE)
+    nearest_mem = _load_json_or_none(NEAREST_CANDIDATE_FILE)
+    last_run_summary_mem = _load_json_or_none(LAST_RUN_SUMMARY_FILE)
+    print("========== 记忆加载状态 ==========")
+    h_status = "reset" if _is_reset_best(historical_best_mem) else ("存在" if historical_best_mem else "不存在")
+    print(f"historical_best：{h_status}")
+    print(f"historical_best 策略文件：{_strategy_file_valid((historical_best_mem or {}).get('strategy_file')) if historical_best_mem else '不存在'}")
+    print(f"nearest_candidate：{_memory_presence(NEAREST_CANDIDATE_FILE)}")
+    print(f"nearest_candidate 策略文件：{_strategy_file_valid((nearest_mem or {}).get('strategy_file')) if nearest_mem else '不存在'}")
+    print(f"last_run_summary：{_memory_presence(LAST_RUN_SUMMARY_FILE)}")
     used_failed_mutations: set[str] = set()
     run_id = run_dir.name.replace("run_", "")
     ensure_runtime_json_file(MEMORY_FILE, MEMORY_EXAMPLE_FILE)
@@ -1289,6 +1345,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     memory_items = _read_json_list_file(MEMORY_FILE)
     blacklist_items = _read_json_list_file(BLACKLIST_FILE)
     lessons_items = _read_json_list_file(LESSONS_FILE)
+    print(f"strategy_memory：{_memory_presence(MEMORY_FILE)}")
+    print(f"strategy_lessons：{_memory_presence(LESSONS_FILE)}")
+    print(f"strategy_blacklist：{_memory_presence(BLACKLIST_FILE)}")
     memory_cfg = runtime_goal.get("memory", {}) or {}
     memory_enabled = bool(memory_cfg.get("enabled", True))
     memory_max_items = int(memory_cfg.get("max_items", 5))
@@ -1323,9 +1382,20 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         failure_context = f"上一轮失败原因：{previous_failure_reason}\n" if previous_failure_reason else ""
         failure_context += "最近失败策略共同原因通常不是没有盈利单，而是固定止损或 trailing_stop_loss 吃掉 ROI 收益。\n"
         compact_memory = build_compact_strategy_context(memory_items, baseline_cfg, memory_max_items, memory_max_chars) if memory_enabled else ""
+        session_parent_candidates = {
+            "historical_best": historical_best_mem if historical_best_mem and not _is_reset_best(historical_best_mem) else None,
+            "nearest_candidate": nearest_mem,
+            "baseline": {"strategy_class": "baseline", "train_metrics": baseline_cfg},
+        }
+        official_champion_name = "historical_best" if session_parent_candidates["historical_best"] else "baseline"
+        print(f"当前正式 champion：{official_champion_name}")
+        print("当前 session_parent 候选：")
+        print(f"- historical_best: {(session_parent_candidates['historical_best'] or {}).get('strategy_class', '无')}")
+        print(f"- nearest_candidate: {(session_parent_candidates['nearest_candidate'] or {}).get('strategy_class', '无')}")
         spec_prompt = _strategy_spec_prompt(class_name, runtime_goal, baseline_cfg, compact_memory, previous_failure_reason)
         spec_prompt += f"\nchampion_strategy_class={champion.get('meta', {}).get('strategy_class', 'baseline')}\n"
         spec_prompt += f"\n已失败 mutation_type（避免重复）={sorted(used_failed_mutations)}\n"
+        (version_dir / "advisor_prompt.txt").write_text(spec_prompt, encoding="utf-8")
         print("正在调用策略顾问模型生成 mutation_spec……")
         try:
             spec_text = safe_ask_ai(
@@ -1412,6 +1482,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "- 只输出可运行的完整 Python 策略代码，不要解释。\n"
             "- 避免把入场条件写成几乎永远不触发的苛刻组合。\n"
         )
+        (version_dir / "codegen_prompt.txt").write_text(prompt, encoding="utf-8")
         print("3. 正在调用 GPT-5.5 生成 Freqtrade 策略代码……")
         response_text = ""
         try:
@@ -1690,6 +1761,13 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "strategy_file": str(strategy_file),
             "parent_strategy": champion.get("meta", {}).get("strategy_class", "baseline"),
             "mutation_type": mutation_type,
+            "official_champion": official_champion_name,
+            "historical_best": session_parent_candidates.get("historical_best"),
+            "nearest_candidate_used": session_parent_candidates.get("nearest_candidate"),
+            "session_parent_choice": strategy_spec.get("session_parent_choice", "baseline"),
+            "session_parent_reason": strategy_spec.get("session_parent_reason", ""),
+            "advisor_prompt_file": str(version_dir / "advisor_prompt.txt"),
+            "codegen_prompt_file": str(version_dir / "codegen_prompt.txt"),
             "changed_items": strategy_spec.get("changes", []),
             "train_metrics": train_metrics,
             "exit_reason_details": {
@@ -1836,6 +1914,11 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     closest_failed = sorted(nearest_failed_candidates, key=_nearest_sort_key)[0] if nearest_failed_candidates else None
     nearest_candidate = None
     if closest_failed:
+        nearest_validation_metrics: list[dict[str, Any]] = []
+        nearest_summary = run_dir / str(closest_failed.get("version")) / "summary.json"
+        if nearest_summary.exists():
+            sum_data = read_json(nearest_summary)
+            nearest_validation_metrics = [_normalize_validation_metric(x, "validation") for x in (sum_data.get("validation_metrics") or [])]
         nearest_candidate = {
             "strategy_class": closest_failed.get("strategy_class"),
             "strategy_file": closest_failed.get("strategy_file"),
@@ -1846,12 +1929,14 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 "max_drawdown_pct": closest_failed.get("max_drawdown_pct"),
                 "total_trades": closest_failed.get("total_trades"),
             },
-            "validation_metrics": [],
+            "validation_metrics": nearest_validation_metrics,
             "improvement_vs_baseline": {
                 "profit_total_pct_delta": _safe_float(closest_failed.get("train_profit_pct")) - baseline_profit_pct,
                 "profit_factor_delta": _safe_float(closest_failed.get("profit_factor")) - _safe_float(baseline_cfg.get("profit_factor")),
             },
         }
+        if not nearest_validation_metrics:
+            nearest_candidate["validation_metrics_missing_reason"] = "训练区间触发硬约束，跳过验证"
         if oversized_fallback and _safe_int(closest_failed.get("total_trades")) > max_trades_target:
             nearest_candidate["trade_over_limit"] = True
             nearest_candidate["why_nearest"] += "（本轮无 25~80 笔候选，使用 81~120 笔超标候选仅作参考）"
@@ -1867,6 +1952,33 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     _write_json_list_file(MEMORY_FILE, memory_items[-200:])
     _write_json_list_file(BLACKLIST_FILE, blacklist_items[-200:])
     _write_json_list_file(LESSONS_FILE, lessons_items[-200:])
+
+    last_run_summary = {
+        "run_id": run_id,
+        "created_at": datetime.utcnow().isoformat(),
+        "target": target_cfg,
+        "official_best": current_best_saved if 'current_best_saved' in locals() else None,
+        "historical_best": historical_best_mem,
+        "nearest_candidate": nearest_candidate,
+        "session_best": session_best,
+        "failed_versions": [r.get("version") for r in invalid_rows],
+        "common_failure_patterns": list({str(r.get("invalid_reason") or r.get("failure_reason") or "") for r in invalid_rows if (r.get("invalid_reason") or r.get("failure_reason"))}),
+        "recommended_next_mutation_types": ["reduce_trade_frequency", "remove_bad_entry_condition", "adjust_stoploss"],
+        "forbidden_next_mutation_types": sorted(used_failed_mutations),
+        "lessons_for_next_run": [
+            "不要重新生成完全不同策略",
+            "优先围绕 nearest_candidate 和 historical_best 做单点小步调整",
+            "目标总交易数是 25~80，不是单币种 25~80",
+            "如果 nearest_candidate 交易数略超标，例如 98 笔，下一轮目标是压到 60~80 笔",
+            "不要放宽入场",
+            "不要启用 exit_signal",
+            "不要启用或扩大 trailing",
+            "不要扩大 stoploss",
+            "优先减少固定止损亏损",
+            "避免与历史失败策略相似",
+        ],
+    }
+    write_json(LAST_RUN_SUMMARY_FILE, last_run_summary)
 
     if best:
         best_strategy_file = run_dir / best_version / "strategy.py" if best_version else Path(best["strategy_file"])
@@ -1936,6 +2048,22 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         else:
             print("本轮没有可参考 challenger。")
         print("本轮失败模式总结：高频风险 / 止损吞噬利润 / trailing 结构失败 / 相似失败策略。")
+
+    print("========== 记忆写入状态 ==========")
+    print(f"nearest_candidate.json：{'已写入' if nearest_candidate else '未写入'}")
+    print(f"last_run_summary.json：{'已写入' if LAST_RUN_SUMMARY_FILE.exists() else '未写入'}")
+    print(f"best_strategy.json：{'已更新' if best else '未更新'}")
+    print("strategy_memory.json：已追加")
+    print("strategy_lessons.json：已更新")
+    print("strategy_blacklist.json：已更新")
+    print(f"下一轮 advisor prompt 将加载 last_run_summary：{'是' if LAST_RUN_SUMMARY_FILE.exists() else '否'}")
+    print(f"下一轮 advisor prompt 将加载 nearest_candidate：{'是' if NEAREST_CANDIDATE_FILE.exists() else '否'}")
+    print(f"下一轮 advisor prompt 将加载 historical_best：{'是' if BEST_STRATEGY_FILE.exists() else '否'}")
+    print("\n========== Prompt 审计文件 ==========")
+    for p in sorted(run_dir.glob('v*/advisor_prompt.txt')):
+        print(p)
+    for p in sorted(run_dir.glob('v*/codegen_prompt.txt')):
+        print(p)
 
     if args.retest_current_best_at_end:
         print("\n========== 结束前复测 current best / baseline ==========")
