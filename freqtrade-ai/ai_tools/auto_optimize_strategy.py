@@ -645,6 +645,15 @@ def print_current_best_summary(goal: dict[str, Any], memory: dict[str, Any] | No
         source = "历史 best"
     tm = data.get("train_metrics", {}) or {}
     av = data.get("avg_validation_metrics", {}) or {}
+    validation_metrics = data.get("validation_metrics", []) or []
+    if validation_metrics:
+        avg_profit, avg_pf, max_dd = _aggregate_validation_metrics(validation_metrics)
+        if "profit_total_pct" not in av:
+            av["profit_total_pct"] = avg_profit
+        if "profit_factor" not in av:
+            av["profit_factor"] = avg_pf
+        if "max_drawdown_pct" not in av:
+            av["max_drawdown_pct"] = max_dd
     print("\n========== 当前最佳策略简述 ==========")
     print(f"来源：{source}")
     print(f"策略名：{data.get('strategy_class', '-')}")
@@ -664,30 +673,42 @@ def print_current_best_summary(goal: dict[str, Any], memory: dict[str, Any] | No
     print("主要风险：仍需更多区间复验。")
 
 
+def _aggregate_validation_metrics(validation_metrics: list[dict[str, Any]]) -> tuple[float, float, float]:
+    if not validation_metrics:
+        return 0.0, 0.0, 0.0
+    rows = [(item.get("metrics", {}) or {}) for item in validation_metrics]
+    avg_profit = sum(_safe_float(x.get("profit_total_pct")) for x in rows) / len(rows)
+    avg_pf = sum(_safe_float(x.get("profit_factor")) for x in rows) / len(rows)
+    max_dd = max(
+        (_safe_float(x.get("max_drawdown_pct")) if x.get("max_drawdown_pct") is not None else _safe_float(x.get("max_drawdown")) * 100.0)
+        for x in rows
+    )
+    return avg_profit, avg_pf, max_dd
+
+
 def extract_strategy_features(strategy_code: str) -> dict[str, Any]:
     lc = strategy_code.lower()
+
     def _extract(pattern: str) -> str | None:
-        m = re.search(pattern, strategy_code, flags=re.IGNORECASE)
+        m = re.search(pattern, strategy_code, flags=re.IGNORECASE | re.DOTALL)
         return m.group(1).strip() if m else None
-    indicators = [x for x in ["rsi", "ema", "macd", "bbands", "adx", "atr", "volume"] if x in lc]
-    keywords = []
-    mapping = [("RSI rebound", ["rsi", "rebound"]), ("EMA cross", ["ema", "cross"]), ("BB bounce", ["bb", "bounce"]),
-               ("MACD momentum", ["macd", "momentum"]), ("pullback", ["pullback"]), ("volume filter", ["volume"])]
-    for name, keys in mapping:
-        if all(k in lc for k in keys):
-            keywords.append(name)
+
+    def _norm_list(tokens: list[str]) -> list[str]:
+        return sorted(set(t.strip().lower() for t in tokens if t and t.strip()))
+
+    indicators = _norm_list(re.findall(r"\b(rsi|ema\d*|macd|bbands|bollinger|adx|atr|volume|sma\d*)\b", lc))
+    entry_conditions = _norm_list(re.findall(r"\((df\[.*?\]\s*[<>=!]+\s*[^\)]+)\)", strategy_code, flags=re.DOTALL))
+    entry_tags = _norm_list(re.findall(r"[\"']([A-Za-z0-9_\-]+)[\"']\s*(?:,|\)|\])", _extract(r"entry_tag\s*=\s*(.*)") or ""))
+
     return {
         "minimal_roi": _extract(r"minimal_roi\s*=\s*(\{.*?\})"),
         "stoploss": _extract(r"stoploss\s*=\s*([-\d\.]+)"),
         "trailing_stop": _extract(r"trailing_stop\s*=\s*(True|False)"),
         "use_exit_signal": _extract(r"use_exit_signal\s*=\s*(True|False)"),
-        "startup_candle_count": _extract(r"startup_candle_count\s*=\s*(\d+)"),
+        "timeframe": _extract(r"timeframe\s*=\s*[\"']([^\"']+)[\"']"),
         "indicators": indicators,
-        "uses_informative_1h": "1h" in lc and "informative" in lc,
-        "uses_position_adjustment": "position_adjustment" in lc,
-        "has_custom_stoploss": "def custom_stoploss" in lc,
-        "has_custom_exit": "def custom_exit" in lc,
-        "entry_keywords": keywords,
+        "entry_conditions": entry_conditions[:20],
+        "entry_tags": entry_tags[:8],
     }
 
 
@@ -696,27 +717,29 @@ def _feature_signature(features: dict[str, Any]) -> str:
         "minimal_roi": features.get("minimal_roi"),
         "stoploss": features.get("stoploss"),
         "trailing_stop": features.get("trailing_stop"),
-        "use_exit_signal": features.get("use_exit_signal"),
-        "entry_keywords": sorted(features.get("entry_keywords", [])),
+        "entry_conditions": features.get("entry_conditions", []),
+        "entry_tags": features.get("entry_tags", []),
+        "indicators": features.get("indicators", []),
     }
     return hashlib.sha256(json.dumps(key, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
 
-def strategy_similarity(a: dict[str, Any], b: dict[str, Any]) -> float:
+def strategy_similarity(a: dict[str, Any], b: dict[str, Any]) -> tuple[float, list[str]]:
+    weights = {"entry_conditions": 0.30, "entry_tags": 0.15, "stoploss": 0.15, "minimal_roi": 0.15, "trailing_stop": 0.10, "indicators": 0.15}
     score = 0.0
-    total = 7.0
-    for k in ["stoploss", "minimal_roi", "trailing_stop", "use_exit_signal"]:
-        if str(a.get(k)) == str(b.get(k)):
-            score += 1.0
-    if set(a.get("indicators", [])) == set(b.get("indicators", [])):
-        score += 1.0
-    if set(a.get("entry_keywords", [])) == set(b.get("entry_keywords", [])):
-        score += 1.0
-    freq_a = "high" if "high" in str(a.get("trade_frequency", "")).lower() else "normal"
-    freq_b = "high" if "high" in str(b.get("trade_frequency", "")).lower() else "normal"
-    if freq_a == freq_b:
-        score += 1.0
-    return score / total
+    reasons: list[str] = []
+    for k in ["stoploss", "minimal_roi", "trailing_stop"]:
+        if str(a.get(k)) == str(b.get(k)) and a.get(k) is not None:
+            score += weights[k]
+            reasons.append(f"{k} 相同")
+    for k in ["entry_conditions", "entry_tags", "indicators"]:
+        sa, sb = set(a.get(k, [])), set(b.get(k, []))
+        if sa and sb:
+            j = len(sa & sb) / max(1, len(sa | sb))
+            score += weights[k] * j
+            if j >= 0.66:
+                reasons.append(f"{k} 相似")
+    return min(1.0, score), reasons
 
 
 def build_compact_strategy_context(memory: list[dict[str, Any]], baseline: dict[str, Any], max_items: int = 5, max_chars: int = 2500) -> str:
@@ -1509,21 +1532,63 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         features = extract_strategy_features(code)
         signature = _feature_signature(features)
         code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
-        similar_failed = next((x for x in blacklist_items if strategy_similarity(features, x.get("features", {})) >= 0.85), None)
-        duplicated_hash = next((x for x in blacklist_items if str(x.get("code_hash", "")) == code_hash), None)
-        if avoid_similar and (similar_failed or duplicated_hash):
-            msg = "新策略与历史失败策略高度相似，建议重新生成。"
-            print(msg)
-            previous_failure_reason = msg
-            if args.auto_approve:
+        similarity_threshold = float(args.similarity_threshold)
+        similarity_report = {"is_similar": False, "similarity_score": 0.0, "similar_to": "", "similar_type": "none", "reasons": [], "decision": "auto_continue", "user_prompt_required": False}
+        parent_pool = [
+            ("session_parent", champion.get("meta") if champion.get("meta") else None),
+            ("historical_best", session_parent_candidates.get("historical_best")),
+            ("nearest_candidate", session_parent_candidates.get("nearest_candidate")),
+        ]
+        best_match = {"score": 0.0, "type": "none", "item": None, "reasons": []}
+        for t, item in parent_pool:
+            if not isinstance(item, dict):
                 continue
-            yn = input("是否仍然执行回测？(y/n)\n").strip()
-            if parse_yes_no(yn) is not True:
-                write_json(version_dir / "summary.json", {"is_valid": False, "invalid_reason": "用户拒绝回测相似失败策略。", "mutation_type": mutation_type})
-                leaderboard.append(
-                    {"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": "用户拒绝回测相似失败策略。"}
-                )
+            score, reasons = strategy_similarity(features, item.get("features", {}))
+            if score > best_match["score"]:
+                best_match = {"score": score, "type": t, "item": item, "reasons": reasons}
+        for item in blacklist_items[-120:]:
+            score, reasons = strategy_similarity(features, item.get("features", {}))
+            if score > best_match["score"]:
+                best_match = {"score": score, "type": "failed_blacklist", "item": item, "reasons": reasons}
+        if best_match["score"] >= similarity_threshold:
+            similarity_report.update({
+                "is_similar": True,
+                "similarity_score": round(float(best_match["score"]), 4),
+                "similar_to": (best_match["item"] or {}).get("strategy_class") or (best_match["item"] or {}).get("version") or "unknown",
+                "similar_type": best_match["type"],
+                "reasons": best_match["reasons"],
+            })
+        print("新策略相似度检测：")
+        print(f"- 相似对象：{similarity_report['similar_to'] or '无'}")
+        print(f"- 相似对象类型：{similarity_report['similar_type']}")
+        print(f"- 相似度：{float(similarity_report['similarity_score']):.2f}")
+        print(f"- 相似原因：{'、'.join(similarity_report['reasons']) if similarity_report['reasons'] else '无'}")
+        if similarity_report["similar_type"] in {"session_parent", "historical_best", "nearest_candidate"} and args.auto_continue_if_similar_to_parent:
+            print(f"新策略与 {similarity_report['similar_type']} 相似，这是小步迭代预期行为，继续回测。")
+            print("相似对象为当前 session_parent，属于预期小步修改，自动继续回测。")
+            similarity_report["decision"] = "auto_continue"
+        elif avoid_similar and similarity_report["similar_type"] == "failed_blacklist":
+            if args.auto_approve and args.auto_reject_failed_similarity:
+                similarity_report["decision"] = "auto_reject"
+                write_json(version_dir / "similarity_report.json", similarity_report)
+                write_json(version_dir / "summary.json", {"is_valid": False, "invalid_reason": "自动拒绝：与失败黑名单高度相似", "mutation_type": mutation_type, "similarity_report": similarity_report})
+                leaderboard.append({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": "自动拒绝：与失败黑名单高度相似"})
                 continue
+            if not args.auto_approve:
+                similarity_report["user_prompt_required"] = True
+                similarity_report["decision"] = "user_prompt"
+                print("新策略与历史失败黑名单高度相似，且不是当前 session_parent。")
+                print("建议重新生成。")
+                yn = input("是否仍然执行回测？(y/n)\n").strip()
+                if parse_yes_no(yn) is not True:
+                    similarity_report["decision"] = "user_reject"
+                    write_json(version_dir / "similarity_report.json", similarity_report)
+                    write_json(version_dir / "summary.json", {"is_valid": False, "invalid_reason": "用户拒绝回测相似失败策略。", "mutation_type": mutation_type, "similarity_report": similarity_report})
+                    leaderboard.append({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": "用户拒绝回测相似失败策略。"})
+                    continue
+                similarity_report["decision"] = "user_override_continue"
+        print(f"- 是否允许自动继续：{'是' if similarity_report['decision'] in {'auto_continue', 'user_override_continue'} else '否'}")
+        write_json(version_dir / "similarity_report.json", similarity_report)
         strategy_file.parent.mkdir(parents=True, exist_ok=True)
         strategy_file.write_text(code, encoding="utf-8")
         shutil.copy2(strategy_file, version_dir / "strategy.py")
@@ -1796,13 +1861,11 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "is_best": is_best,
             "is_valid": is_valid,
             "invalid_reason": invalid_reason,
+            "similarity_report": read_json(version_dir / "similarity_report.json") if (version_dir / "similarity_report.json").exists() else {},
         }
         summary_path = version_dir / "summary.json"
         write_json(summary_path, summary)
-        avg_validation_profit_pct = (
-            sum(_safe_float(item["metrics"].get("profit_total_pct")) for item in validation_metrics) / len(validation_metrics)
-            if validation_metrics else 0.0
-        )
+        avg_validation_profit_pct, avg_validation_profit_factor, max_validation_drawdown_pct = _aggregate_validation_metrics(validation_metrics)
         leaderboard_entry = {
             "version": ver,
             "run_id": run_id,
@@ -1813,6 +1876,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "final_score": final_score,
             "train_profit_pct": _safe_float(train_metrics.get("profit_total_pct")),
             "avg_validation_profit_pct": avg_validation_profit_pct,
+            "avg_validation_profit_factor": avg_validation_profit_factor,
+            "max_validation_drawdown_pct": max_validation_drawdown_pct,
+            "validation_metrics": validation_metrics,
             "profit_factor": _safe_float(train_metrics.get("profit_factor")),
             "max_drawdown_pct": _safe_float(train_metrics.get("max_drawdown")) * 100.0,
             "total_trades": _safe_int(train_metrics.get("total_trades")),
@@ -1833,6 +1899,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "validation_metrics": validation_metrics,
             "avg_validation_metrics": {
                 "profit_total_pct": avg_validation_profit_pct,
+                "profit_factor": avg_validation_profit_factor,
+                "max_drawdown_pct": max_validation_drawdown_pct,
             },
             "train_metrics": train_metrics,
             **_extract_exit_profit_fields(train_metrics),
@@ -2003,7 +2071,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         print("主要优势：训练与验证综合评分最高。")
         print("主要风险：仍需更多样本周期验证稳健性。")
         print("为什么成为 best：在满足有效性约束下 final_score 最高。")
-        current_best_saved = {"strategy_class": best["class_name"], "strategy_file": str(best_strategy_file), "source_run_id": run_id, "version": best_version, "train_metrics": best["train_metrics"], "validation_metrics": [], "avg_validation_metrics": {"profit_total_pct": next((r.get("avg_validation_profit_pct", 0.0) for r in leaderboard_sorted if r.get("version") == best_version), 0.0)}, "score_breakdown": {}, "final_score": best["final_score"], "created_at": datetime.utcnow().isoformat(), "why_best": "本轮 final_score 最高。", "is_overfit": bool(best.get("is_overfit"))}
+        best_leaderboard_entry = next((r for r in leaderboard_sorted if r.get("version") == best_version), {}) or {}
+        best_validation_metrics = best_leaderboard_entry.get("validation_metrics", []) or []
+        cb_avg_profit, cb_avg_pf, cb_max_dd = _aggregate_validation_metrics(best_validation_metrics)
+        current_best_saved = {"strategy_class": best["class_name"], "strategy_file": str(best_strategy_file), "source_run_id": run_id, "version": best_version, "train_metrics": best["train_metrics"], "validation_metrics": best_validation_metrics, "avg_validation_metrics": {"profit_total_pct": cb_avg_profit, "profit_factor": cb_avg_pf, "max_drawdown_pct": cb_max_dd}, "score_breakdown": {}, "final_score": best["final_score"], "created_at": datetime.utcnow().isoformat(), "why_best": "本轮 final_score 最高。", "is_overfit": bool(best.get("is_overfit"))}
         write_json(BEST_STRATEGY_FILE, current_best_saved)
     else:
         if args.force_session_best and session_best:
@@ -2109,6 +2180,9 @@ def main() -> None:
     parser.add_argument("--retest-current-best-at-end", action="store_true", default=False)
     parser.add_argument("--reset-best", action="store_true", default=False)
     parser.add_argument("--force-session-best", action="store_true", default=False)
+    parser.add_argument("--similarity-threshold", type=float, default=0.88)
+    parser.add_argument("--auto-continue-if-similar-to-parent", action="store_true", default=True)
+    parser.add_argument("--auto-reject-failed-similarity", action="store_true", default=False)
     args = parser.parse_args()
 
     goal_path = ROOT_DIR / args.goal
