@@ -16,3 +16,6 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+.env.*
+user_data/backtest_results/backtest-result*.zip
+user_data/ai_memory/backups/
