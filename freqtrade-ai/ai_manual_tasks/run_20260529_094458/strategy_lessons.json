@@ -1,0 +1,764 @@
+{
+  "items": [
+    {
+      "version": "v001",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；最大回撤超过目标；交易数超过目标上限",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v002",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；最大回撤超过目标",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v003",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；最大回撤超过目标；交易数超过目标上限",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v004",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；最大回撤超过目标；交易数超过目标上限",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v001",
+      "failure_reason": "Profit factor 低于 baseline",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v002",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；最大回撤超过目标",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v003",
+      "failure_reason": "Profit factor 低于 baseline",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v004",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；最大回撤超过目标；交易数超过目标上限",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v005",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；最大回撤超过目标",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v001",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v002",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；最大回撤超过目标；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v003",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；最大回撤超过目标；交易数超过目标上限；固定止损亏损吞噬 ROI 收益。；高频风险：交易数超过目标上限 1.5 倍",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v004",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；最大回撤超过目标；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v005",
+      "failure_reason": "Profit factor 低于 baseline",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v001",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；最大回撤超过目标；交易数超过目标上限；固定止损亏损吞噬 ROI 收益。；高频风险：交易数超过目标上限 1.5 倍",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v002",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；最大回撤超过目标；交易数超过目标上限；固定止损亏损吞噬 ROI 收益。；高频风险：交易数超过目标上限 1.5 倍",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v003",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；最大回撤超过目标；交易数超过目标上限；固定止损亏损吞噬 ROI 收益。；高频风险：交易数超过目标上限 1.5 倍",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v004",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；交易数超过目标上限；固定止损亏损吞噬 ROI 收益。；高频风险：交易数超过目标上限 1.5 倍",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v005",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；最大回撤超过目标；交易数超过目标上限；固定止损亏损吞噬 ROI 收益。；高频风险：交易数超过目标上限 1.5 倍",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v001",
+      "failure_reason": "Profit factor 低于 baseline",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v002",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；最大回撤超过目标；交易数超过目标上限；固定止损亏损吞噬 ROI 收益。；高频风险：交易数超过目标上限 1.5 倍",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v003",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；最大回撤超过目标；固定止损亏损吞噬 ROI 收益。；高频风险：交易数超过目标上限 1.5 倍",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v004",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；交易数超过目标上限；固定止损亏损吞噬 ROI 收益。；高频风险：交易数超过目标上限 1.5 倍",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v005",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；最大回撤超过目标；交易数超过目标上限；固定止损亏损吞噬 ROI 收益。；高频风险：交易数超过目标上限 1.5 倍",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v001",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；交易数超过目标上限；固定止损亏损吞噬 ROI 收益。；高频风险：交易数超过目标上限 1.5 倍",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v002",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；最大回撤超过目标；交易数超过目标上限；固定止损亏损吞噬 ROI 收益。；高频风险：交易数超过目标上限 1.5 倍",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v001",
+      "failure_reason": "Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v002",
+      "failure_reason": "Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v003",
+      "failure_reason": "固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v001",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；最大回撤超过目标；固定止损亏损吞噬 ROI 收益。；高频风险：交易数超过目标上限 1.5 倍",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v002",
+      "failure_reason": "Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v003",
+      "failure_reason": "Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v001",
+      "failure_reason": "固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v001",
+      "failure_reason": "Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v002",
+      "failure_reason": "固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v001",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。；高频风险：交易数超过目标上限 1.5 倍",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v002",
+      "failure_reason": "Profit factor 低于 baseline",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v003",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；最大回撤超过目标；交易数超过目标上限；固定止损亏损吞噬 ROI 收益。；高频风险：交易数超过目标上限 1.5 倍",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v004",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。；高频风险：交易数超过目标上限 1.5 倍",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v005",
+      "failure_reason": "Profit factor 低于 baseline",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v001",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。；高频风险：交易数超过目标上限 1.5 倍",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v002",
+      "failure_reason": "Profit factor 低于 baseline",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v003",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；最大回撤超过目标；交易数超过目标上限；固定止损亏损吞噬 ROI 收益。；高频风险：交易数超过目标上限 1.5 倍",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v004",
+      "failure_reason": "Profit factor 低于 baseline",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v005",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；最大回撤超过目标；交易数超过目标上限；固定止损亏损吞噬 ROI 收益。；高频风险：交易数超过目标上限 1.5 倍",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v006",
+      "failure_reason": "Profit factor 低于 baseline",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v008",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。；高频风险：交易数超过目标上限 1.5 倍",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v009",
+      "failure_reason": "固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v010",
+      "failure_reason": "Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v011",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v012",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v014",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v015",
+      "failure_reason": "Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v017",
+      "failure_reason": "Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v018",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v019",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v020",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v021",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v022",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。；高频风险：交易数超过目标上限 1.5 倍",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v024",
+      "failure_reason": "Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v025",
+      "failure_reason": "Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v027",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v028",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v029",
+      "failure_reason": "Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v030",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v031",
+      "failure_reason": "Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v032",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v033",
+      "failure_reason": "Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v035",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v036",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v037",
+      "failure_reason": "Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v038",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v039",
+      "failure_reason": "Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v040",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v001",
+      "failure_reason": "Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v002",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v001",
+      "failure_reason": "训练区间交易数略低于目标下限，验证强度不足",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v002",
+      "failure_reason": "训练区间交易数低于目标下限",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v003",
+      "failure_reason": "Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v004",
+      "failure_reason": "固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v005",
+      "failure_reason": "固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v006",
+      "failure_reason": "固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v007",
+      "failure_reason": "训练区间交易数低于目标下限",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v008",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；最大回撤超过目标；交易数超过目标上限；固定止损亏损吞噬 ROI 收益。；高频风险：交易数超过目标上限 1.5 倍",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v009",
+      "failure_reason": "固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v010",
+      "failure_reason": "Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v011",
+      "failure_reason": "final_score<=0",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v012",
+      "failure_reason": "训练区间交易数略低于目标下限，验证强度不足",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v014",
+      "failure_reason": "Profit factor 低于 baseline",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v015",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；交易数超过目标上限；固定止损亏损吞噬 ROI 收益。；高频风险：交易数超过目标上限 1.5 倍",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v016",
+      "failure_reason": "训练区间亏损超过 baseline；Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v017",
+      "failure_reason": "Profit factor 低于 baseline",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v018",
+      "failure_reason": "固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v019",
+      "failure_reason": "final_score<=0",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v020",
+      "failure_reason": "训练区间交易数略低于目标下限，验证强度不足",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v021",
+      "failure_reason": "final_score<=0",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v022",
+      "failure_reason": "训练区间交易数低于目标下限",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v023",
+      "failure_reason": "Profit factor 低于 baseline",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v024",
+      "failure_reason": "训练区间交易数低于目标下限",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v025",
+      "failure_reason": "固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v026",
+      "failure_reason": "固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v027",
+      "failure_reason": "Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v028",
+      "failure_reason": "固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v029",
+      "failure_reason": "固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v030",
+      "failure_reason": "Profit factor 低于 baseline",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v001",
+      "failure_reason": "训练区间交易数略低于目标下限，验证强度不足",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v002",
+      "failure_reason": "训练区间交易数略低于目标下限，验证强度不足",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v001",
+      "failure_reason": "训练区间交易数略低于目标下限，验证强度不足",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v002",
+      "failure_reason": "final_score<=0",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v003",
+      "failure_reason": "Profit factor 低于 baseline",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v004",
+      "failure_reason": "final_score<=0",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v005",
+      "failure_reason": "训练区间交易数略低于目标下限，验证强度不足",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v006",
+      "failure_reason": "训练区间交易数略低于目标下限，验证强度不足",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v007",
+      "failure_reason": "训练区间交易数略低于目标下限，验证强度不足",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v008",
+      "failure_reason": "训练区间交易数略低于目标下限，验证强度不足",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v009",
+      "failure_reason": "固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v010",
+      "failure_reason": "Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v011",
+      "failure_reason": "final_score<=0",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v012",
+      "failure_reason": "final_score<=0",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v013",
+      "failure_reason": "训练区间交易数略低于目标下限，验证强度不足",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v014",
+      "failure_reason": "固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v015",
+      "failure_reason": "训练区间交易数略低于目标下限，验证强度不足",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v016",
+      "failure_reason": "训练区间交易数略低于目标下限，验证强度不足",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v017",
+      "failure_reason": "训练区间交易数略低于目标下限，验证强度不足",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v018",
+      "failure_reason": "final_score<=0",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v019",
+      "failure_reason": "训练区间交易数略低于目标下限，验证强度不足",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v020",
+      "failure_reason": "训练区间交易数略低于目标下限，验证强度不足",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v021",
+      "failure_reason": "训练区间交易数略低于目标下限，验证强度不足",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v022",
+      "failure_reason": "训练区间交易数略低于目标下限，验证强度不足",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v023",
+      "failure_reason": "训练区间交易数略低于目标下限，验证强度不足",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v024",
+      "failure_reason": "final_score<=0",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v025",
+      "failure_reason": "final_score<=0",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v026",
+      "failure_reason": "final_score<=0",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v027",
+      "failure_reason": "训练区间交易数略低于目标下限，验证强度不足",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v028",
+      "failure_reason": "final_score<=0",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v029",
+      "failure_reason": "训练区间交易数略低于目标下限，验证强度不足",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v030",
+      "failure_reason": "final_score<=0",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v031",
+      "failure_reason": "训练区间交易数略低于目标下限，验证强度不足",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v001",
+      "failure_reason": "final_score<=0",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v002",
+      "failure_reason": "Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v001",
+      "failure_reason": "训练区间交易数略低于目标下限，验证强度不足",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v002",
+      "failure_reason": "final_score<=0",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v003",
+      "failure_reason": "Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v004",
+      "failure_reason": "训练区间交易数略低于目标下限，验证强度不足",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v005",
+      "failure_reason": "final_score<=0",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v001",
+      "failure_reason": "训练区间交易数低于目标下限",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v001",
+      "failure_reason": "final_score<=0",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v002",
+      "failure_reason": "final_score<=0",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v003",
+      "failure_reason": "final_score<=0",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v004",
+      "failure_reason": "训练区间交易数略低于目标下限，验证强度不足",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v005",
+      "failure_reason": "Profit factor 低于 baseline；固定止损亏损吞噬 ROI 收益。",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    },
+    {
+      "version": "v008",
+      "failure_reason": "final_score<=0",
+      "avoid_next": "减少 stoploss 损失，验证区间优先稳健。"
+    }
+  ]
+}
