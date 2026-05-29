@@ -687,6 +687,118 @@ def _aggregate_validation_metrics(validation_metrics: list[dict[str, Any]]) -> t
     return avg_profit, avg_pf, max_dd
 
 
+
+def _new_round_defaults() -> dict[str, Any]:
+    """Return per-iteration defaults for values written to summaries.
+
+    Keep this in one place so skipped/failed branches can still write a
+    complete summary without referencing variables that are only assigned by
+    later backtest branches.
+    """
+    return {
+        "train_metrics": None,
+        "validation_metrics": [],
+        "validation_status": "not_run",
+        "validation_skip_reason": "",
+        "holdout_metrics": [],
+        "holdout_status": "not_run",
+        "holdout_reason": "",
+        "pair_metrics": [],
+        "entry_tag_metrics": [],
+        "similarity_report": None,
+        "final_score": 0,
+        "score_breakdown": {},
+        "invalid_reason": "",
+        "is_valid": False,
+        "is_best": False,
+        "trade_under_min": False,
+        "cannot_be_official_best_unless_validation_strong": False,
+        "validation_strong": False,
+        "trade_count_warning": "",
+    }
+
+
+def _apply_train_hard_constraint_status(
+    state: dict[str, Any],
+    hard_invalid_reason: str,
+    validation_skip_reason: str | None = None,
+) -> None:
+    """Mark validation/holdout as skipped after a train hard constraint."""
+    state["validation_metrics"] = []
+    state["validation_status"] = "skipped"
+    state["validation_skip_reason"] = validation_skip_reason or hard_invalid_reason
+    state["holdout_metrics"] = []
+    state["holdout_status"] = "skipped"
+    state["holdout_reason"] = "训练区间触发硬约束，跳过验证和 holdout"
+    state["is_valid"] = False
+    state["is_best"] = False
+    state["invalid_reason"] = hard_invalid_reason
+    state["final_score"] = 0
+
+
+def _ensure_holdout_not_run_reason(state: dict[str, Any]) -> None:
+    """Populate the standard holdout not-run reason for non-best rounds."""
+    if state.get("holdout_status") == "not_run" and not state.get("holdout_reason"):
+        state["holdout_reason"] = "未达到候选 best 条件，未执行 holdout"
+
+
+def _minimal_round_summary(
+    *,
+    version: str,
+    strategy_class: str,
+    strategy_file: str,
+    state: dict[str, Any],
+    mutation_type: str = "",
+    failure_reason: str = "",
+) -> dict[str, Any]:
+    """Build a minimal but schema-stable per-round summary."""
+    _ensure_holdout_not_run_reason(state)
+    return {
+        "version": version,
+        "strategy_class": strategy_class,
+        "strategy_file": strategy_file,
+        "mutation_type": mutation_type,
+        "train_metrics": state.get("train_metrics"),
+        "validation_metrics": state.get("validation_metrics", []),
+        "validation_status": state.get("validation_status", "not_run"),
+        "validation_skip_reason": state.get("validation_skip_reason", ""),
+        "holdout_metrics": state.get("holdout_metrics", []),
+        "holdout_status": state.get("holdout_status", "not_run"),
+        "holdout_reason": state.get("holdout_reason", ""),
+        "pair_metrics": state.get("pair_metrics", []),
+        "entry_tag_metrics": state.get("entry_tag_metrics", []),
+        "score_breakdown": state.get("score_breakdown", {}),
+        "final_score": state.get("final_score", 0),
+        "failure_reason": failure_reason,
+        "is_best": bool(state.get("is_best", False)),
+        "is_valid": bool(state.get("is_valid", False)),
+        "invalid_reason": state.get("invalid_reason", ""),
+        "similarity_report": state.get("similarity_report"),
+        "trade_under_min": bool(state.get("trade_under_min", False)),
+        "cannot_be_official_best_unless_validation_strong": bool(state.get("cannot_be_official_best_unless_validation_strong", False)),
+        "validation_strong": bool(state.get("validation_strong", False)),
+        "trade_count_warning": state.get("trade_count_warning", ""),
+    }
+
+
+def _is_validation_strong(
+    validation_metrics: list[dict[str, Any]],
+    baseline_cfg: dict[str, Any],
+    target_cfg: dict[str, Any],
+) -> bool:
+    """Return whether validation is strong enough for a near-min-trades candidate."""
+    if not validation_metrics:
+        return False
+    avg_profit_pct, avg_profit_factor, max_drawdown_pct = _aggregate_validation_metrics(validation_metrics)
+    baseline_profit_pct = _safe_float(baseline_cfg.get("profit_total_pct"))
+    baseline_profit_factor = _safe_float(baseline_cfg.get("profit_factor"))
+    max_drawdown_target = _safe_float(target_cfg.get("max_drawdown_pct", 3.0))
+    return (
+        avg_profit_pct >= max(0.0, baseline_profit_pct)
+        and avg_profit_factor >= max(1.0, baseline_profit_factor)
+        and (max_drawdown_target <= 0 or max_drawdown_pct <= max_drawdown_target)
+    )
+
 def extract_strategy_features(strategy_code: str) -> dict[str, Any]:
     lc = strategy_code.lower()
 
@@ -950,6 +1062,8 @@ def _strategy_spec_prompt(class_name: str, runtime_goal: dict[str, Any], baselin
     target_cfg = runtime_goal.get("target", {}) or {}
     min_trades = int(target_cfg.get("min_trades", 25))
     max_trades = int(target_cfg.get("max_trades", 80))
+    min_trades_grace_ratio = float(target_cfg.get("min_trades_grace_ratio", 0.8))
+    min_trades_grace_floor = int(min_trades * min_trades_grace_ratio)
     return (
         f"你是策略顾问模型。只输出 mutation_spec JSON，不要输出 Python 代码。建议 strategy_name={class_name}\n"
         f"goal={json.dumps(runtime_goal.get('target', {}), ensure_ascii=False)}\n"
@@ -958,7 +1072,7 @@ def _strategy_spec_prompt(class_name: str, runtime_goal: dict[str, Any], baselin
         f"last_failure={previous_failure_reason or '无'}\n"
         "必须只选择一个 mutation_type，允许值：add_entry_filter,tighten_entry_trigger,remove_bad_entry_condition,pair_specific_filter,tag_specific_filter,adjust_roi,adjust_stoploss,reduce_trade_frequency,disable_or_adjust_trailing,tighten_volume_filter,cooldown_or_protection。\n"
         "JSON 必须包含: mutation_type,reason,expected_effect,changes,do_not_change。\n"
-        f"硬约束：本轮训练区间总交易数目标是 {min_trades}~{max_trades}（不是单币种）。超过 {max_trades} 不能成为 best，超过 {int(max_trades * 1.5)} 会直接跳过验证。\n"
+        f"硬约束：本轮训练区间总交易数目标是 {min_trades}~{max_trades}（不是单币种）。低于 {min_trades_grace_floor} 会直接跳过验证；{min_trades_grace_floor}~{min_trades - 1} 会继续验证但仅作候选参考。超过 {max_trades} 不能成为 best，超过 {int(max_trades * 1.5)} 会直接跳过验证。\n"
         "重点：减少固定止损吞噬 ROI，不是增加交易数量。禁止/不推荐：increase_trade_frequency,loosen_entry,enable_trailing,adjust_stoploss_only,widen_stoploss。优先：add_entry_filter,tighten_entry_trigger,remove_bad_entry_condition,pair_specific_filter,tag_specific_filter。"
     )
 
@@ -1481,6 +1595,95 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "final_score": 0.0,
         }
         version_statuses.append(status)
+        round_state = _new_round_defaults()
+        train_metrics = round_state["train_metrics"]
+        validation_metrics = round_state["validation_metrics"]
+        validation_status = round_state["validation_status"]
+        validation_skip_reason = round_state["validation_skip_reason"]
+        holdout_metrics = round_state["holdout_metrics"]
+        holdout_status = round_state["holdout_status"]
+        holdout_reason = round_state["holdout_reason"]
+        pair_metrics = round_state["pair_metrics"]
+        entry_tag_metrics = round_state["entry_tag_metrics"]
+        similarity_report = round_state["similarity_report"]
+        final_score = round_state["final_score"]
+        score_breakdown = round_state["score_breakdown"]
+        invalid_reason = round_state["invalid_reason"]
+        is_valid = round_state["is_valid"]
+        is_best = round_state["is_best"]
+        mutation_type = ""
+        spec_hash = ""
+        code_hash = ""
+        features: dict[str, Any] = {}
+        failure_reason = ""
+        trade_under_min = bool(round_state["trade_under_min"])
+        cannot_be_official_best_unless_validation_strong = bool(round_state["cannot_be_official_best_unless_validation_strong"])
+        validation_strong = bool(round_state["validation_strong"])
+        trade_count_warning = str(round_state["trade_count_warning"])
+        summary_write_failed = False
+
+        def sync_round_state() -> None:
+            round_state.update({
+                "train_metrics": train_metrics,
+                "validation_metrics": validation_metrics,
+                "validation_status": validation_status,
+                "validation_skip_reason": validation_skip_reason,
+                "holdout_metrics": holdout_metrics,
+                "holdout_status": holdout_status,
+                "holdout_reason": holdout_reason,
+                "pair_metrics": pair_metrics,
+                "entry_tag_metrics": entry_tag_metrics,
+                "similarity_report": similarity_report,
+                "final_score": final_score,
+                "score_breakdown": score_breakdown,
+                "invalid_reason": invalid_reason,
+                "is_valid": is_valid,
+                "is_best": is_best,
+                "trade_under_min": trade_under_min,
+                "cannot_be_official_best_unless_validation_strong": cannot_be_official_best_unless_validation_strong,
+                "validation_strong": validation_strong,
+                "trade_count_warning": trade_count_warning,
+            })
+
+        def write_iteration_summary(extra: dict[str, Any] | None = None) -> Path:
+            nonlocal is_valid, is_best, invalid_reason, summary_write_failed
+            sync_round_state()
+            summary_data = _minimal_round_summary(
+                version=ver,
+                strategy_class=class_name,
+                strategy_file=str(strategy_file),
+                state=round_state,
+                mutation_type=mutation_type,
+                failure_reason=failure_reason,
+            )
+            if extra:
+                summary_data.update(extra)
+            summary_path_local = version_dir / "summary.json"
+            try:
+                write_json(summary_path_local, summary_data)
+            except Exception as exc:  # noqa: BLE001 - keep the optimizer running between rounds.
+                print(f"写入 summary.json 失败：{exc}。将写入最小 summary 并继续下一轮。")
+                summary_write_failed = True
+                is_valid = False
+                is_best = False
+                invalid_reason = f"summary 写入失败：{exc}"
+                round_state["is_valid"] = False
+                round_state["is_best"] = False
+                round_state["invalid_reason"] = f"summary 写入失败：{exc}"
+                minimal_summary = _minimal_round_summary(
+                    version=ver,
+                    strategy_class=class_name,
+                    strategy_file=str(strategy_file),
+                    state=round_state,
+                    mutation_type=mutation_type,
+                    failure_reason=failure_reason,
+                )
+                try:
+                    summary_path_local.write_text(json.dumps(minimal_summary, ensure_ascii=False, indent=2), encoding="utf-8")
+                except Exception as second_exc:  # noqa: BLE001
+                    print(f"写入最小 summary 仍失败：{second_exc}。继续下一轮。")
+            return summary_path_local
+
         print(f"\n========== 第 {i} 轮 / {ver} ==========")
         print("1. 正在生成 mutation_spec（冠军-挑战者小步改动）……")
         print(f"当前策略顾问模型：{advisor_model}{' (fallback)' if advisor_fallback else ''}")
@@ -1489,6 +1692,12 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         baseline_cfg = runtime_goal.get("baseline", {}) or {}
         min_trades = int(target_cfg.get("min_trades", 25))
         max_trades = int(target_cfg.get("max_trades", 80))
+        min_trades_grace_ratio = float(target_cfg.get("min_trades_grace_ratio", 0.8))
+        allow_near_min_trades_best = bool(
+            getattr(args, "allow_near_min_trades_best", False)
+            or runtime_goal.get("allow_near_min_trades_best", False)
+            or target_cfg.get("allow_near_min_trades_best", False)
+        )
         zero_trade_hint = (
             "上一轮失败原因：训练区间和所有验证区间均为 0 交易，请放宽入场条件。"
             if prev_train_trades == 0 else
@@ -1534,7 +1743,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             err_msg = str(exc)
             previous_failure_reason = f"策略顾问模型调用失败：{err_msg}"
             invalid_reason = previous_failure_reason
-            write_json(version_dir / "summary.json", {"is_valid": False, "invalid_reason": invalid_reason})
+            write_iteration_summary()
             leaderboard.append({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": invalid_reason})
             status["advisor_status"] = "AI 调用失败"
             status["invalid_reason"] = invalid_reason
@@ -1550,7 +1759,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         if not spec_text:
             previous_failure_reason = "strategy_advisor 生成 mutation_spec 失败。"
             invalid_reason = "mutation_spec JSON 解析失败"
-            write_json(version_dir / "summary.json", {"is_valid": False, "invalid_reason": invalid_reason})
+            write_iteration_summary()
             leaderboard.append({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": invalid_reason})
             print(f"strategy_spec 原始返回已保存：{version_dir / 'strategy_spec.raw.txt'}")
             print(f"8. 第 {i} 轮完成：无效，原因：{invalid_reason}")
@@ -1560,7 +1769,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         except (ValueError, json.JSONDecodeError):
             previous_failure_reason = "mutation_spec 不是有效 JSON object。"
             invalid_reason = "mutation_spec JSON 解析失败"
-            write_json(version_dir / "summary.json", {"is_valid": False, "invalid_reason": invalid_reason})
+            write_iteration_summary()
             leaderboard.append({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": invalid_reason})
             print(f"strategy_spec 解析失败，请检查：{version_dir / 'strategy_spec.raw.txt'}")
             print(f"8. 第 {i} 轮完成：无效，原因：{invalid_reason}")
@@ -1578,7 +1787,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "硬性约束：\n"
             "1) 仅允许在 champion 基础上一次小改动，不允许完全重写。\n"
             "2) 策略必须在训练区间产生合理交易，严禁生成完全无交易策略。\n"
-            f"2) 训练区间总交易数目标为 {min_trades}~{max_trades}（不是单币种）。超过 {max_trades} 不能成为 best；超过 {int(max_trades * 1.5)} 直接跳过验证。\n"
+            f"2) 训练区间总交易数目标为 {min_trades}~{max_trades}（不是单币种）。低于 {int(min_trades * min_trades_grace_ratio)} 笔直接跳过验证；{int(min_trades * min_trades_grace_ratio)}~{min_trades - 1} 笔继续验证但仅作候选参考。超过 {max_trades} 不能成为 best；超过 {int(max_trades * 1.5)} 直接跳过验证。\n"
             "3) 禁止连续状态型宽松入场；优先 crossed_above/crossed_below 事件触发；每个策略最多 1~2 个 entry_tag。\n"
             "4) 不允许多个 OR 条件堆叠造成高频；不允许为了增加交易数而放宽入场。\n"
             f"3) {zero_trade_hint}\n"
@@ -1622,7 +1831,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             print("本轮停止：代码生成模型多次失败，跳过本轮回测。")
             if response_text:
                 (version_dir / "codegen.raw.txt").write_text(response_text, encoding="utf-8")
-            write_json(version_dir / "summary.json", {"is_valid": False, "invalid_reason": invalid_reason})
+            write_iteration_summary()
             leaderboard.append({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": invalid_reason})
             continue
         (version_dir / "codegen.raw.txt").write_text(response_text, encoding="utf-8")
@@ -1671,7 +1880,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             if args.auto_approve and args.auto_reject_failed_similarity:
                 similarity_report["decision"] = "auto_reject"
                 write_json(version_dir / "similarity_report.json", similarity_report)
-                write_json(version_dir / "summary.json", {"is_valid": False, "invalid_reason": "自动拒绝：与失败黑名单高度相似", "mutation_type": mutation_type, "similarity_report": similarity_report})
+                invalid_reason = "自动拒绝：与失败黑名单高度相似"
+                write_iteration_summary({"similarity_report": similarity_report})
                 leaderboard.append({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": "自动拒绝：与失败黑名单高度相似"})
                 continue
             if not args.auto_approve:
@@ -1683,7 +1893,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 if parse_yes_no(yn) is not True:
                     similarity_report["decision"] = "user_reject"
                     write_json(version_dir / "similarity_report.json", similarity_report)
-                    write_json(version_dir / "summary.json", {"is_valid": False, "invalid_reason": "用户拒绝回测相似失败策略。", "mutation_type": mutation_type, "similarity_report": similarity_report})
+                    invalid_reason = "用户拒绝回测相似失败策略。"
+                    write_iteration_summary({"similarity_report": similarity_report})
                     leaderboard.append({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": "用户拒绝回测相似失败策略。"})
                     continue
                 similarity_report["decision"] = "user_override_continue"
@@ -1794,6 +2005,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         train_zip = _select_backtest_zip(results_dir, train_before_zips, train_start_ts)
         train_result = parse_backtest_from_zip(train_zip, class_name)
         train_metrics = _extract_metrics(train_result)
+        pair_metrics = _normalize_pair_metrics(train_metrics.get("pairs", []))
+        entry_tag_metrics = _normalize_entry_tag_metrics(train_metrics.get("entry_tags", []))
         status["train_backtest_status"] = "已训练回测"
         iteration_stats["train_backtest_count"] += 1
         prev_train_trades = int(train_metrics.get("total_trades", 0) or 0)
@@ -1806,16 +2019,34 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         high_freq_risk = train_trades > max_trades
 
         val_scores = []
-        validation_metrics: list[dict[str, Any]] = []
+        validation_metrics = []
+        validation_status = "not_run"
+        validation_skip_reason = ""
         hard_invalid_reason: str | None = None
+        min_trades_grace_floor = min_trades * min_trades_grace_ratio
         if train_trades == 0:
             hard_invalid_reason = "训练区间无交易"
-        elif train_trades < min_trades:
+            validation_skip_reason = "训练区间无交易"
+        elif train_trades < min_trades_grace_floor:
             hard_invalid_reason = "训练区间交易数低于目标下限"
+            validation_skip_reason = "训练区间交易数低于目标下限"
+        elif train_trades < min_trades:
+            trade_under_min = True
+            cannot_be_official_best_unless_validation_strong = True
+            trade_count_warning = "训练交易数略低于目标，但表现接近打平，建议下一轮在保持质量基础上略微增加信号。"
+            print(f"训练区间交易数 {train_trades} 低于目标下限 {min_trades}，但在宽限范围内，继续验证，仅作为候选参考。")
         elif severe_trade_excess:
             hard_invalid_reason = "训练区间交易数严重超过目标上限"
+            validation_skip_reason = "训练区间交易数严重超过目标上限"
         if hard_invalid_reason:
             print(f"训练区间触发硬约束：{hard_invalid_reason}，跳过所有验证区间回测。")
+            _apply_train_hard_constraint_status(round_state, hard_invalid_reason, validation_skip_reason)
+            validation_metrics = round_state["validation_metrics"]
+            validation_status = round_state["validation_status"]
+            validation_skip_reason = round_state["validation_skip_reason"]
+            holdout_metrics = round_state["holdout_metrics"]
+            holdout_status = round_state["holdout_status"]
+            holdout_reason = round_state["holdout_reason"]
             status["validation_backtest_status"] = "跳过验证"
             iteration_stats["skipped_validation_count"] += 1
         else:
@@ -1841,8 +2072,11 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 _print_round_table(ver, p.timerange, vm)
                 val_scores.append(_score(vm, p))
             if validation_metrics:
+                validation_status = "completed"
                 status["validation_backtest_status"] = "已验证回测"
                 iteration_stats["validation_backtest_count"] += 1
+            else:
+                validation_status = "failed"
         validation_score = sum(val_scores) / len(val_scores) if val_scores else 0.0
         write_json(
             version_dir / "validation_metrics.json",
@@ -1861,6 +2095,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             target_cfg=target_cfg,
         )
         final_score = final_score - overfit_penalty - baseline_dd_penalty
+        if hard_invalid_reason:
+            final_score = 0
         if train_trades > max_trades:
             final_score = min(final_score, 0.0)
         is_overfit = train_score > validation_score * 1.3 if validation_score else True
@@ -1877,10 +2113,17 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         else:
             zero_trade_streak = 0
 
+        validation_strong = _is_validation_strong(validation_metrics, baseline_cfg, target_cfg)
         is_valid, invalid_reason = _validate_round(train_metrics, validation_metrics, final_score)
         if hard_invalid_reason:
             is_valid = False
             invalid_reason = hard_invalid_reason
+        elif trade_under_min and not validation_strong:
+            is_valid = False
+            invalid_reason = "训练区间交易数略低于目标下限，验证强度不足"
+        elif trade_under_min and not allow_near_min_trades_best:
+            is_valid = False
+            invalid_reason = "训练区间交易数略低于目标下限，仅作为候选参考"
         elif mild_trade_excess:
             is_valid = False
             invalid_reason = "训练区间交易数超过目标上限"
@@ -1983,9 +2226,13 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 ],
             },
             "validation_metrics": validation_metrics,
+            "validation_status": validation_status,
+            "validation_skip_reason": validation_skip_reason,
             "holdout_metrics": holdout_metrics,
-            "pair_metrics": _normalize_pair_metrics(train_metrics.get("pairs", [])),
-            "entry_tag_metrics": _normalize_entry_tag_metrics(train_metrics.get("entry_tags", [])),
+            "holdout_status": holdout_status,
+            "holdout_reason": holdout_reason,
+            "pair_metrics": pair_metrics,
+            "entry_tag_metrics": entry_tag_metrics,
             "score_breakdown": score_breakdown,
             "overfit_result": {
                 "is_overfit": is_overfit,
@@ -1999,9 +2246,14 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "is_valid": is_valid,
             "invalid_reason": invalid_reason,
             "similarity_report": read_json(version_dir / "similarity_report.json") if (version_dir / "similarity_report.json").exists() else {},
+            "trade_under_min": trade_under_min,
+            "cannot_be_official_best_unless_validation_strong": cannot_be_official_best_unless_validation_strong,
+            "validation_strong": validation_strong,
+            "allow_near_min_trades_best": allow_near_min_trades_best,
+            "min_trades_grace_ratio": min_trades_grace_ratio,
+            "trade_count_warning": trade_count_warning,
         }
-        summary_path = version_dir / "summary.json"
-        write_json(summary_path, summary)
+        summary_path = write_iteration_summary(summary)
         avg_validation_profit_pct, avg_validation_profit_factor, max_validation_drawdown_pct = _aggregate_validation_metrics(validation_metrics)
         leaderboard_entry = {
             "version": ver,
@@ -2016,6 +2268,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "avg_validation_profit_factor": avg_validation_profit_factor,
             "max_validation_drawdown_pct": max_validation_drawdown_pct,
             "validation_metrics": validation_metrics,
+            "trade_under_min": trade_under_min,
+            "cannot_be_official_best_unless_validation_strong": cannot_be_official_best_unless_validation_strong,
+            "validation_strong": validation_strong,
+            "trade_count_warning": trade_count_warning,
             "profit_factor": _safe_float(train_metrics.get("profit_factor")),
             "max_drawdown_pct": _safe_float(train_metrics.get("max_drawdown")) * 100.0,
             "total_trades": _safe_int(train_metrics.get("total_trades")),
@@ -2059,10 +2315,11 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 "failure_reason": failure_reason,
                 "avoid_next": "减少 stoploss 损失，验证区间优先稳健。",
             })
-        holdout_metrics: list[dict[str, Any]] = []
         holdout_failed = False
         holdout_ranges = list(runtime_goal.get("holdout_ranges", []) or [])
         if is_best and holdout_ranges:
+            holdout_status = "completed"
+            holdout_reason = ""
             for idx, h in enumerate(holdout_ranges, start=1):
                 h_label = str(h.get("label") or f"holdout_{idx:02d}")
                 h_timerange = str(h.get("timerange") or "")
@@ -2081,12 +2338,38 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 if _safe_float(hm.get("profit_total_pct")) < -2.5 or _safe_float(hm.get("profit_factor")) < 0.45 or _safe_float(hm.get("max_drawdown_pct")) > 3.0:
                     holdout_failed = True
             if holdout_failed:
+                holdout_status = "failed"
+                holdout_reason = "holdout 复验未通过"
                 is_best = False
                 is_valid = False
                 invalid_reason = "holdout 复验未通过，降级为 nearest_candidate"
                 status["is_best"] = False
                 status["is_valid"] = False
                 status["invalid_reason"] = invalid_reason
+            elif not holdout_metrics:
+                holdout_status = "not_run"
+                holdout_reason = "未找到可执行 holdout 区间，未执行 holdout"
+        elif holdout_status == "not_run" and not holdout_reason:
+            holdout_reason = "未达到候选 best 条件，未执行 holdout"
+        summary.update({
+            "holdout_metrics": holdout_metrics,
+            "holdout_status": holdout_status,
+            "holdout_reason": holdout_reason,
+            "is_best": is_best,
+            "is_valid": is_valid,
+            "invalid_reason": invalid_reason,
+            "trade_under_min": trade_under_min,
+            "cannot_be_official_best_unless_validation_strong": cannot_be_official_best_unless_validation_strong,
+            "validation_strong": validation_strong,
+            "trade_count_warning": trade_count_warning,
+        })
+        summary_path = write_iteration_summary(summary)
+        if summary_write_failed:
+            status["is_valid"] = False
+            status["is_best"] = False
+            status["invalid_reason"] = invalid_reason
+            flush_iteration_stats()
+            continue
         if is_best:
             best = round_data
             iteration_stats["new_best_update_count"] += 1
@@ -2130,7 +2413,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         total_trades = _safe_int(row.get("total_trades"))
         if total_trades <= 0:
             return False
-        if total_trades < _safe_int(target_cfg.get("min_trades", 25)):
+        min_trades_target = _safe_int(target_cfg.get("min_trades", 25))
+        if total_trades < min_trades_target and not (row.get("trade_under_min") and row.get("validation_strong")):
             return False
         if total_trades > int(max_trades_target * 1.5):
             return False
@@ -2146,7 +2430,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
 
         profit_gap = abs(profit_pct - baseline_profit_pct)
         drawdown_penalty = max(0.0, drawdown_pct - max_drawdown_target)
-        trade_penalty = max(0, total_trades - max_trades_target)
+        min_trades_target = _safe_int(target_cfg.get("min_trades", 25))
+        trade_penalty = max(0, total_trades - max_trades_target) + max(0, min_trades_target - total_trades)
         return (profit_gap, drawdown_penalty, -profit_factor, float(trade_penalty))
 
     nearest_failed_candidates = [row for row in leaderboard_sorted if _is_eligible_nearest(row, allow_oversized=False)]
@@ -2173,6 +2458,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 "total_trades": closest_failed.get("total_trades"),
             },
             "validation_metrics": nearest_validation_metrics,
+            "trade_under_min": bool(closest_failed.get("trade_under_min", False)),
+            "validation_strong": bool(closest_failed.get("validation_strong", False)),
+            "trade_count_warning": closest_failed.get("trade_count_warning", ""),
             "improvement_vs_baseline": {
                 "profit_total_pct_delta": _safe_float(closest_failed.get("train_profit_pct")) - baseline_profit_pct,
                 "profit_factor_delta": _safe_float(closest_failed.get("profit_factor")) - _safe_float(baseline_cfg.get("profit_factor")),
@@ -2180,6 +2468,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         }
         if not nearest_validation_metrics:
             nearest_candidate["validation_metrics_missing_reason"] = "训练区间触发硬约束，跳过验证"
+        if bool(closest_failed.get("trade_under_min", False)):
+            nearest_candidate["trade_under_min"] = True
+            nearest_candidate["why_nearest"] += "（训练交易数略低于目标，但验证表现较强，仅作候选参考）"
         if oversized_fallback and _safe_int(closest_failed.get("total_trades")) > max_trades_target:
             nearest_candidate["trade_over_limit"] = True
             nearest_candidate["why_nearest"] += "（本轮无 25~80 笔候选，使用 81~120 笔超标候选仅作参考）"
@@ -2204,6 +2495,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             bsd = read_json(best_sum)
             best_pair_metrics = list(bsd.get("pair_metrics", []) or [])
             best_entry_tag_metrics = list(bsd.get("entry_tag_metrics", []) or [])
+    trade_count_warning = next((str(r.get("trade_count_warning")) for r in leaderboard_sorted if r.get("trade_count_warning")), "")
     last_run_summary = {
         "run_id": run_id,
         "created_at": datetime.utcnow().isoformat(),
@@ -2212,6 +2504,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         "historical_best": historical_best_mem,
         "nearest_candidate": nearest_candidate,
         "session_best": session_best,
+        "trade_count_warning": trade_count_warning,
         "failed_versions": [r.get("version") for r in invalid_rows],
         "common_failure_patterns": list({str(r.get("invalid_reason") or r.get("failure_reason") or "") for r in invalid_rows if (r.get("invalid_reason") or r.get("failure_reason"))}),
         "recommended_next_mutation_types": ["add_entry_filter", "tighten_entry_trigger", "remove_bad_entry_condition", "pair_specific_filter", "tag_specific_filter"],
@@ -2392,6 +2685,7 @@ def main() -> None:
     parser.add_argument("--similarity-threshold", type=float, default=0.88)
     parser.add_argument("--auto-continue-if-similar-to-parent", action="store_true", default=True)
     parser.add_argument("--auto-reject-failed-similarity", action="store_true", default=False)
+    parser.add_argument("--allow-near-min-trades-best", action="store_true", default=False, help="允许训练交易数处于 min_trades 宽限范围且验证强劲的策略成为正式 best")
     args = parser.parse_args()
 
     goal_path = ROOT_DIR / args.goal
