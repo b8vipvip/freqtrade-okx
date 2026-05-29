@@ -2003,6 +2003,676 @@ def maybe_download_data(runtime_goal: dict[str, Any], args: argparse.Namespace, 
         print(cp.stderr)
         raise RuntimeError("下载历史数据失败。")
 
+
+MANUAL_TASK_ROOT = ROOT_DIR / "ai_manual_tasks"
+SENSITIVE_KEY_RE = re.compile(r"(?i)(OKX_API_KEY|OKX_API_SECRET|OKX_API_PASSPHRASE|OPENAI_API_KEY|CLAUDE_API_KEY|API[_-]?KEY|SECRET|PASSPHRASE)\s*[=:]\s*[^\s,'\"]+")
+
+
+def _resolve_repo_path(value: str | Path) -> Path:
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else ROOT_DIR / path
+
+
+def _sanitize_manual_task_name(name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", name.strip())
+    cleaned = cleaned.strip("._-/")
+    if not cleaned:
+        raise RuntimeError("manual task name 不能为空。")
+    if cleaned in {".", ".."} or ".." in cleaned.split("/"):
+        raise RuntimeError(f"manual task name 不安全：{name}")
+    return cleaned
+
+
+def _sanitize_for_manual_task(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            if re.search(r"(?i)(api[_-]?key|secret|passphrase|token|password)", str(key)):
+                out[str(key)] = "<redacted>"
+            else:
+                out[str(key)] = _sanitize_for_manual_task(item)
+        return out
+    if isinstance(value, list):
+        return [_sanitize_for_manual_task(item) for item in value]
+    if isinstance(value, str):
+        return SENSITIVE_KEY_RE.sub(lambda m: m.group(1) + "=<redacted>", value)
+    return value
+
+
+def _write_manual_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(_sanitize_for_manual_task(data), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_json_or_empty(path: Path) -> dict[str, Any]:
+    data = _load_json_or_none(path)
+    return data if isinstance(data, dict) else {}
+
+
+def _copy_strategy_or_note(src_value: Any, dest: Path, label: str) -> bool:
+    src = Path(str(src_value or "")).expanduser()
+    if src and not src.is_absolute():
+        src = ROOT_DIR / src
+    if src.exists() and src.is_file():
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+        return True
+    dest.write_text(
+        f"# {label} strategy file is unavailable.\n"
+        f"# Expected source: {src_value or 'not set'}\n",
+        encoding="utf-8",
+    )
+    return False
+
+
+def _recent_strategy_memory_excerpt(limit: int = 50) -> dict[str, Any]:
+    items = _read_json_list_file(MEMORY_FILE)[-limit:] if MEMORY_FILE.exists() else []
+    return {"items": items, "limit": limit, "source": str(MEMORY_FILE)}
+
+
+def _recent_leaderboard_entries(run_limit: int = 8, item_limit: int = 80) -> dict[str, Any]:
+    entries: list[dict[str, Any]] = []
+    run_dirs = sorted(RESULT_ROOT.glob("run_*"), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+    for rd in run_dirs[:run_limit]:
+        path = rd / "leaderboard.json"
+        if not path.exists():
+            continue
+        try:
+            raw = read_json(path)
+        except Exception:
+            continue
+        for item in (raw.get("items") if isinstance(raw, dict) else []) or []:
+            entries.append({
+                "run_id": item.get("run_id") or rd.name.replace("run_", ""),
+                "version": item.get("version"),
+                "strategy_class": item.get("strategy_class"),
+                "final_score": item.get("final_score"),
+                "is_valid": item.get("is_valid"),
+                "is_best": item.get("is_best"),
+                "invalid_reason": item.get("invalid_reason"),
+                "train_profit_pct": item.get("train_profit_pct"),
+                "avg_validation_profit_pct": item.get("avg_validation_profit_pct"),
+                "profit_factor": item.get("profit_factor"),
+                "max_drawdown_pct": item.get("max_drawdown_pct"),
+                "total_trades": item.get("total_trades"),
+                "mutation_type": item.get("mutation_type"),
+            })
+            if len(entries) >= item_limit:
+                return {"items": entries, "run_limit": run_limit, "item_limit": item_limit}
+    return {"items": entries, "run_limit": run_limit, "item_limit": item_limit}
+
+
+def _latest_pair_entry_tag_summary() -> list[dict[str, Any]]:
+    summaries = sorted(RESULT_ROOT.glob("run_*/v*/summary.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for path in summaries[:40]:
+        try:
+            data = read_json(path)
+        except Exception:
+            continue
+        pairs = data.get("pair_metrics") or []
+        tags = data.get("entry_tag_metrics") or []
+        if pairs or tags:
+            return [{"source": str(path), "pair_metrics": pairs, "entry_tag_metrics": tags}]
+    return []
+
+
+def _manual_readme_text(task_name: str, task_dir: Path, branch: str) -> str:
+    return f"""# 半自动 AI 策略生成任务包：{task_name}
+
+这是半自动策略生成任务包。
+服务器不会在本步骤调用 AI。
+请先执行 `codex_advisor_instruction.md`，生成 `generated_mutation_spec.json`。
+再执行 `codex_codegen_instruction.md`，生成 `generated_strategy.py`。
+生成策略后，服务器会拉取代码并执行回测。
+
+## 推荐流程
+
+1. 打开 Codex。
+2. 让 Codex 读取本目录的 `codex_advisor_instruction.md`，只生成 `generated_mutation_spec.json`。
+3. 再让 Codex 读取 `codex_codegen_instruction.md`，生成 `generated_strategy.py`。
+4. 在服务器回到仓库执行：
+
+```bash
+git pull
+python3 ai_tools/auto_optimize_strategy.py --goal ai_tools/optimization_goal.json --manual-ai-run {task_dir.as_posix()}/generated_strategy.py --manual-ai-task-dir {task_dir.as_posix()}
+```
+
+## Git 分支
+
+建议分支：`{branch}`
+"""
+
+
+def _manual_advisor_instruction(runtime_goal: dict[str, Any], best: dict[str, Any], nearest: dict[str, Any], last_run: dict[str, Any]) -> str:
+    target = runtime_goal.get("target", {}) or {}
+    min_trades = target.get("min_trades", 25)
+    max_trades = target.get("max_trades", 80)
+    forbidden = last_run.get("forbidden_next_mutation_types") or ["disable_or_adjust_trailing", "扩大止损", "放宽高频入场"]
+    problems = last_run.get("current_main_problems") or last_run.get("common_failure_patterns") or ["高频风险", "固定止损亏损吞噬 ROI 收益", "验证区间稳健性不足"]
+    return f"""你是 strategy_advisor。请读取本目录上下文文件，只输出 `generated_mutation_spec.json`，不要输出 Python 策略代码。
+
+必须使用的上下文文件：
+- `optimization_goal.snapshot.json`
+- `current_best_summary.json`
+- `nearest_candidate_summary.json`
+- `last_run_summary.json`
+- `strategy_lessons.json`
+- `strategy_blacklist.json`
+- `strategy_memory_excerpt.json`
+- `leaderboard_recent.json`
+- `pair_entry_tag_summary.json`
+
+当前目标交易数：训练区间总交易数 {min_trades}~{max_trades}（不是单币种）。
+当前历史 best 指标：`current_best_summary.json`，关键字段：{json.dumps(best.get('train_metrics', {}) or {}, ensure_ascii=False)[:1200]}
+nearest_candidate 指标：`nearest_candidate_summary.json`，关键字段：{json.dumps(nearest.get('train_metrics', {}) or {}, ensure_ascii=False)[:1200]}
+上轮失败模式：{json.dumps(last_run.get('common_failure_patterns') or last_run.get('last_failure_modes') or last_run.get('for_advisor_next_round') or [], ensure_ascii=False)[:1200]}
+当前主要问题：{json.dumps(problems, ensure_ascii=False)}
+禁止方向：{json.dumps(forbidden, ensure_ascii=False)}
+推荐 mutation_type：优先从 `add_entry_filter`, `tighten_entry_trigger`, `remove_bad_entry_condition`, `pair_specific_filter`, `tag_specific_filter`, `adjust_roi`, `adjust_stoploss`, `reduce_trade_frequency` 中选择一个。
+
+硬性要求：
+- 本轮只能做单点小步修改。
+- 不允许生成策略代码。
+- 不允许启用 exit_signal。
+- 不允许做空、杠杆、加仓、马丁格尔。
+- 不允许为了交易数而宽松堆叠 OR 造成高频。
+
+只输出以下 JSON object，并写入 `generated_mutation_spec.json`：
+
+```json
+{{
+  "session_parent_choice": "historical_best | nearest_candidate | baseline",
+  "session_parent_reason": "...",
+  "mutation_type": "...",
+  "goal": "...",
+  "changes": [
+    {{
+      "target": "entry_filter / roi / stoploss / pair_filter / tag_filter",
+      "action": "...",
+      "reason": "..."
+    }}
+  ],
+  "risk_controls": ["..."],
+  "do_not_change": ["..."],
+  "expected_effect": {{
+    "trade_count": "...",
+    "profit_factor": "...",
+    "drawdown": "...",
+    "stoploss_loss": "..."
+  }}
+}}
+```
+"""
+
+
+def _manual_codegen_instruction() -> str:
+    return """你是 code_generator。请读取：
+- `generated_mutation_spec.json`
+- `current_best_strategy.py`
+- `nearest_candidate_strategy.py`
+- `optimization_goal.snapshot.json`
+
+然后只生成一个文件：`generated_strategy.py`。
+
+要求：
+- 必须是完整可运行 Freqtrade Strategy。
+- 只能 long-only spot。
+- `can_short = False`。
+- `use_exit_signal = False`。
+- 不主动使用 `populate_exit_trend` 产生 `exit_long` 信号；如果框架需要该函数，只返回 dataframe，不设置 exit_long=1。
+- 不使用杠杆。
+- 不使用加仓。
+- 不使用马丁格尔。
+- 不引入外部网络请求。
+- 策略类名先可用占位：`Manual_AI_Generated_Strategy`。
+- 服务器导入时会自动重命名为唯一类名。
+- 只根据 mutation_spec 做单点小步修改，不要完全重写父策略。
+- 输出完整 Python 文件内容，不要输出解释性文字。
+"""
+
+
+def _scan_manual_task_for_sensitive_text(task_dir: Path) -> list[str]:
+    hits: list[str] = []
+    for path in task_dir.rglob("*"):
+        if not path.is_file() or path.stat().st_size > 2_000_000:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        if SENSITIVE_KEY_RE.search(text):
+            hits.append(str(path.relative_to(ROOT_DIR)))
+    return hits
+
+
+def run_manual_git_push(task_dir: Path, task_name: str, branch: str) -> None:
+    print("========== Git 自动提交推送 ==========")
+    rel_task = task_dir.relative_to(ROOT_DIR)
+    commands = [
+        ["git", "checkout", "-B", branch],
+        ["git", "add", str(rel_task)],
+    ]
+    for cmd in commands:
+        cp = run_cmd(cmd, ROOT_DIR)
+        if cp.stdout:
+            print(cp.stdout)
+        if cp.stderr:
+            print(cp.stderr)
+        if cp.returncode != 0:
+            raise RuntimeError(f"Git 命令失败：{' '.join(cmd)}")
+    diff_cp = run_cmd(["git", "diff", "--cached", "--quiet"], ROOT_DIR)
+    if diff_cp.returncode == 0:
+        print("没有新的任务包变更需要提交，跳过 git commit。")
+    else:
+        msg = f"Add manual AI task {task_name}"
+        cp = run_cmd(["git", "commit", "-m", msg], ROOT_DIR)
+        print(cp.stdout)
+        if cp.stderr:
+            print(cp.stderr)
+        if cp.returncode != 0:
+            raise RuntimeError("git commit 失败。")
+    push_cp = run_cmd(["git", "push", "-u", "origin", branch], ROOT_DIR)
+    if push_cp.stdout:
+        print(push_cp.stdout)
+    if push_cp.stderr:
+        print(push_cp.stderr)
+    if push_cp.returncode != 0:
+        raise RuntimeError("git push 失败。")
+    print(f"GitHub 分支：{branch}")
+
+
+def prepare_manual_ai_task(runtime_goal: dict[str, Any], args: argparse.Namespace) -> Path:
+    train, _ = _build_periods(runtime_goal)
+    if train.timerange:
+        maybe_download_data(runtime_goal, args, train.timerange)
+    task_name = _sanitize_manual_task_name(args.manual_task_name or f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}")
+    branch = args.manual_git_branch or f"ai-manual/{task_name}"
+    task_dir = MANUAL_TASK_ROOT / task_name
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    best = _load_json_or_empty(BEST_STRATEGY_FILE)
+    nearest = _load_json_or_empty(NEAREST_CANDIDATE_FILE)
+    last_run = _load_json_or_empty(LAST_RUN_SUMMARY_FILE)
+    _write_manual_json(task_dir / "optimization_goal.snapshot.json", runtime_goal)
+    _write_manual_json(task_dir / "current_best_summary.json", best)
+    _write_manual_json(task_dir / "nearest_candidate_summary.json", nearest)
+    _write_manual_json(task_dir / "last_run_summary.json", last_run)
+    _write_manual_json(task_dir / "strategy_lessons.json", {"items": _read_json_list_file(LESSONS_FILE)})
+    _write_manual_json(task_dir / "strategy_blacklist.json", {"items": _read_json_list_file(BLACKLIST_FILE)})
+    _write_manual_json(task_dir / "strategy_memory_excerpt.json", _recent_strategy_memory_excerpt(50))
+    _write_manual_json(task_dir / "leaderboard_recent.json", _recent_leaderboard_entries())
+    _write_manual_json(task_dir / "pair_entry_tag_summary.json", _latest_pair_entry_tag_summary())
+    _write_manual_json(task_dir / "run_context.json", {
+        "task_name": task_name,
+        "created_at": datetime.utcnow().isoformat(),
+        "mode": "manual_ai_prepare",
+        "ai_call": "disabled",
+        "train_period": runtime_goal.get("train_period", {}),
+        "validation_periods": runtime_goal.get("validation_periods", []),
+        "holdout_ranges": runtime_goal.get("holdout_ranges", []),
+        "git_branch": branch,
+    })
+    _copy_strategy_or_note(best.get("strategy_file"), task_dir / "current_best_strategy.py", "current_best")
+    _copy_strategy_or_note(nearest.get("strategy_file"), task_dir / "nearest_candidate_strategy.py", "nearest_candidate")
+    (task_dir / "README.md").write_text(_manual_readme_text(task_name, task_dir.relative_to(ROOT_DIR), branch), encoding="utf-8")
+    (task_dir / "codex_advisor_instruction.md").write_text(_manual_advisor_instruction(runtime_goal, best, nearest, last_run), encoding="utf-8")
+    (task_dir / "codex_codegen_instruction.md").write_text(_manual_codegen_instruction(), encoding="utf-8")
+
+    hits = _scan_manual_task_for_sensitive_text(task_dir)
+    if hits:
+        raise RuntimeError("半自动任务包疑似包含敏感密钥，请检查：" + ", ".join(hits))
+
+    if args.manual_git_push:
+        run_manual_git_push(task_dir, task_name, branch)
+
+    print("\n========== 半自动任务包已生成 ==========")
+    print(f"任务目录：{task_dir}")
+    print(f"Git 分支：{branch}")
+    print("下一步：")
+    print("1. 打开 Codex")
+    print("2. 让 Codex 读取 codex_advisor_instruction.md")
+    print("3. 生成 generated_mutation_spec.json")
+    print("4. 再让 Codex 读取 codex_codegen_instruction.md")
+    print("5. 生成 generated_strategy.py")
+    print("6. 回到服务器执行：")
+    print("   git pull")
+    print(f"   python3 ai_tools/auto_optimize_strategy.py --goal {args.goal} --manual-ai-run {task_dir.relative_to(ROOT_DIR) / 'generated_strategy.py'} --manual-ai-task-dir {task_dir.relative_to(ROOT_DIR)}")
+    return task_dir
+
+
+def _rename_first_strategy_class(code: str, class_name: str) -> str:
+    pattern = re.compile(r"class\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*IStrategy\s*\)\s*:")
+    if not pattern.search(code):
+        raise RuntimeError("生成策略中未找到继承 IStrategy 的策略类。")
+    return pattern.sub(f"class {class_name}(IStrategy):", code, count=1)
+
+
+def run_manual_ai_backtest(runtime_goal: dict[str, Any], args: argparse.Namespace, run_dir: Path) -> None:
+    strategy_source = _resolve_repo_path(args.manual_ai_run)
+    if not strategy_source.exists():
+        raise FileNotFoundError(f"manual-ai-run 策略文件不存在：{strategy_source}")
+    print("当前模式：半自动策略回测模式")
+    print("AI 调用：关闭")
+    print(f"策略来源：{strategy_source}")
+
+    config = str(runtime_goal.get("config", args.config))
+    timeframe = str(runtime_goal.get("timeframe", args.timeframe))
+    strategy_family = str(runtime_goal.get("strategy_family", args.base_strategy))
+    train, validations = _build_periods(runtime_goal)
+    if not train.timerange:
+        raise RuntimeError("缺少训练区间 train_period.timerange，无法继续。")
+    maybe_download_data(runtime_goal, args, train.timerange)
+
+    run_id = run_dir.name.replace("run_", "")
+    ver = "v001"
+    version_dir = run_dir / ver
+    version_dir.mkdir(parents=True, exist_ok=True)
+    class_name = f"{strategy_family}_{run_id}_manual_{ver}"
+    strategy_file = STRATEGY_DIR / f"{class_name}.py"
+
+    raw_code = strategy_source.read_text(encoding="utf-8")
+    code = _rename_first_strategy_class(extract_python_code(raw_code), class_name)
+    strategy_file.parent.mkdir(parents=True, exist_ok=True)
+    strategy_file.write_text(code, encoding="utf-8")
+    shutil.copy2(strategy_file, version_dir / "strategy.py")
+    GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(strategy_file, GENERATED_DIR / strategy_file.name)
+
+    mutation_spec = {}
+    task_dir = _resolve_repo_path(args.manual_ai_task_dir) if args.manual_ai_task_dir else strategy_source.parent
+    spec_path = task_dir / "generated_mutation_spec.json"
+    if spec_path.exists():
+        try:
+            mutation_spec = read_json(spec_path)
+            write_json(version_dir / "mutation_spec.json", mutation_spec)
+        except Exception as exc:
+            print(f"读取 generated_mutation_spec.json 失败，将继续回测：{exc}")
+    mutation_type = str(mutation_spec.get("mutation_type", "manual_ai") or "manual_ai")
+    spec_hash = hashlib.sha256(json.dumps(mutation_spec, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest() if mutation_spec else ""
+    features = extract_strategy_features(code)
+    code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
+    signature = _feature_signature(features)
+
+    iteration_stats = {
+        "planned_iterations": 1,
+        "advisor_success_count": 0,
+        "codegen_success_count": 0,
+        "generated_versions_count": 1,
+        "train_backtest_count": 0,
+        "validation_backtest_count": 0,
+        "validation_backtest_total_count": 0,
+        "skipped_validation_count": 0,
+        "valid_strategy_count": 0,
+        "invalid_strategy_count": 0,
+        "new_best_update_count": 0,
+        "current_iteration_version": ver,
+        "history_strategy_total_count": len(_read_json_list_file(MEMORY_FILE)) if MEMORY_FILE.exists() else 0,
+        "version_statuses": [],
+        "manual_ai_mode": True,
+    }
+    status = {"version": ver, "strategy_class": class_name, "advisor_status": "半自动跳过", "codegen_status": "半自动外部生成", "syntax_check_status": "未执行", "static_check_status": "未执行", "train_backtest_status": "未执行", "validation_backtest_status": "未执行", "is_valid": False, "is_best": False, "invalid_reason": "", "final_score": 0.0}
+    iteration_stats["version_statuses"].append(status)
+
+    def finish_invalid(reason: str) -> None:
+        status["invalid_reason"] = reason
+        status["is_valid"] = False
+        iteration_stats["invalid_strategy_count"] = 1
+        summary = _minimal_round_summary(version=ver, strategy_class=class_name, strategy_file=str(strategy_file), state=_new_round_defaults(), mutation_type=mutation_type, failure_reason=reason)
+        summary.update({"manual_ai_mode": True, "manual_strategy_source": str(strategy_source), "ai_models_used": {"strategy_advisor": {"used_model": "manual_disabled", "attempts": []}, "code_generator": {"used_model": "manual_disabled", "attempts": []}}})
+        write_json(version_dir / "summary.json", summary)
+        write_json(run_dir / "leaderboard.json", {"items": [{"version": ver, "run_id": run_id, "strategy_class": class_name, "strategy_file": str(strategy_file), "is_valid": False, "is_best": False, "invalid_reason": reason, "final_score": 0.0}]})
+        write_json(run_dir / ITERATION_STATS_FILE_NAME, iteration_stats)
+        print_log_saved_summary(args)
+        print("\n========== 半自动策略回测完成 ==========")
+        print(f"策略文件：{strategy_file}")
+        print(f"训练区间结果：未执行（{reason}）")
+        print(f"验证区间结果：未执行（{reason}）")
+        print("是否成为新 best：否")
+        print(f"summary.json：{version_dir / 'summary.json'}")
+        print(f"run.log：{run_dir / 'run.log'}")
+
+    print("5. 正在检查 Python 语法……")
+    pyc = run_cmd([sys.executable, "-m", "py_compile", str(strategy_file)], ROOT_DIR)
+    if pyc.returncode != 0:
+        print(pyc.stderr)
+        finish_invalid("Python 语法检查失败")
+        return
+    status["syntax_check_status"] = "成功"
+    validate_strategy_class_name(strategy_file, class_name)
+    static_ok, static_reason = check_entry_long_static(strategy_file)
+    if not static_ok:
+        finish_invalid(static_reason or "静态检查失败")
+        return
+    status["static_check_status"] = "成功"
+
+    target_cfg = runtime_goal.get("target", {}) or {}
+    baseline_cfg = runtime_goal.get("baseline", {}) or {}
+    min_trades = int(target_cfg.get("min_trades", 25))
+    max_trades = int(target_cfg.get("max_trades", 80))
+    min_trades_grace_ratio = float(target_cfg.get("min_trades_grace_ratio", 0.8))
+
+    train_cmd = ["docker", "compose", "run", "--rm", "freqtrade", "backtesting", "--config", config, "--strategy", class_name, "--timeframe", timeframe, "--timerange", train.timerange, "--export", "trades", "--cache", "none"]
+    results_dir = ROOT_DIR / "user_data" / "backtest_results"
+    print(f"6. 正在回测训练区间：{train.timerange}")
+    before = set(_list_backtest_zips(results_dir))
+    ts = time.time()
+    cp = run_cmd(train_cmd, ROOT_DIR)
+    (version_dir / "backtest_logs.txt").write_text(f"[Train {train.timerange}]\nSTDOUT:\n{cp.stdout}\n\nSTDERR:\n{cp.stderr}\n", encoding="utf-8")
+    if cp.returncode != 0:
+        print(cp.stderr)
+        finish_invalid("训练区间回测失败")
+        return
+    train_zip = _select_backtest_zip(results_dir, before, ts)
+    train_metrics = _extract_metrics(parse_backtest_from_zip(train_zip, class_name))
+    pair_metrics = _normalize_pair_metrics(train_metrics.get("pairs", []))
+    entry_tag_metrics = _normalize_entry_tag_metrics(train_metrics.get("entry_tags", []))
+    write_json(version_dir / "train_metrics.json", train_metrics)
+    _print_round_table(ver, train.timerange, train_metrics)
+    status["train_backtest_status"] = "已训练回测"
+    iteration_stats["train_backtest_count"] = 1
+
+    train_score = _score(train_metrics, train)
+    train_trades = _safe_int(train_metrics.get("total_trades"))
+    hard_invalid_reason: str | None = None
+    validation_skip_reason = ""
+    trade_under_min = False
+    cannot_be_official_best_unless_validation_strong = False
+    trade_count_warning = ""
+    if train_trades == 0:
+        hard_invalid_reason = "训练区间无交易"
+        validation_skip_reason = hard_invalid_reason
+    elif train_trades < min_trades * min_trades_grace_ratio:
+        hard_invalid_reason = "训练区间交易数低于目标下限"
+        validation_skip_reason = hard_invalid_reason
+    elif train_trades < min_trades:
+        trade_under_min = True
+        cannot_be_official_best_unless_validation_strong = True
+        trade_count_warning = "训练交易数略低于目标，但表现接近打平，建议下一轮略微增加信号。"
+    elif train_trades > max_trades * 1.5:
+        hard_invalid_reason = "训练区间交易数严重超过目标上限"
+        validation_skip_reason = hard_invalid_reason
+
+    validation_metrics: list[dict[str, Any]] = []
+    val_scores: list[float] = []
+    validation_status = "not_run"
+    if hard_invalid_reason:
+        print(f"训练区间触发硬约束：{hard_invalid_reason}，跳过所有验证区间回测。")
+        iteration_stats["skipped_validation_count"] = 1
+        status["validation_backtest_status"] = "跳过验证"
+    else:
+        for p in validations:
+            print(f"7. 正在回测验证区间：{p.timerange}")
+            vcmd = train_cmd.copy()
+            vcmd[vcmd.index("--timerange") + 1] = p.timerange
+            before = set(_list_backtest_zips(results_dir))
+            ts = time.time()
+            vcp = run_cmd(vcmd, ROOT_DIR)
+            with (version_dir / "backtest_logs.txt").open("a", encoding="utf-8") as logf:
+                logf.write(f"\n[Validation {p.name} {p.timerange}]\nSTDOUT:\n{vcp.stdout}\n\nSTDERR:\n{vcp.stderr}\n")
+            if vcp.returncode != 0:
+                print(vcp.stderr)
+                continue
+            vzip = _select_backtest_zip(results_dir, before, ts)
+            vm = _extract_metrics(parse_backtest_from_zip(vzip, class_name))
+            validation_metrics.append({"period": p.name, "timerange": p.timerange, "metrics": vm})
+            val_scores.append(_score(vm, p))
+            iteration_stats["validation_backtest_total_count"] += 1
+            _print_round_table(ver, p.timerange, vm)
+        if validation_metrics:
+            validation_status = "completed"
+            status["validation_backtest_status"] = "已验证回测"
+            iteration_stats["validation_backtest_count"] = 1
+        else:
+            validation_status = "failed"
+            status["validation_backtest_status"] = "失败"
+    validation_score = sum(val_scores) / len(val_scores) if val_scores else 0.0
+    write_json(version_dir / "validation_metrics.json", {"periods": validation_metrics, "average_score": validation_score})
+
+    overfit_penalty = max(0.0, train_score - validation_score) * 0.3
+    baseline_ok, baseline_reason, baseline_dd_penalty = _baseline_gate_and_penalty(train_metrics, runtime_goal)
+    final_score, score_penalty_detail = _compute_final_score(train_score, validation_score, train_metrics, validation_metrics, target_cfg)
+    final_score = final_score - overfit_penalty - baseline_dd_penalty
+    if hard_invalid_reason or train_trades > max_trades:
+        final_score = min(final_score, 0.0) if train_trades > max_trades else 0.0
+    is_overfit = train_score > validation_score * 1.3 if validation_score else True
+    validation_strong = _is_validation_strong(validation_metrics, baseline_cfg, target_cfg)
+    is_valid, invalid_reason = _validate_round(train_metrics, validation_metrics, final_score)
+    if hard_invalid_reason:
+        is_valid = False
+        invalid_reason = hard_invalid_reason
+    elif trade_under_min and not validation_strong:
+        is_valid = False
+        invalid_reason = "训练区间交易数略低于目标下限，验证强度不足"
+    elif train_trades > max_trades:
+        is_valid = False
+        invalid_reason = "训练区间交易数超过目标上限"
+    elif is_valid and not baseline_ok:
+        is_valid = False
+        invalid_reason = baseline_reason or "未通过 baseline 检查"
+
+    historical_best = _load_json_or_empty(BEST_STRATEGY_FILE)
+    historical_score = _safe_float(historical_best.get("final_score")) if historical_best.get("final_score") is not None else -1e18
+    is_best = bool(is_valid and final_score > historical_score)
+    holdout_metrics: list[dict[str, Any]] = []
+    holdout_status = "not_run"
+    holdout_reason = "未达到候选 best 条件，未执行 holdout"
+    if is_best and runtime_goal.get("holdout_ranges"):
+        holdout_status = "completed"
+        holdout_reason = ""
+        holdout_failed = False
+        for idx, h in enumerate(runtime_goal.get("holdout_ranges", []) or [], start=1):
+            h_timerange = str(h.get("timerange") or "")
+            if not TIMERANGE_RE.match(h_timerange):
+                continue
+            hcmd = train_cmd.copy()
+            hcmd[hcmd.index("--timerange") + 1] = h_timerange
+            before = set(_list_backtest_zips(results_dir))
+            ts = time.time()
+            hcp = run_cmd(hcmd, ROOT_DIR)
+            if hcp.returncode != 0:
+                continue
+            hzip = _select_backtest_zip(results_dir, before, ts)
+            hm = _extract_metrics(parse_backtest_from_zip(hzip, class_name))
+            holdout_metrics.append({"label": str(h.get("label") or f"holdout_{idx:02d}"), "timerange": h_timerange, "metrics": hm})
+            if _safe_float(hm.get("profit_total_pct")) < -2.5 or _safe_float(hm.get("profit_factor")) < 0.45 or _safe_float(hm.get("max_drawdown_pct")) > 3.0:
+                holdout_failed = True
+        if holdout_failed:
+            is_best = False
+            is_valid = False
+            invalid_reason = "holdout 复验未通过，降级为 nearest_candidate"
+            holdout_status = "failed"
+            holdout_reason = "holdout 复验未通过"
+        elif not holdout_metrics:
+            holdout_status = "not_run"
+            holdout_reason = "未找到可执行 holdout 区间，未执行 holdout"
+
+    status.update({"is_valid": bool(is_valid), "is_best": bool(is_best), "invalid_reason": invalid_reason, "final_score": float(final_score)})
+    iteration_stats["valid_strategy_count" if is_valid else "invalid_strategy_count"] = 1
+    if is_best:
+        iteration_stats["new_best_update_count"] = 1
+
+    avg_val_profit, avg_val_pf, max_val_dd = _aggregate_validation_metrics(validation_metrics)
+    score_breakdown = {"train_score": train_score, "validation_score": validation_score, "overfit_penalty": overfit_penalty, "baseline_dd_penalty": baseline_dd_penalty, "penalty_detail": score_penalty_detail, "baseline_check": {"passed": baseline_ok, "reason": baseline_reason}}
+    reason_detail = [] if is_best else _build_not_best_reason_detail(train_metrics, validation_metrics, final_score, historical_best, target_cfg, invalid_reason)
+    summary = {
+        "strategy_class": class_name,
+        "strategy_file": str(strategy_file),
+        "manual_ai_mode": True,
+        "manual_strategy_source": str(strategy_source),
+        "manual_ai_task_dir": str(task_dir),
+        "mutation_type": mutation_type,
+        "session_parent_choice": mutation_spec.get("session_parent_choice", "manual"),
+        "session_parent_reason": mutation_spec.get("session_parent_reason", ""),
+        "changed_items": mutation_spec.get("changes", []),
+        "train_metrics": train_metrics,
+        "validation_metrics": validation_metrics,
+        "validation_status": validation_status,
+        "validation_skip_reason": validation_skip_reason,
+        "holdout_metrics": holdout_metrics,
+        "holdout_status": holdout_status,
+        "holdout_reason": holdout_reason,
+        "pair_metrics": pair_metrics,
+        "entry_tag_metrics": entry_tag_metrics,
+        "score_breakdown": score_breakdown,
+        "overfit_result": {"is_overfit": is_overfit, "train_score": train_score, "validation_score": validation_score},
+        "final_score": final_score,
+        "failure_reason": invalid_reason or "通过",
+        "reason_detail": reason_detail,
+        "is_best": is_best,
+        "is_valid": is_valid,
+        "invalid_reason": invalid_reason,
+        "features": features,
+        "spec_hash": spec_hash,
+        "code_hash": code_hash,
+        "trade_under_min": trade_under_min,
+        "cannot_be_official_best_unless_validation_strong": cannot_be_official_best_unless_validation_strong,
+        "validation_strong": validation_strong,
+        "trade_count_warning": trade_count_warning,
+        "ai_models_used": {"strategy_advisor": {"used_model": "manual_disabled", "attempts": []}, "code_generator": {"used_model": "manual_disabled", "attempts": []}},
+    }
+    write_json(version_dir / "summary.json", summary)
+
+    leaderboard_entry = {"version": ver, "run_id": run_id, "strategy_class": class_name, "strategy_file": str(strategy_file), "code_hash": code_hash, "created_at": datetime.utcnow().isoformat(), "final_score": final_score, "train_profit_pct": _safe_float(train_metrics.get("profit_total_pct")), "train_profit_abs": _safe_float(train_metrics.get("profit_total_abs")), "avg_validation_profit_pct": avg_val_profit, "avg_validation_profit_factor": avg_val_pf, "max_validation_drawdown_pct": max_val_dd, "validation_metrics": validation_metrics, "trade_under_min": trade_under_min, "cannot_be_official_best_unless_validation_strong": cannot_be_official_best_unless_validation_strong, "validation_strong": validation_strong, "trade_count_warning": trade_count_warning, "profit_factor": _safe_float(train_metrics.get("profit_factor")), "max_drawdown_pct": _safe_float(train_metrics.get("max_drawdown")) * 100.0, "total_trades": _safe_int(train_metrics.get("total_trades")), "is_overfit": is_overfit, "is_best": is_best, "is_valid": is_valid, "invalid_reason": invalid_reason, "features": features, "spec_hash": spec_hash, "feature_signature": signature, "mutation_type": mutation_type, **_extract_exit_profit_fields(train_metrics)}
+    write_json(run_dir / "leaderboard.json", {"items": [leaderboard_entry]})
+    write_json(run_dir / ITERATION_STATS_FILE_NAME, iteration_stats)
+
+    memory_items = _read_json_list_file(MEMORY_FILE)
+    memory_items.append(leaderboard_entry)
+    _write_json_list_file(MEMORY_FILE, memory_items[-200:])
+    if not is_valid:
+        blacklist_items = _read_json_list_file(BLACKLIST_FILE)
+        blacklist_items.append({**leaderboard_entry, "failure_reason": invalid_reason, "avoid_next": "避免重复本轮半自动失败结构。"})
+        _write_json_list_file(BLACKLIST_FILE, blacklist_items[-200:])
+    lessons_items = _read_json_list_file(LESSONS_FILE)
+    lessons_items.append({"version": ver, "manual_ai_mode": True, "failure_reason": invalid_reason or "通过", "avoid_next": "继续围绕 best/nearest 做单点小步修改。"})
+    _write_json_list_file(LESSONS_FILE, lessons_items[-200:])
+
+    nearest_candidate = None
+    if not is_best and train_trades > 0:
+        nearest_candidate = {"strategy_class": class_name, "strategy_file": str(strategy_file), "why_nearest": _build_why_nearest(leaderboard_entry, target_cfg, historical_best), "train_metrics": {"profit_total_abs": leaderboard_entry.get("train_profit_abs"), "profit_total_pct": leaderboard_entry.get("train_profit_pct"), "profit_factor": leaderboard_entry.get("profit_factor"), "max_drawdown_pct": leaderboard_entry.get("max_drawdown_pct"), "total_trades": leaderboard_entry.get("total_trades"), "roi_profit_abs": leaderboard_entry.get("roi_profit_abs"), "stop_loss_profit_abs": leaderboard_entry.get("stop_loss_profit_abs")}, "validation_metrics": validation_metrics, "trade_under_min": trade_under_min, "validation_strong": validation_strong, "trade_count_warning": trade_count_warning}
+        write_json(NEAREST_CANDIDATE_FILE, nearest_candidate)
+    if is_best:
+        current_best_saved = {"strategy_class": class_name, "strategy_file": str(strategy_file), "source_run_id": run_id, "version": ver, "train_metrics": train_metrics, "validation_metrics": validation_metrics, "avg_validation_metrics": {"profit_total_pct": avg_val_profit, "profit_factor": avg_val_pf, "max_drawdown_pct": max_val_dd}, "score_breakdown": score_breakdown, "final_score": final_score, "created_at": datetime.utcnow().isoformat(), "why_best": "半自动策略回测 final_score 超过历史 best。", "is_overfit": bool(is_overfit)}
+        write_json(BEST_STRATEGY_FILE, current_best_saved)
+        shutil.copy2(strategy_file, GENERATED_DIR / f"BEST_{strategy_family}.py")
+
+    last_run_summary = {"run_id": run_id, "manual_ai_mode": True, "best_updated": bool(is_best), "current_best": read_json(BEST_STRATEGY_FILE) if BEST_STRATEGY_FILE.exists() else None, "nearest_candidate": nearest_candidate, "leaderboard_top": [leaderboard_entry], "common_failure_patterns": [] if is_valid else [invalid_reason], "forbidden_next_mutation_types": ["扩大止损", "启用 exit_signal", "启用杠杆/加仓/马丁格尔"], "recommended_next_mutation_types": ["add_entry_filter", "tighten_entry_trigger", "remove_bad_entry_condition", "pair_specific_filter", "tag_specific_filter"]}
+    write_json(LAST_RUN_SUMMARY_FILE, last_run_summary)
+
+    if hasattr(args, "_run_start_ts"):
+        elapsed = time.time() - float(getattr(args, "_run_start_ts"))
+        print("\n========== 本次运行总耗时 ==========")
+        print(f"总耗时：{_format_elapsed_seconds(elapsed)}（{elapsed:.1f} 秒）")
+    print_log_saved_summary(args)
+    print("\n========== 半自动策略回测完成 ==========")
+    print(f"策略文件：{strategy_file}")
+    print(f"训练区间结果：profit={_safe_float(train_metrics.get('profit_total_pct')):.2f}%, trades={_safe_int(train_metrics.get('total_trades'))}, PF={_safe_float(train_metrics.get('profit_factor')):.4f}")
+    print(f"验证区间结果：avg_profit={avg_val_profit:.2f}%, avg_PF={avg_val_pf:.4f}, max_dd={max_val_dd:.2f}%")
+    print(f"是否成为新 best：{'是' if is_best else '否'}")
+    print(f"summary.json：{version_dir / 'summary.json'}")
+    print(f"run.log：{run_dir / 'run.log'}")
+
+
 def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace, run_dir: Path) -> None:
     config = str(runtime_goal.get("config", args.config))
     timeframe = str(runtime_goal.get("timeframe", args.timeframe))
@@ -3290,7 +3960,15 @@ def main() -> None:
     parser.add_argument("--print-prompt-files", action="store_true", default=False, help="运行结束时打印完整 Prompt 审计文件列表")
     parser.add_argument("--no-log-file", action="store_true", default=False, help="不保存本次终端完整日志，仅输出到终端")
     parser.add_argument("--log-dir", default="user_data/logs", help="全局终端日志目录，默认 user_data/logs")
+    parser.add_argument("--manual-ai-prepare", action="store_true", default=False, help="只生成半自动 AI 任务包，不调用 AI，不回测新策略")
+    parser.add_argument("--manual-task-name", default=None, help="半自动任务包目录名；默认 run_YYYYMMDD_HHMMSS")
+    parser.add_argument("--manual-ai-run", default=None, help="读取 Codex 生成的策略文件，执行本地回测和 best 判断；不调用 AI")
+    parser.add_argument("--manual-ai-task-dir", default=None, help="半自动任务包目录，可用于读取 generated_mutation_spec.json 等上下文")
+    parser.add_argument("--manual-git-push", action="store_true", default=False, help="生成任务包后自动 git add / commit / push")
+    parser.add_argument("--manual-git-branch", default=None, help="半自动任务包 Git 分支；默认 ai-manual/<task_name>")
     args = parser.parse_args()
+    if args.manual_ai_prepare and args.manual_ai_run:
+        parser.error("--manual-ai-prepare 和 --manual-ai-run 不能同时使用")
 
     run_dir = RESULT_ROOT / f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -3314,7 +3992,12 @@ def main() -> None:
 
         maybe_reset_best_strategy(args.reset_best)
 
-        effective_iterations = args.iterations if args.iterations is not None else int(runtime_goal.get("max_iterations", 5))
+        if args.manual_ai_prepare:
+            effective_iterations = 0
+        elif args.manual_ai_run:
+            effective_iterations = 1
+        else:
+            effective_iterations = args.iterations if args.iterations is not None else int(runtime_goal.get("max_iterations", 5))
         runtime_goal["max_iterations"] = int(effective_iterations)
         print(f"本次实际迭代轮数：{int(effective_iterations)}")
 
@@ -3326,7 +4009,13 @@ def main() -> None:
         write_json(run_dir / "goal.json", goal)
         print(f"运行时配置已保存：{run_dir / 'goal.runtime.json'}")
 
-        run_auto_optimization(runtime_goal, args, run_dir)
+        if args.manual_ai_prepare:
+            prepare_manual_ai_task(runtime_goal, args)
+            print_log_saved_summary(args)
+        elif args.manual_ai_run:
+            run_manual_ai_backtest(runtime_goal, args, run_dir)
+        else:
+            run_auto_optimization(runtime_goal, args, run_dir)
     except BaseException:
         if log_ctx is not None:
             print("\n========== 异常 traceback ==========")
