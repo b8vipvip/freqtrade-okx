@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -56,6 +57,126 @@ ROLE_DISPLAY_NAMES = {
     "strategy_advisor": "策略顾问",
     "code_generator": "代码生成",
 }
+
+
+class Tee:
+    """Write terminal output to multiple streams, similar to the shell tee command."""
+
+    def __init__(self, *files: Any) -> None:
+        self.files = files
+
+    def write(self, data: str) -> int:
+        for file in self.files:
+            file.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        for file in self.files:
+            file.flush()
+
+    def isatty(self) -> bool:
+        return any(getattr(file, "isatty", lambda: False)() for file in self.files)
+
+
+@dataclass
+class LogFileContext:
+    run_log_path: Path
+    global_log_path: Path
+    latest_log_path: Path
+    files: list[Any] = field(default_factory=list)
+    original_stdout: Any = None
+    original_stderr: Any = None
+
+
+def _resolve_log_dir(log_dir: str) -> Path:
+    path = Path(log_dir).expanduser()
+    return path if path.is_absolute() else ROOT_DIR / path
+
+
+def _update_latest_log(latest_log_path: Path, global_log_path: Path) -> None:
+    latest_log_path.parent.mkdir(parents=True, exist_ok=True)
+    if latest_log_path.exists() or latest_log_path.is_symlink():
+        latest_log_path.unlink()
+    try:
+        latest_log_path.symlink_to(global_log_path)
+    except OSError:
+        shutil.copy2(global_log_path, latest_log_path)
+
+
+def setup_terminal_logging(run_dir: Path, args: argparse.Namespace) -> LogFileContext | None:
+    if getattr(args, "no_log_file", False):
+        return None
+
+    run_id = run_dir.name
+    run_log_path = run_dir / "run.log"
+    global_log_dir = _resolve_log_dir(str(getattr(args, "log_dir", "user_data/logs")))
+    global_log_path = global_log_dir / f"auto_optimize_{run_id}.log"
+    latest_log_path = global_log_dir / "latest.log"
+
+    run_log_path.parent.mkdir(parents=True, exist_ok=True)
+    global_log_path.parent.mkdir(parents=True, exist_ok=True)
+    run_log_file = run_log_path.open("a", encoding="utf-8", buffering=1)
+    global_log_file = global_log_path.open("a", encoding="utf-8", buffering=1)
+
+    ctx = LogFileContext(
+        run_log_path=run_log_path,
+        global_log_path=global_log_path,
+        latest_log_path=latest_log_path,
+        files=[run_log_file, global_log_file],
+        original_stdout=sys.stdout,
+        original_stderr=sys.stderr,
+    )
+    sys.stdout = Tee(sys.__stdout__, run_log_file, global_log_file)
+    sys.stderr = Tee(sys.__stderr__, run_log_file, global_log_file)
+    _update_latest_log(latest_log_path, global_log_path)
+    return ctx
+
+
+def restore_terminal_logging(log_ctx: LogFileContext | None) -> None:
+    if log_ctx is None:
+        return
+    sys.stdout.flush()
+    sys.stderr.flush()
+    sys.stdout = log_ctx.original_stdout or sys.__stdout__
+    sys.stderr = log_ctx.original_stderr or sys.__stderr__
+    for file in log_ctx.files:
+        file.close()
+
+
+def print_log_start_banner(log_ctx: LogFileContext | None) -> None:
+    if log_ctx is None:
+        return
+    print("\n========== 日志文件 ==========")
+    print("本次完整运行日志：")
+    print(log_ctx.run_log_path)
+    print("\n全局日志副本：")
+    print(log_ctx.global_log_path)
+    print("\n查看实时日志：")
+    print(f"tail -f {log_ctx.run_log_path}")
+
+
+def print_log_saved_summary(args: argparse.Namespace) -> None:
+    log_ctx = getattr(args, "_log_context", None)
+    if log_ctx is None:
+        return
+    print("\n========== 日志保存 ==========")
+    print("完整运行日志：")
+    print(log_ctx.run_log_path)
+    print("\n全局日志：")
+    print(log_ctx.global_log_path)
+    print("\n最近一次日志：")
+    print(log_ctx.latest_log_path)
+
+
+def _format_elapsed_seconds(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}小时{minutes}分{secs}秒"
+    if minutes:
+        return f"{minutes}分{secs}秒"
+    return f"{secs}秒"
 
 
 @dataclass
@@ -3129,6 +3250,12 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     if args.print_current_best:
         print_current_best_summary(runtime_goal, historical_best, current_best_saved if best else None)
 
+    if hasattr(args, "_run_start_ts"):
+        elapsed = time.time() - float(getattr(args, "_run_start_ts"))
+        print("\n========== 本次运行总耗时 ==========")
+        print(f"总耗时：{_format_elapsed_seconds(elapsed)}（{elapsed:.1f} 秒）")
+    print_log_saved_summary(args)
+
 
 def main() -> None:
     load_project_env()
@@ -3161,38 +3288,57 @@ def main() -> None:
     parser.add_argument("--auto-reject-failed-similarity", action="store_true", default=False)
     parser.add_argument("--allow-near-min-trades-best", action="store_true", default=False, help="允许训练交易数处于 min_trades 宽限范围且验证强劲的策略成为正式 best")
     parser.add_argument("--print-prompt-files", action="store_true", default=False, help="运行结束时打印完整 Prompt 审计文件列表")
+    parser.add_argument("--no-log-file", action="store_true", default=False, help="不保存本次终端完整日志，仅输出到终端")
+    parser.add_argument("--log-dir", default="user_data/logs", help="全局终端日志目录，默认 user_data/logs")
     args = parser.parse_args()
-
-    goal_path = ROOT_DIR / args.goal
-    ensure_goal_file(goal_path)
-    goal = read_json(goal_path)
-    goal.setdefault("language", "zh-CN")
-
-    runtime_goal = goal if args.no_wizard else run_wizard(goal, args)
-    if runtime_goal.get("runtime_auto_approve", False):
-        args.auto_approve = True
-    if runtime_goal.get("runtime_force_download", False):
-        args.force_download = True
-    if runtime_goal.get("runtime_reset_best", False):
-        args.reset_best = True
-
-    maybe_reset_best_strategy(args.reset_best)
-
-    effective_iterations = args.iterations if args.iterations is not None else int(runtime_goal.get("max_iterations", 5))
-    runtime_goal["max_iterations"] = int(effective_iterations)
-    print(f"本次实际迭代轮数：{int(effective_iterations)}")
-
-    if args.save_goal:
-        write_json(goal_path, runtime_goal)
-        print(f"已保存修改后的目标配置到：{goal_path}")
 
     run_dir = RESULT_ROOT / f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
-    write_json(run_dir / "goal.runtime.json", runtime_goal)
-    write_json(run_dir / "goal.json", goal)
-    print(f"运行时配置已保存：{run_dir / 'goal.runtime.json'}")
+    args._run_start_ts = time.time()
+    log_ctx = setup_terminal_logging(run_dir, args)
+    args._log_context = log_ctx
+    try:
+        print_log_start_banner(log_ctx)
+        goal_path = ROOT_DIR / args.goal
+        ensure_goal_file(goal_path)
+        goal = read_json(goal_path)
+        goal.setdefault("language", "zh-CN")
 
-    run_auto_optimization(runtime_goal, args, run_dir)
+        runtime_goal = goal if args.no_wizard else run_wizard(goal, args)
+        if runtime_goal.get("runtime_auto_approve", False):
+            args.auto_approve = True
+        if runtime_goal.get("runtime_force_download", False):
+            args.force_download = True
+        if runtime_goal.get("runtime_reset_best", False):
+            args.reset_best = True
+
+        maybe_reset_best_strategy(args.reset_best)
+
+        effective_iterations = args.iterations if args.iterations is not None else int(runtime_goal.get("max_iterations", 5))
+        runtime_goal["max_iterations"] = int(effective_iterations)
+        print(f"本次实际迭代轮数：{int(effective_iterations)}")
+
+        if args.save_goal:
+            write_json(goal_path, runtime_goal)
+            print(f"已保存修改后的目标配置到：{goal_path}")
+
+        write_json(run_dir / "goal.runtime.json", runtime_goal)
+        write_json(run_dir / "goal.json", goal)
+        print(f"运行时配置已保存：{run_dir / 'goal.runtime.json'}")
+
+        run_auto_optimization(runtime_goal, args, run_dir)
+    except BaseException:
+        if log_ctx is not None:
+            print("\n========== 异常 traceback ==========")
+        traceback.print_exc()
+        raise
+    finally:
+        if log_ctx is not None:
+            try:
+                _update_latest_log(log_ctx.latest_log_path, log_ctx.global_log_path)
+            except OSError as exc:
+                print(f"更新 latest.log 失败：{exc}", file=sys.stderr)
+        restore_terminal_logging(log_ctx)
 
 
 if __name__ == "__main__":
