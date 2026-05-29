@@ -1,0 +1,79 @@
+[
+  {
+    "source": "/opt/freqtrade-okx/freqtrade-ai/user_data/backtest_results/ai_optimization_runs/run_20260529_082737/v008/summary.json",
+    "pair_metrics": [
+      {
+        "pair": "DOGE/USDT",
+        "trades": 10,
+        "profit_total_abs": 2.49981372,
+        "profit_total_pct": 0.249981372,
+        "profit_factor": 0.0,
+        "winrate": 1.0,
+        "max_drawdown_pct": 0.0
+      },
+      {
+        "pair": "SOL/USDT",
+        "trades": 10,
+        "profit_total_abs": 2.06177425,
+        "profit_total_pct": 0.206177425,
+        "profit_factor": 2.25169980716552,
+        "winrate": 0.9,
+        "max_drawdown_pct": 0.0
+      },
+      {
+        "pair": "XRP/USDT",
+        "trades": 8,
+        "profit_total_abs": 0.67922258,
+        "profit_total_pct": 0.067922258,
+        "profit_factor": 1.4126388737743867,
+        "winrate": 0.875,
+        "max_drawdown_pct": 0.0
+      },
+      {
+        "pair": "BTC/USDT",
+        "trades": 2,
+        "profit_total_abs": -1.3973407199999999,
+        "profit_total_pct": -0.139734072,
+        "profit_factor": 0.15195771499022145,
+        "winrate": 0.5,
+        "max_drawdown_pct": 0.0
+      },
+      {
+        "pair": "ETH/USDT",
+        "trades": 9,
+        "profit_total_abs": -1.5427837399999997,
+        "profit_total_pct": -0.15427837399999997,
+        "profit_factor": 0.531787189802861,
+        "winrate": 0.7777777777777778,
+        "max_drawdown_pct": 0.0
+      },
+      {
+        "pair": "TOTAL",
+        "trades": 39,
+        "profit_total_abs": 2.300686090000001,
+        "profit_total_pct": 0.23006860900000012,
+        "profit_factor": 1.2793451176419712,
+        "winrate": 0.8717948717948718,
+        "max_drawdown_pct": 0.0
+      }
+    ],
+    "entry_tag_metrics": [
+      {
+        "enter_tag": "macd_cross_momentum",
+        "trades": 39,
+        "profit_total_abs": 2.300686090000001,
+        "profit_total_pct": 0.23006860900000012,
+        "profit_factor": 1.2793451176419712,
+        "winrate": 0.8717948717948718
+      },
+      {
+        "enter_tag": "TOTAL",
+        "trades": 39,
+        "profit_total_abs": 2.300686090000001,
+        "profit_total_pct": 0.23006860900000012,
+        "profit_factor": 1.2793451176419712,
+        "winrate": 0.8717948717948718
+      }
+    ]
+  }
+]
