@@ -19,3 +19,4 @@ venv/
 .env.*
 user_data/backtest_results/backtest-result*.zip
 user_data/ai_memory/backups/
+ai_manual_tasks/
