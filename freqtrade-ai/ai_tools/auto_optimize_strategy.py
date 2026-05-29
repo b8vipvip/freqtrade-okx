@@ -526,6 +526,254 @@ def parse_exit_reason_details(result: dict[str, Any]) -> dict[str, Any]:
 
 
 
+
+def _max_drawdown_pct(metrics: dict[str, Any]) -> float:
+    if metrics.get("max_drawdown_pct") is not None:
+        return _safe_float(metrics.get("max_drawdown_pct"))
+    return _safe_float(metrics.get("max_drawdown")) * 100.0
+
+
+def _format_signed_abs(value: float) -> str:
+    return f"{value:+.4f}"
+
+
+def _print_starting_champion_summary(goal: dict[str, Any], champion: dict[str, Any]) -> None:
+    source = str(champion.get("source") or "baseline")
+    meta = champion.get("meta", {}) or {}
+    if source == "reset_empty":
+        print("历史 best 不存在，当前使用 baseline 作为 champion。")
+        source_label = "baseline"
+    elif source == "historical_best":
+        source_label = "historical_best"
+    elif source == "baseline":
+        if not BEST_STRATEGY_FILE.exists():
+            print("历史 best 不存在，当前使用 baseline 作为 champion。")
+        else:
+            print("历史 best 无效，当前使用 baseline 作为 champion。")
+        source_label = "baseline"
+    else:
+        source_label = source or "无"
+
+    tm = meta.get("train_metrics", {}) or {}
+    av = dict(meta.get("avg_validation_metrics", {}) or {})
+    validation_metrics = meta.get("validation_metrics", []) or []
+    if validation_metrics:
+        avg_profit, avg_pf, max_dd = _aggregate_validation_metrics(validation_metrics)
+        av.setdefault("profit_total_pct", avg_profit)
+        av.setdefault("profit_factor", avg_pf)
+        av.setdefault("max_drawdown_pct", max_dd)
+
+    advantages = meta.get("why_best") or ("无历史 best，作为基准对照。" if source_label == "baseline" else "综合指标为当前历史最优。")
+    risks = meta.get("risk_summary") or meta.get("main_risks") or "仍需在更多验证区间复验稳健性。"
+    print("\n========== 当前历史最佳策略简述 ==========")
+    print(f"来源：{source_label}")
+    print(f"策略名：{meta.get('strategy_class', '-')}")
+    print(f"策略文件：{meta.get('strategy_file', '-')}")
+    print(f"训练区间：{goal.get('train_period', {}).get('timerange', '-')}")
+    print(f"交易数：{_safe_int(tm.get('total_trades'))}")
+    print(f"收益USDT：{_safe_float(tm.get('profit_total_abs')):.4f}")
+    print(f"收益率：{_safe_float(tm.get('profit_total_pct')):.2f}%")
+    print(f"胜率：{_safe_float(tm.get('winrate')) * 100:.2f}%")
+    print(f"Profit Factor：{_safe_float(tm.get('profit_factor')):.4f}")
+    print(f"最大回撤：{_max_drawdown_pct(tm):.2f}%")
+    print(f"验证区间平均收益率：{_safe_float(av.get('profit_total_pct')):.2f}%")
+    print(f"验证区间平均 PF：{_safe_float(av.get('profit_factor')):.4f}")
+    print(f"验证区间最大回撤：{_safe_float(av.get('max_drawdown_pct')):.2f}%")
+    print(f"是否疑似过拟合：{'是' if meta.get('is_overfit') else '否'}")
+    print(f"主要优势：{advantages}")
+    print(f"主要风险：{risks}")
+
+
+def _validation_profit_states(validation_metrics: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+    profitable: list[str] = []
+    losing: list[str] = []
+    for item in validation_metrics:
+        label = str(item.get("timerange") or item.get("period") or item.get("period_name") or "validation")
+        profit = _safe_float((item.get("metrics", {}) or {}).get("profit_total_abs"))
+        if profit > 0:
+            profitable.append(label)
+        elif profit < 0:
+            losing.append(label)
+    return profitable, losing
+
+
+def _build_not_best_reason_detail(
+    train_metrics: dict[str, Any],
+    validation_metrics: list[dict[str, Any]],
+    final_score: float,
+    champion_meta: dict[str, Any] | None,
+    target_cfg: dict[str, Any],
+    invalid_reason: str | None,
+) -> list[str]:
+    details: list[str] = []
+    champion_train = (champion_meta or {}).get("train_metrics", {}) or {}
+    champion_name = (champion_meta or {}).get("strategy_class") or "historical_best"
+    train_profit = _safe_float(train_metrics.get("profit_total_pct"))
+    champ_profit = _safe_float(champion_train.get("profit_total_pct"))
+    if champion_train and train_profit < champ_profit:
+        details.append(f"训练区间收益低于 {champion_name}：{train_profit:.2f}% < {champ_profit:.2f}%")
+    train_pf = _safe_float(train_metrics.get("profit_factor"))
+    champ_pf = _safe_float(champion_train.get("profit_factor"))
+    if champion_train and train_pf < champ_pf:
+        details.append(f"训练区间 PF 低于 {champion_name}：{train_pf:.4f} < {champ_pf:.4f}")
+    train_dd = _max_drawdown_pct(train_metrics)
+    champ_dd = _max_drawdown_pct(champion_train)
+    if champion_train and champ_dd > 0 and train_dd > champ_dd:
+        details.append(f"训练区间回撤高于 {champion_name}：{train_dd:.2f}% > {champ_dd:.2f}%")
+
+    profitable, losing = _validation_profit_states(validation_metrics)
+    if profitable and losing:
+        details.append(f"验证区间表现不稳定：{','.join(profitable)} 盈利，但 {','.join(losing)} 亏损")
+    elif validation_metrics and not profitable and losing:
+        details.append("验证区间全部亏损")
+    worst_pf = min((_safe_float((item.get("metrics", {}) or {}).get("profit_factor")) for item in validation_metrics), default=None)
+    if worst_pf is not None and worst_pf < _safe_float(target_cfg.get("min_profit_factor", 1.0)):
+        details.append(f"最差验证 PF 仅 {worst_pf:.4f}")
+
+    roi_profit_abs = _safe_float(train_metrics.get("roi_profit_abs"))
+    stop_loss_profit_abs = _safe_float(train_metrics.get("stop_loss_profit_abs"))
+    if roi_profit_abs > 0 and abs(stop_loss_profit_abs) > roi_profit_abs * 1.2:
+        details.append(f"固定止损亏损吞噬 ROI 收益：训练 ROI {roi_profit_abs:+.4f}，固定止损 {stop_loss_profit_abs:.4f}")
+
+    min_pf = _safe_float(target_cfg.get("min_profit_factor", 1.0))
+    if train_pf < min_pf:
+        details.append(f"训练区间 PF 低于目标：{train_pf:.4f} < {min_pf:.4f}")
+    max_dd_target = _safe_float(target_cfg.get("max_drawdown_pct"))
+    if max_dd_target > 0 and train_dd > max_dd_target:
+        details.append(f"训练区间回撤超标：{train_dd:.2f}% > {max_dd_target:.2f}%")
+    if final_score <= 0:
+        details.append(f"final_score={final_score:.4f}，未通过评分门槛")
+    elif invalid_reason:
+        details.append(str(invalid_reason))
+    return details or [str(invalid_reason or "综合评分未优于当前 best")]
+
+
+def _build_common_failure_patterns(rows: list[dict[str, Any]], target_cfg: dict[str, Any]) -> list[str]:
+    if not rows:
+        return []
+    total = len(rows)
+    majority = total // 2 + 1
+    min_trades = _safe_int(target_cfg.get("min_trades", 25))
+    max_trades = _safe_int(target_cfg.get("max_trades", 80))
+    min_pf = _safe_float(target_cfg.get("min_profit_factor", 1.0))
+    max_dd = _safe_float(target_cfg.get("max_drawdown_pct", 3.0))
+    patterns: list[str] = []
+
+    if sum(_safe_int(r.get("total_trades")) > max_trades for r in rows) >= majority:
+        patterns.append("交易数过高")
+    if sum(0 < _safe_int(r.get("total_trades")) < min_trades for r in rows) >= majority:
+        patterns.append("交易数偏低")
+
+    validation_state_rows = [r for r in rows if r.get("validation_metrics")]
+    if validation_state_rows:
+        all_validation_losses = True
+        any_mixed = False
+        for row in validation_state_rows:
+            profits = [_safe_float((item.get("metrics", {}) or {}).get("profit_total_abs")) for item in row.get("validation_metrics", [])]
+            if any(p > 0 for p in profits):
+                all_validation_losses = False
+            if any(p > 0 for p in profits) and any(p < 0 for p in profits):
+                any_mixed = True
+        if all_validation_losses:
+            patterns.append("验证区间全部亏损")
+        elif any_mixed:
+            patterns.append("验证区间表现不稳定")
+
+        severe_month_drag = 0
+        for row in validation_state_rows:
+            profits = [_safe_float((item.get("metrics", {}) or {}).get("profit_total_abs")) for item in row.get("validation_metrics", [])]
+            if len(profits) >= 2 and min(profits) < 0 and max(profits) > 0 and abs(min(profits)) > max(abs(p) for p in profits if p != min(profits)) * 1.2:
+                severe_month_drag += 1
+        if severe_month_drag > 0:
+            patterns.append("最差验证月份拖累整体表现")
+
+    stoploss_swallow = sum(
+        _safe_float(r.get("roi_profit_abs")) > 0
+        and abs(_safe_float(r.get("stop_loss_profit_abs"))) > _safe_float(r.get("roi_profit_abs")) * 1.2
+        for r in rows
+    )
+    if stoploss_swallow >= majority or stoploss_swallow > 0:
+        patterns.append("固定止损吞噬 ROI")
+    if sum(_safe_float(r.get("profit_factor")) < min_pf for r in rows) >= majority:
+        patterns.append("PF 低")
+    if max_dd > 0 and sum(_safe_float(r.get("max_drawdown_pct")) > max_dd for r in rows) >= majority:
+        patterns.append("回撤超标")
+
+    if not patterns:
+        reasons = [str(r.get("invalid_reason") or r.get("failure_reason") or "综合评分不达标") for r in rows]
+        patterns = sorted({r for r in reasons if r})[:5]
+    return patterns
+
+
+def _build_why_nearest(row: dict[str, Any], target_cfg: dict[str, Any], champion_meta: dict[str, Any] | None) -> list[str]:
+    reasons: list[str] = []
+    trades = _safe_int(row.get("total_trades"))
+    min_trades = _safe_int(target_cfg.get("min_trades", 25))
+    max_trades = _safe_int(target_cfg.get("max_trades", 80))
+    if min_trades <= trades <= max_trades:
+        reasons.append("训练交易数在目标范围内")
+    elif trades < min_trades:
+        reasons.append("训练交易数略低于目标下限，仅作为候选参考")
+    elif trades <= int(max_trades * 1.5):
+        reasons.append("训练交易数略高于目标上限，仅作为候选参考")
+
+    validation_metrics = row.get("validation_metrics", []) or []
+    if any(_safe_float((item.get("metrics", {}) or {}).get("profit_total_abs")) > 0 and _safe_float((item.get("metrics", {}) or {}).get("profit_factor")) > 1 for item in validation_metrics):
+        reasons.append("有一个验证区间盈利且 PF > 1")
+    profitable, losing = _validation_profit_states(validation_metrics)
+    champion_train = (champion_meta or {}).get("train_metrics", {}) or {}
+    if champion_train and (
+        _safe_float(row.get("train_profit_pct")) < _safe_float(champion_train.get("profit_total_pct"))
+        or _safe_float(row.get("profit_factor")) < _safe_float(champion_train.get("profit_factor"))
+        or losing
+    ):
+        reasons.append("但训练区间和其他验证区间不如 historical_best")
+    elif losing:
+        reasons.append("但仍存在亏损验证区间")
+    reasons.append("仅作为后续优化参考，不覆盖正式 best")
+    return reasons
+
+
+def _build_nearest_advisor_notes(nearest_candidate: dict[str, Any] | None) -> dict[str, Any]:
+    if not nearest_candidate:
+        return {}
+    train = nearest_candidate.get("train_metrics", {}) or {}
+    validations = nearest_candidate.get("validation_metrics", []) or []
+    positives: list[str] = []
+    problems: list[str] = []
+    for item in validations:
+        label = str(item.get("timerange") or item.get("label") or item.get("period") or "验证区间")
+        profit_abs = _safe_float(item.get("profit_total_abs"))
+        pf = _safe_float(item.get("profit_factor"))
+        dd = _safe_float(item.get("max_drawdown_pct"))
+        trades = _safe_int(item.get("total_trades"))
+        if profit_abs > 0:
+            positives.append(f"{label} 验证区间盈利 {_format_signed_abs(profit_abs)} USDT")
+            positives.append(f"{label} PF {pf:.4f}")
+            positives.append(f"{label} 回撤仅 {dd:.2f}%")
+            positives.append(f"{label} 交易数 {trades}，可作为目标区间参考")
+        elif profit_abs < 0:
+            problems.append(f"{label} 亏损 {profit_abs:.4f} USDT")
+    train_profit_abs = _safe_float(train.get("profit_total_abs"))
+    if train_profit_abs < 0:
+        problems.insert(0, f"训练区间亏损 {train_profit_abs:.4f} USDT")
+    if _safe_float(train.get("profit_factor")) > 0:
+        problems.append("训练 PF 低于 historical_best 或目标时，不得覆盖正式 best")
+    if _safe_float(train.get("roi_profit_abs")) > 0 and abs(_safe_float(train.get("stop_loss_profit_abs"))) > _safe_float(train.get("roi_profit_abs")) * 1.2:
+        problems.append("固定止损吞噬 ROI")
+    return {
+        "本轮_nearest_可取之处": positives,
+        "本轮_nearest_问题": problems,
+        "下一轮建议": [
+            "不要扩大交易数",
+            "不要扩大 stoploss",
+            "保持 45~65 笔交易",
+            "分析 nearest_candidate 在盈利验证区间有效、但在亏损验证区间失效的原因",
+            "优先做 pair_specific_filter 或 tag_specific_filter",
+            "减少导致亏损验证区间固定止损的入场",
+        ],
+    }
+
 def _memory_presence(path: Path) -> str:
     return "存在" if path.exists() else "不存在"
 
@@ -1516,6 +1764,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     reset_best_used = bool(getattr(args, "reset_best", False) or runtime_goal.get("runtime_reset_best", False))
     champion = {"meta": _build_baseline_best(runtime_goal), "code": "", "source": "reset_empty"} if reset_best_used else _load_champion(runtime_goal)
     _print_champion_source(champion)
+    _print_starting_champion_summary(runtime_goal, champion)
     nearest_candidate: dict[str, Any] | None = None
     historical_best_mem = _load_json_or_none(BEST_STRATEGY_FILE)
     nearest_mem = _load_json_or_none(NEAREST_CANDIDATE_FILE)
@@ -1717,6 +1966,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         print(f"- historical_best: {(session_parent_candidates['historical_best'] or {}).get('strategy_class', '无')}")
         print(f"- nearest_candidate: {(session_parent_candidates['nearest_candidate'] or {}).get('strategy_class', '无')}")
         spec_prompt = _strategy_spec_prompt(class_name, runtime_goal, baseline_cfg, compact_memory, previous_failure_reason)
+        if last_run_summary_mem:
+            spec_prompt += "\nlast_run_summary=" + json.dumps(last_run_summary_mem, ensure_ascii=False)[:4000] + "\n"
         spec_prompt += f"\nchampion_strategy_class={champion.get('meta', {}).get('strategy_class', 'baseline')}\n"
         spec_prompt += f"\n已失败 mutation_type（避免重复）={sorted(used_failed_mutations)}\n"
         (version_dir / "advisor_prompt.txt").write_text(spec_prompt, encoding="utf-8")
@@ -2153,7 +2404,6 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         if not failure_reasons and invalid_reason:
             failure_reasons.append(invalid_reason)
         failure_reason = "；".join(failure_reasons) if failure_reasons else ("通过" if is_valid else "综合评分不达标")
-
         round_data = {
             "iteration": i, "class_name": class_name, "strategy_file": str(strategy_file),
             "train_metrics": train_metrics, "train_score": train_score, "validation_score": validation_score,
@@ -2162,16 +2412,23 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         }
         write_json(run_dir / f"round_{i:03d}.json", round_data)
         is_best = is_valid and final_score > 0 and (best is None or final_score > float(best["final_score"]))
+        reason_detail = [] if is_best else _build_not_best_reason_detail(
+            train_metrics=train_metrics,
+            validation_metrics=validation_metrics,
+            final_score=final_score,
+            champion_meta=champion.get("meta", {}) or {},
+            target_cfg=target_cfg,
+            invalid_reason=invalid_reason,
+        )
+
         status["is_valid"] = bool(is_valid)
         status["is_best"] = bool(is_best)
         status["invalid_reason"] = str(invalid_reason or "")
         status["final_score"] = float(final_score)
         if validation_metrics:
             status["validation_backtest_status"] = "已完成"
-            iteration_stats["validation_backtest_count"] += 1
-        elif "跳过" in str(invalid_reason or "") or _safe_int(train_metrics.get("total_trades")) == 0:
+        elif "跳过" in str(validation_status or "") or _safe_int(train_metrics.get("total_trades")) == 0:
             status["validation_backtest_status"] = "跳过"
-            iteration_stats["skipped_validation_count"] += 1
         if is_valid:
             iteration_stats["valid_strategy_count"] += 1
         else:
@@ -2242,6 +2499,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "final_score": final_score,
             "improvement_vs_champion": improvement_vs_champion,
             "failure_reason": failure_reason,
+            "reason_detail": reason_detail,
             "is_best": is_best,
             "is_valid": is_valid,
             "invalid_reason": invalid_reason,
@@ -2264,6 +2522,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "created_at": datetime.utcnow().isoformat(),
             "final_score": final_score,
             "train_profit_pct": _safe_float(train_metrics.get("profit_total_pct")),
+            "train_profit_abs": _safe_float(train_metrics.get("profit_total_abs")),
             "avg_validation_profit_pct": avg_validation_profit_pct,
             "avg_validation_profit_factor": avg_validation_profit_factor,
             "max_validation_drawdown_pct": max_validation_drawdown_pct,
@@ -2283,6 +2542,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "features": features,
             "spec_hash": spec_hash,
             "failure_reason": failure_reason,
+            "reason_detail": reason_detail,
             "avoid_next": "降低高频宽松入场，控制回撤与止损亏损。",
             **_extract_exit_profit_fields(train_metrics),
         }
@@ -2351,6 +2611,15 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 holdout_reason = "未找到可执行 holdout 区间，未执行 holdout"
         elif holdout_status == "not_run" and not holdout_reason:
             holdout_reason = "未达到候选 best 条件，未执行 holdout"
+        if not is_best and not reason_detail:
+            reason_detail = _build_not_best_reason_detail(
+                train_metrics=train_metrics,
+                validation_metrics=validation_metrics,
+                final_score=final_score,
+                champion_meta=champion.get("meta", {}) or {},
+                target_cfg=target_cfg,
+                invalid_reason=invalid_reason,
+            )
         summary.update({
             "holdout_metrics": holdout_metrics,
             "holdout_status": holdout_status,
@@ -2358,6 +2627,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "is_best": is_best,
             "is_valid": is_valid,
             "invalid_reason": invalid_reason,
+            "reason_detail": reason_detail,
             "trade_under_min": trade_under_min,
             "cannot_be_official_best_unless_validation_strong": cannot_be_official_best_unless_validation_strong,
             "validation_strong": validation_strong,
@@ -2387,6 +2657,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             print(f"本轮 {ver} 成为新 best，下一轮将以 {ver} 作为 session_parent 候选。")
         print(f"8. 第 {i} 轮完成：{'有效' if is_valid else '无效'}，原因：{invalid_reason or '通过'}")
         print(f"是否成为新最佳：{'是' if is_best else '否'}")
+        if not is_best:
+            print("未成为 best 原因：")
+            for detail in reason_detail:
+                print(f"- {detail}")
         flush_iteration_stats()
         if zero_trade_streak >= 3:
             print("连续 3 轮无交易，可能是 AI prompt 或策略模板过于保守，请检查生成策略代码。")
@@ -2450,12 +2724,15 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         nearest_candidate = {
             "strategy_class": closest_failed.get("strategy_class"),
             "strategy_file": closest_failed.get("strategy_file"),
-            "why_nearest": "在有交易失败策略中，收益最接近 baseline，且回撤/交易数惩罚更低、PF 更优。",
+            "why_nearest": _build_why_nearest(closest_failed, target_cfg, champion.get("meta", {}) or historical_best_mem),
             "train_metrics": {
+                "profit_total_abs": closest_failed.get("train_profit_abs"),
                 "profit_total_pct": closest_failed.get("train_profit_pct"),
                 "profit_factor": closest_failed.get("profit_factor"),
                 "max_drawdown_pct": closest_failed.get("max_drawdown_pct"),
                 "total_trades": closest_failed.get("total_trades"),
+                "roi_profit_abs": closest_failed.get("roi_profit_abs"),
+                "stop_loss_profit_abs": closest_failed.get("stop_loss_profit_abs"),
             },
             "validation_metrics": nearest_validation_metrics,
             "trade_under_min": bool(closest_failed.get("trade_under_min", False)),
@@ -2470,10 +2747,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             nearest_candidate["validation_metrics_missing_reason"] = "训练区间触发硬约束，跳过验证"
         if bool(closest_failed.get("trade_under_min", False)):
             nearest_candidate["trade_under_min"] = True
-            nearest_candidate["why_nearest"] += "（训练交易数略低于目标，但验证表现较强，仅作候选参考）"
+            nearest_candidate.setdefault("why_nearest", []).append("训练交易数略低于目标，但验证表现较强，仅作候选参考")
         if oversized_fallback and _safe_int(closest_failed.get("total_trades")) > max_trades_target:
             nearest_candidate["trade_over_limit"] = True
-            nearest_candidate["why_nearest"] += "（本轮无 25~80 笔候选，使用 81~120 笔超标候选仅作参考）"
+            nearest_candidate.setdefault("why_nearest", []).append("本轮无目标交易数范围候选，使用轻度超标候选仅作参考")
         write_json(NEAREST_CANDIDATE_FILE, nearest_candidate)
 
     historical_best = read_json(BEST_STRATEGY_FILE) if BEST_STRATEGY_FILE.exists() else None
@@ -2496,6 +2773,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             best_pair_metrics = list(bsd.get("pair_metrics", []) or [])
             best_entry_tag_metrics = list(bsd.get("entry_tag_metrics", []) or [])
     trade_count_warning = next((str(r.get("trade_count_warning")) for r in leaderboard_sorted if r.get("trade_count_warning")), "")
+    common_failure_patterns = _build_common_failure_patterns(invalid_rows, target_cfg)
+    nearest_advisor_notes = _build_nearest_advisor_notes(nearest_candidate)
     last_run_summary = {
         "run_id": run_id,
         "created_at": datetime.utcnow().isoformat(),
@@ -2506,7 +2785,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         "session_best": session_best,
         "trade_count_warning": trade_count_warning,
         "failed_versions": [r.get("version") for r in invalid_rows],
-        "common_failure_patterns": list({str(r.get("invalid_reason") or r.get("failure_reason") or "") for r in invalid_rows if (r.get("invalid_reason") or r.get("failure_reason"))}),
+        "common_failure_patterns": common_failure_patterns,
+        "nearest_advisor_notes": nearest_advisor_notes,
         "recommended_next_mutation_types": ["add_entry_filter", "tighten_entry_trigger", "remove_bad_entry_condition", "pair_specific_filter", "tag_specific_filter"],
         "forbidden_next_mutation_types": sorted(used_failed_mutations),
         "worst_pairs": sorted(best_pair_metrics, key=lambda x: _safe_float(x.get("profit_total_abs")))[:5],
@@ -2562,10 +2842,11 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             write_json(run_dir / "session_best.json", session_best)
         print("本次没有找到有效新策略，当前最佳策略保持不变。")
         print("本轮失败策略共同原因：")
-        print("- 交易数过高")
-        print("- 验证区间全部亏损")
-        print("- PF 低")
-        print("- 回撤超标")
+        if common_failure_patterns:
+            for pattern in common_failure_patterns:
+                print(f"- {pattern}")
+        else:
+            print("- 暂无可归纳的共同失败模式")
         print("下一轮建议：")
         print("- 降低目标交易数到 25~80")
         print("- 不要继续宽松高频入场")
@@ -2633,10 +2914,13 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             f"{row.get('version')}：顾问={row.get('advisor_status')} / 代码={row.get('codegen_status')} / 语法={row.get('syntax_check_status')} / 静态={row.get('static_check_status')} / 训练={row.get('train_backtest_status')} / 验证={row.get('validation_backtest_status')} / 有效={'是' if row.get('is_valid') else '否'} / 新best={'是' if row.get('is_best') else '否'} / 原因={row.get('invalid_reason') or '通过'}"
         )
     print("\n========== Prompt 审计文件 ==========")
-    for p in sorted(run_dir.glob('v*/advisor_prompt.txt')):
-        print(p)
-    for p in sorted(run_dir.glob('v*/codegen_prompt.txt')):
-        print(p)
+    if getattr(args, "print_prompt_files", False):
+        for p in sorted(run_dir.glob('v*/advisor_prompt.txt')):
+            print(p)
+        for p in sorted(run_dir.glob('v*/codegen_prompt.txt')):
+            print(p)
+    else:
+        print(f'Prompt 审计文件：已保存到各版本目录，如需查看请执行：find {run_dir} -maxdepth 3 -type f \\( -name "*prompt*" \\) -print')
 
     if args.retest_current_best_at_end:
         print("\n========== 结束前复测 current best / baseline ==========")
@@ -2686,6 +2970,7 @@ def main() -> None:
     parser.add_argument("--auto-continue-if-similar-to-parent", action="store_true", default=True)
     parser.add_argument("--auto-reject-failed-similarity", action="store_true", default=False)
     parser.add_argument("--allow-near-min-trades-best", action="store_true", default=False, help="允许训练交易数处于 min_trades 宽限范围且验证强劲的策略成为正式 best")
+    parser.add_argument("--print-prompt-files", action="store_true", default=False, help="运行结束时打印完整 Prompt 审计文件列表")
     args = parser.parse_args()
 
     goal_path = ROOT_DIR / args.goal
