@@ -194,3 +194,65 @@ def test_validation_strong_requires_profit_pf_and_drawdown_targets() -> None:
 
     assert optimizer._is_validation_strong(strong_validation, baseline, target) is True
     assert optimizer._is_validation_strong(weak_validation, baseline, target) is False
+
+
+def test_not_best_reason_detail_explains_mixed_validation_and_stoploss() -> None:
+    train = _metrics(58, profit=-0.7638)
+    train.update({
+        "profit_total_abs": -7.6382,
+        "profit_factor": 0.5795,
+        "max_drawdown_pct": 1.4238,
+        "roi_profit_abs": 9.0999,
+        "stop_loss_profit_abs": -18.1642,
+    })
+    validations = [
+        {"period": "valid_202604", "timerange": "20260401-20260430", "metrics": {**_metrics(60, profit=0.4043), "profit_total_abs": 4.0427, "profit_factor": 1.3618}},
+        {"period": "valid_202603", "timerange": "20260301-20260331", "metrics": {**_metrics(42, profit=-1.5265), "profit_total_abs": -15.2649, "profit_factor": 0.3929}},
+        {"period": "valid_202602", "timerange": "20260201-20260228", "metrics": {**_metrics(39, profit=-1.0237), "profit_total_abs": -10.2367, "profit_factor": 0.4764}},
+    ]
+    champion = {"strategy_class": "historical_best", "train_metrics": {"profit_total_pct": 0.03, "profit_factor": 1.0585, "max_drawdown_pct": 0.46}}
+
+    detail = optimizer._build_not_best_reason_detail(train, validations, -41.9608, champion, {"min_profit_factor": 1.0, "max_drawdown_pct": 3.0}, "final_score<=0")
+
+    joined = "\n".join(detail)
+    assert "训练区间收益低于 historical_best" in joined
+    assert "训练区间 PF 低于 historical_best" in joined
+    assert "验证区间表现不稳定" in joined
+    assert "最差验证 PF 仅 0.3929" in joined
+    assert "固定止损亏损吞噬 ROI 收益" in joined
+    assert "final_score=-41.9608" in joined
+
+
+def test_common_failure_patterns_are_data_driven_not_fixed() -> None:
+    rows = [
+        {
+            "total_trades": 24,
+            "profit_factor": 0.9,
+            "max_drawdown_pct": 1.0,
+            "roi_profit_abs": 9.0,
+            "stop_loss_profit_abs": -18.0,
+            "validation_metrics": [
+                {"period": "202604", "metrics": {"profit_total_abs": 4.0}},
+                {"period": "202603", "metrics": {"profit_total_abs": -15.0}},
+            ],
+        },
+        {
+            "total_trades": 60,
+            "profit_factor": 0.58,
+            "max_drawdown_pct": 1.4,
+            "roi_profit_abs": 9.1,
+            "stop_loss_profit_abs": -18.2,
+            "validation_metrics": [
+                {"period": "202604", "metrics": {"profit_total_abs": 4.0}},
+                {"period": "202603", "metrics": {"profit_total_abs": -15.0}},
+            ],
+        },
+    ]
+
+    patterns = optimizer._build_common_failure_patterns(rows, {"min_trades": 25, "max_trades": 80, "min_profit_factor": 1.0, "max_drawdown_pct": 3.0})
+
+    assert "交易数过高" not in patterns
+    assert "验证区间全部亏损" not in patterns
+    assert "验证区间表现不稳定" in patterns
+    assert "固定止损吞噬 ROI" in patterns
+    assert "PF 低" in patterns
