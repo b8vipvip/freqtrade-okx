@@ -1,0 +1,37 @@
+{
+  "session_parent_choice": "historical_best",
+  "session_parent_reason": "historical_best 是当前唯一有效 best：训练交易数刚好达到 25 笔下限，PF 0.9238 明显优于 nearest_candidate 的 0.4980，回撤 0.757% 也低于目标；nearest_candidate 虽有 55 笔交易缓冲，但训练亏损和 2026-03、2026-02 验证亏损更重，不适合作为本轮父代。",
+  "mutation_type": "tag_specific_filter",
+  "goal": "只围绕唯一入场标签 macd_cross_momentum 做一个极小的质量门槛，优先削减最容易触发固定止损的弱势动量入场，同时严格避免把训练总交易数压低到 25 笔以下。",
+  "changes": [
+    {
+      "target": "tag_filter",
+      "action": "仅对 enter_tag=macd_cross_momentum 增加一个通用的弱势动量保护条件：当 5m MACD 金叉刚形成但 1h 趋势确认不足或成交量确认不足时跳过该标签入场；不要按交易对写死名单，不改变 ROI、stoploss、trailing 或 exit_signal。该过滤阈值必须非常轻，只允许过滤少量最弱信号，回测若训练总交易数低于 25 笔则整轮回退。",
+      "reason": "当前所有 25 笔交易都来自 macd_cross_momentum，亏损主要由 5 次固定止损吞噬 19 次 ROI 收益；BTC/ETH/XRP 的弱势入场拖累总收益，但 pair_specific_filter 已在禁止方向中，因此用标签级、非交易对专属的弱势动量保护来减少固定止损风险。"
+    }
+  ],
+  "risk_controls": [
+    "保持现货、只做多、无杠杆、无加仓、无马丁格尔。",
+    "不启用 exit_signal，不新增 custom_exit。",
+    "不修改 minimal_roi、stoploss、trailing_stop 或仓位管理。",
+    "不放宽任何入场条件，不使用 OR 堆叠制造高频。",
+    "若训练总交易数低于 25 或验证任一月份交易数过低，则回退该 mutation。",
+    "若固定止损亏损未下降，或最差验证月份继续明显拖累整体，则不要晋升。"
+  ],
+  "do_not_change": [
+    "minimal_roi",
+    "stoploss",
+    "trailing_stop",
+    "use_exit_signal",
+    "position_adjustment",
+    "pair whitelist / blacklist",
+    "已有 macd_cross_momentum 主体结构",
+    "timeframe 和 informative timeframe"
+  ],
+  "expected_effect": {
+    "trade_count": "保持在 25~30 附近；允许极小幅减少弱信号，但不得低于训练区间总交易数 25。",
+    "profit_factor": "通过减少固定止损入场，目标从 0.9238 小幅提升到 1.0 附近或至少不低于 historical_best。",
+    "drawdown": "应维持低于 1%~1.2%，不得接近 3% 上限。",
+    "stoploss_loss": "目标将固定止损亏损从约 -9.48 USDT 小幅降低，同时不牺牲主要 ROI 收益。"
+  }
+}
