@@ -53,6 +53,31 @@ MODEL_CONFIG_EXAMPLE_FILE = ROOT_DIR / "ai_tools" / "model_config.example.json"
 TIMERANGE_RE = re.compile(r"^\d{8}-\d{8}$")
 
 
+def load_dotenv_file(path: Path) -> None:
+    """Load simple KEY=VALUE pairs from .env without overriding existing environment variables."""
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        os.environ[key] = value
+
+
+load_dotenv_file(ROOT_DIR / ".env")
+
+
 ROLE_DISPLAY_NAMES = {
     "strategy_advisor": "策略顾问",
     "code_generator": "代码生成",
@@ -166,6 +191,229 @@ def print_log_saved_summary(args: argparse.Namespace) -> None:
     print(log_ctx.global_log_path)
     print("\n最近一次日志：")
     print(log_ctx.latest_log_path)
+
+
+@dataclass
+class LogRepoPushResult:
+    enabled: bool
+    repo_path: Path | None = None
+    branch: str = "main"
+    rel_log_dir: Path | None = None
+    status: str = "未启用"
+    github_path: str = ""
+    error: str = ""
+
+
+SENSITIVE_ENV_ASSIGN_RE = re.compile(
+    r"(?im)\b(OPENAI_API_KEY|CLAUDE_API_KEY|OKX_API_KEY|OKX_API_SECRET|OKX_API_PASSPHRASE)\s*=\s*(?:[^\s'\"]+|'[^']*'|\"[^\"]*\")"
+)
+SENSITIVE_SK_RE = re.compile(r"\bsk-[A-Za-z0-9_\-]{12,}\b")
+SENSITIVE_BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=\-]+")
+SENSITIVE_FIELD_RE = re.compile(
+    r"(?i)([\"']?(?:password|token|api_key|api_secret)[\"']?\s*[:=]\s*)([\"']?)([^\"'\s,}]+)([\"']?)"
+)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    parsed = parse_yes_no(os.getenv(name, ""))
+    return default if parsed is None else parsed
+
+
+def _sanitize_log_text(text: str) -> str:
+    text = SENSITIVE_ENV_ASSIGN_RE.sub(lambda m: f"{m.group(1)}=[REDACTED]", text)
+    text = SENSITIVE_SK_RE.sub("[REDACTED]", text)
+    text = SENSITIVE_BEARER_RE.sub("Bearer [REDACTED]", text)
+    text = SENSITIVE_FIELD_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]{m.group(4)}", text)
+    return text
+
+
+def _copy_if_exists(src: Path, dest: Path) -> bool:
+    if not src.exists() or not src.is_file():
+        return False
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dest)
+    return True
+
+
+def _run_git_for_logs(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, cwd=cwd, text=True, capture_output=True)
+
+
+def configure_log_repo_args(args: argparse.Namespace) -> None:
+    if args.push_logs_to_git is None:
+        args.push_logs_to_git = _env_bool("AUTO_PUSH_LOGS_TO_GIT", False)
+    args.log_repo_path = str(args.log_repo_path or os.getenv("LOG_REPO_PATH", "")).strip()
+    args.log_repo_remote = str(os.getenv("LOG_REPO_REMOTE", "origin")).strip() or "origin"
+    args.log_repo_branch = str(os.getenv("LOG_REPO_BRANCH", "main")).strip() or "main"
+    args.log_repo_include_summary = _env_bool("LOG_REPO_INCLUDE_SUMMARY", True)
+    args.log_repo_include_prompts = _env_bool("LOG_REPO_INCLUDE_PROMPTS", False)
+    args.log_repo_include_strategy = _env_bool("LOG_REPO_INCLUDE_STRATEGY", False)
+
+
+def check_log_repo_startup(args: argparse.Namespace) -> None:
+    if not getattr(args, "push_logs_to_git", False):
+        return
+    print("\n========== 日志仓库启动检查 ==========")
+    repo_path_raw = getattr(args, "log_repo_path", "")
+    if not repo_path_raw:
+        print("警告：AUTO_PUSH_LOGS_TO_GIT=true，但 LOG_REPO_PATH 未配置。")
+        return
+    repo_path = Path(repo_path_raw).expanduser()
+    if not repo_path.exists():
+        print(f"警告：LOG_REPO_PATH 不存在：{repo_path}")
+        return
+    if not (repo_path / ".git").exists():
+        print(f"警告：LOG_REPO_PATH 不是 Git 仓库：{repo_path}")
+        return
+    remote = getattr(args, "log_repo_remote", "origin")
+    branch = getattr(args, "log_repo_branch", "main")
+    remote_cp = _run_git_for_logs(["git", "remote", "get-url", remote], repo_path)
+    if remote_cp.returncode != 0:
+        print(f"警告：日志仓库 remote 不存在：{remote}")
+    branch_cp = _run_git_for_logs(["git", "rev-parse", "--abbrev-ref", "HEAD"], repo_path)
+    current_branch = branch_cp.stdout.strip() if branch_cp.returncode == 0 else ""
+    if current_branch != branch:
+        print(f"警告：日志仓库当前分支为 {current_branch or '未知'}，目标分支为 {branch}。结束推送时会尝试 git checkout {branch}。")
+
+
+def _copy_log_repo_summary_files(run_dir: Path, dest_dir: Path) -> None:
+    for name in [ITERATION_STATS_FILE_NAME, "leaderboard.json", "goal.runtime.json"]:
+        _copy_if_exists(run_dir / name, dest_dir / name)
+    snapshots = [
+        (BEST_STRATEGY_FILE, "best_strategy_snapshot.json"),
+        (NEAREST_CANDIDATE_FILE, "nearest_candidate_snapshot.json"),
+        (LAST_RUN_SUMMARY_FILE, "last_run_summary.json"),
+    ]
+    for src, dest_name in snapshots:
+        _copy_if_exists(src, dest_dir / dest_name)
+
+
+def _copy_log_repo_optional_prompts(run_dir: Path, dest_dir: Path) -> None:
+    for prompt in sorted(run_dir.glob("v*/advisor_prompt.txt")) + sorted(run_dir.glob("v*/codegen_prompt.txt")):
+        try:
+            rel = prompt.relative_to(run_dir)
+        except ValueError:
+            continue
+        _copy_if_exists(prompt, dest_dir / rel)
+
+
+def _copy_log_repo_optional_strategy(run_dir: Path, dest_dir: Path) -> None:
+    candidates: list[Path] = []
+    if BEST_STRATEGY_FILE.exists():
+        try:
+            best_data = read_json(BEST_STRATEGY_FILE)
+            if str(best_data.get("source_run_id", "")) == run_dir.name.replace("run_", ""):
+                raw = str(best_data.get("strategy_file", "") or "")
+                if raw:
+                    candidates.append(Path(raw))
+        except Exception:
+            pass
+    candidates.extend(sorted(run_dir.glob("v*/strategy.py"), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True))
+    for src in candidates:
+        if src.exists() and src.is_file():
+            _copy_if_exists(src, dest_dir / "strategy.py")
+            return
+
+
+def push_run_logs_to_log_repo(run_dir: Path, args: argparse.Namespace) -> LogRepoPushResult:
+    enabled = bool(getattr(args, "push_logs_to_git", False))
+    repo_path_raw = str(getattr(args, "log_repo_path", "") or "").strip()
+    branch = str(getattr(args, "log_repo_branch", "main") or "main")
+    result = LogRepoPushResult(enabled=enabled, repo_path=Path(repo_path_raw).expanduser() if repo_path_raw else None, branch=branch)
+    if not enabled:
+        return result
+    if not repo_path_raw:
+        result.status = "失败"
+        result.error = "LOG_REPO_PATH 未配置"
+        print("警告：日志推送失败，但自动优化主流程已完成。")
+        print(f"错误信息：{result.error}")
+        return result
+    repo_path = Path(repo_path_raw).expanduser()
+    result.repo_path = repo_path
+    remote = str(getattr(args, "log_repo_remote", "origin") or "origin")
+    rel_log_dir = Path("logs") / datetime.utcnow().strftime("%Y-%m-%d") / run_dir.name
+    result.rel_log_dir = rel_log_dir
+    result.github_path = str(rel_log_dir / "run.log")
+
+    try:
+        if not repo_path.exists() or not (repo_path / ".git").exists():
+            raise RuntimeError(f"日志仓库不存在或不是 Git 仓库：{repo_path}")
+        run_log = run_dir / "run.log"
+        if not run_log.exists():
+            raise RuntimeError(f"本次 run.log 不存在：{run_log}")
+
+        commands = [
+            ["git", "checkout", branch],
+            ["git", "pull", "--rebase", remote, branch],
+        ]
+        for cmd in commands:
+            cp = _run_git_for_logs(cmd, repo_path)
+            if cp.stdout:
+                print(cp.stdout.rstrip())
+            if cp.stderr:
+                print(cp.stderr.rstrip())
+            if cp.returncode != 0:
+                raise RuntimeError(f"Git 命令失败：{' '.join(cmd)}")
+
+        dest_dir = repo_path / rel_log_dir
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        sanitized = _sanitize_log_text(run_log.read_text(encoding="utf-8", errors="ignore"))
+        (dest_dir / "run.log").write_text(sanitized, encoding="utf-8")
+        if getattr(args, "log_repo_include_summary", True):
+            _copy_log_repo_summary_files(run_dir, dest_dir)
+        if getattr(args, "log_repo_include_prompts", False):
+            _copy_log_repo_optional_prompts(run_dir, dest_dir)
+        if getattr(args, "log_repo_include_strategy", False):
+            _copy_log_repo_optional_strategy(run_dir, dest_dir)
+
+        commands = [
+            ["git", "add", str(rel_log_dir)],
+        ]
+        for cmd in commands:
+            cp = _run_git_for_logs(cmd, repo_path)
+            if cp.stdout:
+                print(cp.stdout.rstrip())
+            if cp.stderr:
+                print(cp.stderr.rstrip())
+            if cp.returncode != 0:
+                raise RuntimeError(f"Git 命令失败：{' '.join(cmd)}")
+        diff_cp = _run_git_for_logs(["git", "diff", "--cached", "--quiet", "--", str(rel_log_dir)], repo_path)
+        if diff_cp.returncode == 0:
+            print("日志仓库没有新变更，跳过 commit。")
+            result.status = "成功"
+            return result
+        commit_cp = _run_git_for_logs(["git", "commit", "-m", f"Add auto optimize log {run_dir.name}", "--", str(rel_log_dir)], repo_path)
+        if commit_cp.stdout:
+            print(commit_cp.stdout.rstrip())
+        if commit_cp.stderr:
+            print(commit_cp.stderr.rstrip())
+        if commit_cp.returncode != 0:
+            raise RuntimeError("git commit 失败。")
+        push_cp = _run_git_for_logs(["git", "push", remote, branch], repo_path)
+        if push_cp.stdout:
+            print(push_cp.stdout.rstrip())
+        if push_cp.stderr:
+            print(push_cp.stderr.rstrip())
+        if push_cp.returncode != 0:
+            raise RuntimeError("git push 失败。")
+        result.status = "成功"
+        return result
+    except Exception as exc:
+        result.status = "失败"
+        result.error = str(exc)
+        print("警告：日志推送失败，但自动优化主流程已完成。")
+        print(f"错误信息：{exc}")
+        return result
+
+
+def print_log_repo_push_summary(result: LogRepoPushResult) -> None:
+    print("\n========== 日志仓库推送 ==========")
+    print(f"日志仓库：{result.repo_path or '-'}")
+    print(f"目标分支：{result.branch}")
+    print(f"日志目录：{str(result.rel_log_dir) + '/' if result.rel_log_dir else '-'}")
+    print(f"推送状态：{result.status}")
+    print(f"GitHub 路径：{result.github_path or '-'}")
+    print(f"错误信息：{result.error or '-'}")
 
 
 def _format_elapsed_seconds(seconds: float) -> str:
@@ -3966,7 +4214,12 @@ def main() -> None:
     parser.add_argument("--manual-ai-task-dir", default=None, help="半自动任务包目录，可用于读取 generated_mutation_spec.json 等上下文")
     parser.add_argument("--manual-git-push", action="store_true", default=False, help="生成任务包后自动 git add / commit / push")
     parser.add_argument("--manual-git-branch", default=None, help="半自动任务包 Git 分支；默认 ai-manual/<task_name>")
+    log_push_group = parser.add_mutually_exclusive_group()
+    log_push_group.add_argument("--push-logs-to-git", dest="push_logs_to_git", action="store_true", default=None, help="强制开启运行日志推送到独立日志仓库")
+    log_push_group.add_argument("--no-push-logs-to-git", dest="push_logs_to_git", action="store_false", help="强制关闭运行日志推送到独立日志仓库")
+    parser.add_argument("--log-repo-path", default=None, help="覆盖 LOG_REPO_PATH，指定独立日志仓库本地路径")
     args = parser.parse_args()
+    configure_log_repo_args(args)
     if args.manual_ai_prepare and args.manual_ai_run:
         parser.error("--manual-ai-prepare 和 --manual-ai-run 不能同时使用")
 
@@ -3977,6 +4230,7 @@ def main() -> None:
     args._log_context = log_ctx
     try:
         print_log_start_banner(log_ctx)
+        check_log_repo_startup(args)
         goal_path = ROOT_DIR / args.goal
         ensure_goal_file(goal_path)
         goal = read_json(goal_path)
@@ -4024,9 +4278,13 @@ def main() -> None:
     finally:
         if log_ctx is not None:
             try:
+                sys.stdout.flush()
+                sys.stderr.flush()
                 _update_latest_log(log_ctx.latest_log_path, log_ctx.global_log_path)
             except OSError as exc:
                 print(f"更新 latest.log 失败：{exc}", file=sys.stderr)
+        log_push_result = push_run_logs_to_log_repo(run_dir, args)
+        print_log_repo_push_summary(log_push_result)
         restore_terminal_logging(log_ctx)
 
 
