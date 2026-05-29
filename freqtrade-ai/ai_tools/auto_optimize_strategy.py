@@ -956,10 +956,10 @@ def _strategy_spec_prompt(class_name: str, runtime_goal: dict[str, Any], baselin
         f"baseline={json.dumps(baseline_cfg, ensure_ascii=False)}\n"
         f"recent_failed={compact_memory}\n"
         f"last_failure={previous_failure_reason or '无'}\n"
-        "必须只选择一个 mutation_type，允许值：adjust_roi,adjust_stoploss,reduce_trade_frequency,add_entry_filter,remove_bad_entry_condition,disable_or_adjust_trailing,tighten_volume_filter,pair_specific_filter,cooldown_or_protection。\n"
+        "必须只选择一个 mutation_type，允许值：add_entry_filter,tighten_entry_trigger,remove_bad_entry_condition,pair_specific_filter,tag_specific_filter,adjust_roi,adjust_stoploss,reduce_trade_frequency,disable_or_adjust_trailing,tighten_volume_filter,cooldown_or_protection。\n"
         "JSON 必须包含: mutation_type,reason,expected_effect,changes,do_not_change。\n"
         f"硬约束：本轮训练区间总交易数目标是 {min_trades}~{max_trades}（不是单币种）。超过 {max_trades} 不能成为 best，超过 {int(max_trades * 1.5)} 会直接跳过验证。\n"
-        "禁止连续状态型宽松入场；优先 crossed_above/crossed_below 事件触发；每个策略最多 1~2 个 entry_tag；不允许多个 OR 条件堆叠造成高频；不允许为了增加交易数而放宽入场。"
+        "重点：减少固定止损吞噬 ROI，不是增加交易数量。禁止/不推荐：increase_trade_frequency,loosen_entry,enable_trailing,adjust_stoploss_only,widen_stoploss。优先：add_entry_filter,tighten_entry_trigger,remove_bad_entry_condition,pair_specific_filter,tag_specific_filter。"
     )
 
 
@@ -1159,7 +1159,60 @@ def _extract_metrics(result: dict[str, Any]) -> dict[str, Any]:
         "winrate": float(result.get("winrate", 0.0) or 0.0),
         **exit_reason_details,
         "pairs": result.get("results_per_pair", []),
+        "entry_tags": result.get("results_per_enter_tag", []),
     }
+
+
+def _normalize_pair_metrics(raw_pairs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for item in raw_pairs or []:
+        pair = str(item.get("key") or item.get("pair") or "")
+        if not pair:
+            continue
+        trades = _safe_int(item.get("trades") or item.get("total_trades"))
+        profit_abs = _safe_float(item.get("profit_total_abs"))
+        profit_pct = _safe_float(item.get("profit_total")) * 100.0 if item.get("profit_total") is not None else _safe_float(item.get("profit_total_pct"))
+        out.append({"pair": pair, "trades": trades, "profit_total_abs": profit_abs, "profit_total_pct": profit_pct, "profit_factor": _safe_float(item.get("profit_factor")), "winrate": _safe_float(item.get("winrate")), "max_drawdown_pct": _safe_float(item.get("max_drawdown_pct"))})
+    return out
+
+
+def _normalize_entry_tag_metrics(raw_tags: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for item in raw_tags or []:
+        tag = str(item.get("key") or item.get("enter_tag") or "")
+        if not tag:
+            continue
+        out.append({"enter_tag": tag, "trades": _safe_int(item.get("trades") or item.get("total_trades")), "profit_total_abs": _safe_float(item.get("profit_total_abs")), "profit_total_pct": (_safe_float(item.get("profit_total")) * 100.0 if item.get("profit_total") is not None else _safe_float(item.get("profit_total_pct"))), "profit_factor": _safe_float(item.get("profit_factor")), "winrate": _safe_float(item.get("winrate"))})
+    return out
+
+
+def _compute_final_score(train_score: float, validation_score: float, train_metrics: dict[str, Any], validation_metrics: list[dict[str, Any]], target_cfg: dict[str, Any]) -> tuple[float, dict[str, Any]]:
+    max_dd_target = _safe_float(target_cfg.get("max_drawdown_pct", 3.0))
+    max_trades = _safe_int(target_cfg.get("max_trades", 80))
+    worst_val_score = min((_score(v["metrics"], PeriodDef(v["period"], v["timerange"], 1.0, "validation")) for v in validation_metrics), default=0.0)
+    penalty = 0.0
+    penalty_reasons: list[str] = []
+    for item in validation_metrics:
+        m = item.get("metrics", {}) or {}
+        if _safe_float(m.get("profit_total_pct")) < -2.5:
+            penalty += 40.0
+            penalty_reasons.append(f"{item.get('period')} profit_total_pct<-2.5%")
+        if _safe_float(m.get("profit_factor")) < 0.45:
+            penalty += 30.0
+            penalty_reasons.append(f"{item.get('period')} PF<0.45")
+        if max_dd_target > 0 and _safe_float(m.get("max_drawdown_pct")) > max_dd_target * 0.9:
+            penalty += 12.0
+            penalty_reasons.append(f"{item.get('period')} DD接近上限")
+        if _safe_int(m.get("total_trades")) > max_trades:
+            penalty += 16.0
+            penalty_reasons.append(f"{item.get('period')} trades>{max_trades}")
+    roi_abs = max(0.0, _safe_float(train_metrics.get("roi_profit_abs")))
+    stop_loss_abs = abs(_safe_float(train_metrics.get("stop_loss_profit_abs")))
+    if stop_loss_abs > roi_abs * 1.2:
+        penalty += 30.0
+        penalty_reasons.append("固定止损亏损>ROI*1.2")
+    score = train_score * 0.4 + validation_score * 0.4 + worst_val_score * 0.2 - penalty
+    return score, {"worst_validation_score": worst_val_score, "penalty_total": penalty, "penalty_reasons": penalty_reasons}
 
 
 def _score(metrics: dict[str, Any], period: PeriodDef) -> float:
@@ -1419,7 +1472,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "advisor_status": "未执行",
             "codegen_status": "未执行",
             "syntax_check_status": "未执行",
-            "static_check_status": "未执行",
+            "static_check_status": "未启用",
             "train_backtest_status": "未执行",
             "validation_backtest_status": "未执行",
             "is_valid": False,
@@ -1670,9 +1723,11 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 print(pyc.stderr)
                 print(f"第 {i} 轮语法检查失败，跳过。")
                 continue
+        status["syntax_check_status"] = "成功"
         validate_strategy_class_name(strategy_file, class_name)
         static_ok, static_reason = check_entry_long_static(strategy_file)
         if not static_ok:
+            status["static_check_status"] = "失败"
             invalid_reason = static_reason or "静态检查失败"
             previous_failure_reason = invalid_reason
             card = {
@@ -1714,6 +1769,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             print("  --export trades \\")
             print("  --cache none")
             continue
+        status["static_check_status"] = "成功"
 
         print(f"6. 正在回测训练区间：{train.timerange}")
         train_cmd = [
@@ -1797,7 +1853,14 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         )
         overfit_penalty = max(0.0, train_score - validation_score) * 0.3
         baseline_ok, baseline_reason, baseline_dd_penalty = _baseline_gate_and_penalty(train_metrics, runtime_goal)
-        final_score = train_score * 0.6 + validation_score * 0.4 - overfit_penalty - baseline_dd_penalty
+        final_score, score_penalty_detail = _compute_final_score(
+            train_score=train_score,
+            validation_score=validation_score,
+            train_metrics=train_metrics,
+            validation_metrics=validation_metrics,
+            target_cfg=target_cfg,
+        )
+        final_score = final_score - overfit_penalty - baseline_dd_penalty
         if train_trades > max_trades:
             final_score = min(final_score, 0.0)
         is_overfit = train_score > validation_score * 1.3 if validation_score else True
@@ -1877,7 +1940,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "validation_score": validation_score,
             "overfit_penalty": overfit_penalty,
             "baseline_dd_penalty": baseline_dd_penalty,
-            "formula": "final_score = train_score*0.6 + validation_score*0.4 - overfit_penalty - baseline_dd_penalty",
+            "formula": "final_score = train_score*0.4 + validation_score*0.4 + worst_validation_score*0.2 - penalties - overfit_penalty - baseline_dd_penalty",
+            "penalty_detail": score_penalty_detail,
             "zero_score_reason": zero_reason,
             "baseline_check": {
                 "passed": baseline_ok,
@@ -1919,6 +1983,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 ],
             },
             "validation_metrics": validation_metrics,
+            "holdout_metrics": holdout_metrics,
+            "pair_metrics": _normalize_pair_metrics(train_metrics.get("pairs", [])),
+            "entry_tag_metrics": _normalize_entry_tag_metrics(train_metrics.get("entry_tags", [])),
             "score_breakdown": score_breakdown,
             "overfit_result": {
                 "is_overfit": is_overfit,
@@ -1992,6 +2059,34 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 "failure_reason": failure_reason,
                 "avoid_next": "减少 stoploss 损失，验证区间优先稳健。",
             })
+        holdout_metrics: list[dict[str, Any]] = []
+        holdout_failed = False
+        holdout_ranges = list(runtime_goal.get("holdout_ranges", []) or [])
+        if is_best and holdout_ranges:
+            for idx, h in enumerate(holdout_ranges, start=1):
+                h_label = str(h.get("label") or f"holdout_{idx:02d}")
+                h_timerange = str(h.get("timerange") or "")
+                if not TIMERANGE_RE.match(h_timerange):
+                    continue
+                hcmd = train_cmd.copy()
+                hcmd[hcmd.index("--timerange") + 1] = h_timerange
+                before = set(_list_backtest_zips(results_dir))
+                ts = time.time()
+                hcp = run_cmd(hcmd, ROOT_DIR)
+                if hcp.returncode != 0:
+                    continue
+                hzip = _select_backtest_zip(results_dir, before, ts)
+                hm = _extract_metrics(parse_backtest_from_zip(hzip, class_name))
+                holdout_metrics.append({"label": h_label, "timerange": h_timerange, "metrics": hm})
+                if _safe_float(hm.get("profit_total_pct")) < -2.5 or _safe_float(hm.get("profit_factor")) < 0.45 or _safe_float(hm.get("max_drawdown_pct")) > 3.0:
+                    holdout_failed = True
+            if holdout_failed:
+                is_best = False
+                is_valid = False
+                invalid_reason = "holdout 复验未通过，降级为 nearest_candidate"
+                status["is_best"] = False
+                status["is_valid"] = False
+                status["invalid_reason"] = invalid_reason
         if is_best:
             best = round_data
             iteration_stats["new_best_update_count"] += 1
@@ -1999,6 +2094,14 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             write_json(run_dir / "best_strategy.json", best)
             shutil.copy2(strategy_file, GENERATED_DIR / f"BEST_{strategy_family}.py")
             champion = {"meta": {"strategy_class": class_name, "strategy_file": str(strategy_file), "train_metrics": train_metrics}, "code": code}
+            historical_best_mem = {
+                "strategy_class": class_name,
+                "strategy_file": str(strategy_file),
+                "train_metrics": train_metrics,
+                "validation_metrics": validation_metrics,
+                "final_score": final_score,
+            }
+            print(f"本轮 {ver} 成为新 best，下一轮将以 {ver} 作为 session_parent 候选。")
         print(f"8. 第 {i} 轮完成：{'有效' if is_valid else '无效'}，原因：{invalid_reason or '通过'}")
         print(f"是否成为新最佳：{'是' if is_best else '否'}")
         flush_iteration_stats()
@@ -2093,6 +2196,14 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     _write_json_list_file(BLACKLIST_FILE, blacklist_items[-200:])
     _write_json_list_file(LESSONS_FILE, lessons_items[-200:])
 
+    best_pair_metrics: list[dict[str, Any]] = []
+    best_entry_tag_metrics: list[dict[str, Any]] = []
+    if best_version:
+        best_sum = run_dir / best_version / "summary.json"
+        if best_sum.exists():
+            bsd = read_json(best_sum)
+            best_pair_metrics = list(bsd.get("pair_metrics", []) or [])
+            best_entry_tag_metrics = list(bsd.get("entry_tag_metrics", []) or [])
     last_run_summary = {
         "run_id": run_id,
         "created_at": datetime.utcnow().isoformat(),
@@ -2103,8 +2214,12 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         "session_best": session_best,
         "failed_versions": [r.get("version") for r in invalid_rows],
         "common_failure_patterns": list({str(r.get("invalid_reason") or r.get("failure_reason") or "") for r in invalid_rows if (r.get("invalid_reason") or r.get("failure_reason"))}),
-        "recommended_next_mutation_types": ["reduce_trade_frequency", "remove_bad_entry_condition", "adjust_stoploss"],
+        "recommended_next_mutation_types": ["add_entry_filter", "tighten_entry_trigger", "remove_bad_entry_condition", "pair_specific_filter", "tag_specific_filter"],
         "forbidden_next_mutation_types": sorted(used_failed_mutations),
+        "worst_pairs": sorted(best_pair_metrics, key=lambda x: _safe_float(x.get("profit_total_abs")))[:5],
+        "best_pairs": sorted(best_pair_metrics, key=lambda x: _safe_float(x.get("profit_total_abs")), reverse=True)[:5],
+        "worst_entry_tags": sorted(best_entry_tag_metrics, key=lambda x: _safe_float(x.get("profit_total_abs")))[:5],
+        "best_entry_tags": sorted(best_entry_tag_metrics, key=lambda x: _safe_float(x.get("profit_total_abs")), reverse=True)[:5],
         "lessons_for_next_run": [
             "不要重新生成完全不同策略",
             "优先围绕 nearest_candidate 和 historical_best 做单点小步调整",
@@ -2115,6 +2230,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "不要启用或扩大 trailing",
             "不要扩大 stoploss",
             "优先减少固定止损亏损",
+            "优先削减验证区间持续拖累的 pair / entry_tag，而不是扩大止损",
             "避免与历史失败策略相似",
         ],
     }
