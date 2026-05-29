@@ -5,7 +5,8 @@
     "base_url_env": "CLAUDE_BASE_URL",
     "api_key_env": "CLAUDE_API_KEY",
     "model_env": "CLAUDE_MODEL",
-    "default_model": "claude-opus-4-7"
+    "default_model": "claude-opus-4-7",
+    "model_pool_env": "CLAUDE_MODEL_POOL"
   },
   "code_generator": {
     "enabled": true,
@@ -13,7 +14,8 @@
     "base_url_env": "OPENAI_BASE_URL",
     "api_key_env": "OPENAI_API_KEY",
     "model_env": "OPENAI_MODEL",
-    "default_model": "gpt-5.5"
+    "default_model": "gpt-5.5",
+    "model_pool_env": "OPENAI_MODEL_POOL"
   },
   "code_repair": {
     "enabled": true,
@@ -21,6 +23,7 @@
     "base_url_env": "OPENAI_BASE_URL",
     "api_key_env": "OPENAI_API_KEY",
     "model_env": "OPENAI_MODEL",
-    "default_model": "gpt-5.5"
+    "default_model": "gpt-5.5",
+    "model_pool_env": "OPENAI_MODEL_POOL"
   }
 }

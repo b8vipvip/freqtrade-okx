@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -52,6 +52,39 @@ MODEL_CONFIG_EXAMPLE_FILE = ROOT_DIR / "ai_tools" / "model_config.example.json"
 TIMERANGE_RE = re.compile(r"^\d{8}-\d{8}$")
 
 
+ROLE_DISPLAY_NAMES = {
+    "strategy_advisor": "策略顾问",
+    "code_generator": "代码生成",
+}
+
+
+@dataclass
+class AIRoleRuntime:
+    role: str
+    client: OpenAI
+    model_pool: list[str]
+    timeout_sec: int
+    switch_on_error: bool = True
+    max_attempts_per_call: int = 5
+    attempts: list[dict[str, Any]] = field(default_factory=list)
+    used_model: str = ""
+
+    @property
+    def display_name(self) -> str:
+        return ROLE_DISPLAY_NAMES.get(self.role, self.role)
+
+    def begin_call(self) -> None:
+        self.attempts = []
+        self.used_model = ""
+
+    def usage_snapshot(self) -> dict[str, Any]:
+        return {
+            "model_pool": list(self.model_pool),
+            "used_model": self.used_model,
+            "attempts": list(self.attempts),
+        }
+
+
 @dataclass
 class PeriodDef:
     name: str
@@ -67,6 +100,7 @@ DEFAULT_MODEL_CONFIG: dict[str, Any] = {
         "base_url_env": "CLAUDE_BASE_URL",
         "api_key_env": "CLAUDE_API_KEY",
         "model_env": "CLAUDE_MODEL",
+        "model_pool_env": "CLAUDE_MODEL_POOL",
         "default_model": "claude-opus-4-7",
     },
     "code_generator": {
@@ -75,6 +109,7 @@ DEFAULT_MODEL_CONFIG: dict[str, Any] = {
         "base_url_env": "OPENAI_BASE_URL",
         "api_key_env": "OPENAI_API_KEY",
         "model_env": "OPENAI_MODEL",
+        "model_pool_env": "OPENAI_MODEL_POOL",
         "default_model": "gpt-5.5",
     },
     "code_repair": {
@@ -83,6 +118,7 @@ DEFAULT_MODEL_CONFIG: dict[str, Any] = {
         "base_url_env": "OPENAI_BASE_URL",
         "api_key_env": "OPENAI_API_KEY",
         "model_env": "OPENAI_MODEL",
+        "model_pool_env": "OPENAI_MODEL_POOL",
         "default_model": "gpt-5.5",
     },
 }
@@ -1180,6 +1216,19 @@ class AIRequestFailed(RuntimeError):
         self.status_code = status_code
 
 
+class AIModelPoolExhaustedError(AIRequestFailed):
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        attempts: list[dict[str, Any]] | None = None,
+        used_model: str = "",
+    ):
+        super().__init__(message, status_code=status_code)
+        self.attempts = attempts or []
+        self.used_model = used_model
+
+
 def _format_ai_error(exc: Exception) -> tuple[str, int | None]:
     status_code = getattr(exc, "status_code", None)
     if status_code is None:
@@ -1190,25 +1239,36 @@ def _format_ai_error(exc: Exception) -> tuple[str, int | None]:
     if isinstance(body, dict):
         err = body.get("error")
         if isinstance(err, dict):
-            detail = str(err.get("message") or "")
+            detail = str(err.get("message") or err.get("code") or "")
     if not detail:
         detail = str(exc)
     msg = f"{status_code} {detail}".strip() if status_code else detail
     return msg.strip(), status_code
 
 
-def _should_retry_ai_error(error_message: str, status_code: int | None) -> bool:
+def _is_403_provider_tos_block(error_message: str, status_code: int | None) -> bool:
     msg = (error_message or "").lower()
-    retry_status_codes = {429, 502, 503, 504}
+    return status_code == 403 and any(k in msg for k in ["terms of service", "prohibited", "guardrail", "moderation"])
+
+
+def _is_retriable_ai_error(error_message: str, status_code: int | None, exc: Exception | None = None) -> bool:
+    msg = (error_message or "").lower()
+    retry_status_codes = {429, 500, 502, 503, 504}
     retry_keywords = [
         "system_cpu_overloaded",
         "system cpu overloaded",
         "auth_unavailable",
         "no auth available",
+        "provider unavailable",
+        "model unavailable",
+        "upstream error",
+        "gateway timeout",
         "rate limit",
         "timeout",
     ]
     if status_code in retry_status_codes:
+        return True
+    if exc is not None and isinstance(exc, (APITimeoutError, APIConnectionError, InternalServerError, RateLimitError, TimeoutError)):
         return True
     return any(k in msg for k in retry_keywords)
 
@@ -1217,94 +1277,184 @@ def _print_auth_unavailable_hint(error_message: str) -> None:
     msg = (error_message or "").lower()
     if "auth_unavailable" in msg or "no auth available" in msg or "providers=codex" in msg:
         print("检测到中转站 provider 鉴权/通道不可用，这通常不是本地代码错误。")
-        print("建议稍后重试，或更换 OPENAI_MODEL / OPENAI_BASE_URL / 中转站分组。")
+        print("将自动切换同角色模型池中的下一个模型；如持续失败，请检查模型池、BASE_URL 或中转站分组。")
+
+
+def _ai_backoff_seconds(failure_index: int, tos_block: bool = False) -> int:
+    if tos_block:
+        return 5
+    return min(60, 10 * (2 ** max(0, failure_index - 1)))
+
+
+def _role_pool_failed_message(role_name: str, attempts: list[dict[str, Any]], fallback_error: str) -> str:
+    display = ROLE_DISPLAY_NAMES.get(role_name, role_name)
+    failed_attempts = [a for a in attempts if a.get("status") == "failed"]
+    if failed_attempts and all(int(a.get("status_code") or 0) == 403 and a.get("tos_blocked") for a in failed_attempts):
+        return f"{display}模型池全部失败：403 provider TOS blocked"
+    return f"{display}模型池全部失败：{fallback_error}"
 
 
 def safe_ask_ai(
-    client: OpenAI,
-    model: str,
+    role_runtime: AIRoleRuntime,
     messages: list[dict[str, str]],
-    timeout_sec: int,
-    role_name: str,
     state: dict[str, Any],
-    max_retries: int = 5,
 ) -> str:
-    now = time.time()
-    last_call = float(state.get("last_ai_call_time", 0.0) or 0.0)
-    cooldown = max(0.0, float(state.get("ai_call_cooldown_seconds", 0.0) or 0.0))
-    elapsed_since_last = now - last_call if last_call > 0 else -1.0
-    wait_before_call = max(0.0, cooldown - elapsed_since_last) if elapsed_since_last >= 0 else 0.0
-    print("准备调用 AI：")
-    print(f"角色：{role_name}")
-    print(f"模型：{model}")
-    if elapsed_since_last < 0:
-        print("距离上次 AI 请求：首次调用")
-    else:
-        print(f"距离上次 AI 请求：{elapsed_since_last:.1f} 秒")
-    print(f"本次请求前等待：{wait_before_call:.1f} 秒")
-    if wait_before_call > 0:
-        time.sleep(wait_before_call)
+    role_runtime.begin_call()
+    if role_runtime.role not in {"strategy_advisor", "code_generator"}:
+        raise ValueError(f"safe_ask_ai 仅支持 strategy_advisor/code_generator，收到：{role_runtime.role}")
+    model_pool = [m for m in role_runtime.model_pool if m]
+    if not model_pool:
+        raise AIModelPoolExhaustedError(f"{role_runtime.display_name}模型池为空", attempts=[])
 
-    print("正在调用 AI 生成策略，请稍等……")
-    start_ts = time.time()
-    stop_event = threading.Event()
+    max_attempts = max(1, int(role_runtime.max_attempts_per_call or 1))
+    timeout_sec = max(1, int(role_runtime.timeout_sec or 1))
+    last_error_message = "未知错误"
+    last_status_code: int | None = None
 
-    def _heartbeat() -> None:
-        while not stop_event.wait(10):
-            waited = int(time.time() - start_ts)
-            print(f"AI 正在生成策略中，已等待 {waited} 秒……")
-            if waited > timeout_sec:
-                print(f"AI 调用超过 {timeout_sec} 秒，可能是中转站响应过慢。")
+    for attempt_idx in range(max_attempts):
+        model_idx = attempt_idx % len(model_pool) if role_runtime.switch_on_error else 0
+        model = model_pool[model_idx]
+        next_model = model_pool[(model_idx + 1) % len(model_pool)] if len(model_pool) > 1 else model
+        now = time.time()
+        last_call = float(state.get("last_ai_call_time", 0.0) or 0.0)
+        cooldown = max(0.0, float(state.get("ai_call_cooldown_seconds", 0.0) or 0.0))
+        elapsed_since_last = now - last_call if last_call > 0 else -1.0
+        wait_before_call = max(0.0, cooldown - elapsed_since_last) if elapsed_since_last >= 0 else 0.0
+        print("准备调用 AI：")
+        print(f"角色：{role_runtime.role}")
+        print(f"模型池：{', '.join(model_pool)}")
+        print(f"当前模型：{model}")
+        print(f"尝试次数：{attempt_idx + 1}/{max_attempts}")
+        if elapsed_since_last < 0:
+            print("距离上次 AI 请求：首次调用")
+        else:
+            print(f"距离上次 AI 请求：{elapsed_since_last:.1f} 秒")
+        print(f"本次请求前等待：{wait_before_call:.1f} 秒")
+        if wait_before_call > 0:
+            time.sleep(wait_before_call)
 
-    heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
-    heartbeat_thread.start()
-    retry_waits = [5, 10, 30]
-    res = None
-    error_message = "未知错误"
-    try:
-        for attempt in range(max(0, max_retries) + 1):
+        start_ts = time.time()
+        stop_event = threading.Event()
+
+        def _heartbeat() -> None:
+            while not stop_event.wait(10):
+                waited = int(time.time() - start_ts)
+                print(f"AI 正在生成策略中，已等待 {waited} 秒……")
+                if waited > timeout_sec:
+                    print(f"AI 调用超过 {timeout_sec} 秒，可能是中转站响应过慢。")
+
+        heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
+        heartbeat_thread.start()
+        try:
             try:
-                res = client.chat.completions.create(model=model, messages=messages, temperature=0.2)
-                break
+                res = role_runtime.client.chat.completions.create(model=model, messages=messages, temperature=0.2)
             except (InternalServerError, RateLimitError, APITimeoutError, APIConnectionError, APIStatusError, TimeoutError, Exception) as exc:
                 error_message, status_code = _format_ai_error(exc)
-                if status_code == 503 and "system cpu overloaded" in error_message.lower():
+                last_error_message = error_message or exc.__class__.__name__
+                last_status_code = status_code
+                tos_block = _is_403_provider_tos_block(last_error_message, status_code)
+                retriable = tos_block or _is_retriable_ai_error(last_error_message, status_code, exc)
+                role_runtime.attempts.append({
+                    "model": model,
+                    "status": "failed",
+                    "error": last_error_message,
+                    "status_code": status_code,
+                    "tos_blocked": tos_block,
+                })
+                if status_code == 503 and "system cpu overloaded" in last_error_message.lower():
                     print("提示：这是模型服务/中转站负载过高，不是本地代码错误。")
-                _print_auth_unavailable_hint(error_message)
-                can_retry = attempt < max_retries and (
-                    _should_retry_ai_error(error_message, status_code)
-                    or isinstance(exc, (APITimeoutError, APIConnectionError, TimeoutError))
-                )
-                if can_retry:
-                    wait_sec = retry_waits[min(attempt, len(retry_waits) - 1)]
-                    print(f"AI 调用失败：{error_message}")
-                    print(f"将在 {wait_sec} 秒后重试，第 {attempt + 1}/{max_retries} 次。")
+                _print_auth_unavailable_hint(last_error_message)
+                if not retriable:
+                    raise AIModelPoolExhaustedError(
+                        _role_pool_failed_message(role_runtime.role, role_runtime.attempts, last_error_message),
+                        status_code=status_code,
+                        attempts=role_runtime.attempts,
+                    ) from exc
+                wait_sec = _ai_backoff_seconds(attempt_idx + 1, tos_block=tos_block)
+                print("AI 调用失败：")
+                print(f"角色：{role_runtime.role}")
+                print(f"模型：{model}")
+                print(f"错误：{last_error_message}")
+                if attempt_idx + 1 < max_attempts:
+                    print(f"将在 {wait_sec} 秒后切换到下一个模型：{next_model}")
+                    print(f"尝试次数：{attempt_idx + 1}/{max_attempts}")
                     time.sleep(wait_sec)
                     continue
-                raise AIRequestFailed(error_message, status_code=status_code) from exc
+                raise AIModelPoolExhaustedError(
+                    _role_pool_failed_message(role_runtime.role, role_runtime.attempts, last_error_message),
+                    status_code=status_code,
+                    attempts=role_runtime.attempts,
+                ) from exc
             finally:
                 state["last_ai_call_time"] = time.time()
-    finally:
-        stop_event.set()
-        heartbeat_thread.join(timeout=1)
+        finally:
+            stop_event.set()
+            heartbeat_thread.join(timeout=1)
 
-    if res is None:
-        raise AIRequestFailed(error_message)
+        content = (res.choices[0].message.content or "").strip()
+        elapsed = int(time.time() - start_ts)
+        role_runtime.used_model = model
+        role_runtime.attempts.append({"model": model, "status": "success"})
+        print("AI 调用成功：")
+        print(f"角色：{role_runtime.role}")
+        print(f"实际使用模型：{model}")
+        print(f"用时：{elapsed} 秒")
+        print(f"返回字符数：{len(content)}")
+        return content
 
-    content = (res.choices[0].message.content or "").strip()
-    elapsed = int(time.time() - start_ts)
-    print(f"AI 策略生成完成，用时 {elapsed} 秒，返回字符数 {len(content)}。")
-    return content
+    raise AIModelPoolExhaustedError(
+        _role_pool_failed_message(role_runtime.role, role_runtime.attempts, last_error_message),
+        status_code=last_status_code,
+        attempts=role_runtime.attempts,
+    )
 
 
-def _build_model_client(model_cfg: dict[str, Any], role_name: str, timeout_sec: int) -> tuple[OpenAI, str]:
+def _parse_model_pool(raw: str | None) -> list[str]:
+    return [item.strip() for item in (raw or "").split(",") if item.strip()]
+
+
+def _build_ai_role_runtime(
+    model_cfg: dict[str, Any],
+    role_name: str,
+    timeout_sec: int,
+    max_attempts_per_call: int,
+    switch_on_error: bool,
+) -> AIRoleRuntime:
     base_url = (os.getenv(str(model_cfg.get("base_url_env", ""))) or "").strip() or None
     api_key = (os.getenv(str(model_cfg.get("api_key_env", ""))) or "").strip()
-    model = (os.getenv(str(model_cfg.get("model_env", ""))) or str(model_cfg.get("default_model", ""))).strip()
+    default_pool_env_by_role = {"strategy_advisor": "CLAUDE_MODEL_POOL", "code_generator": "OPENAI_MODEL_POOL"}
+    pool_env_name = str(model_cfg.get("model_pool_env") or default_pool_env_by_role.get(role_name, ""))
+    legacy_model_env = str(model_cfg.get("model_env", ""))
+    model_pool = _parse_model_pool(os.getenv(pool_env_name)) if pool_env_name else []
+    if not model_pool:
+        legacy_model = (os.getenv(legacy_model_env) or str(model_cfg.get("default_model", ""))).strip()
+        model_pool = [legacy_model] if legacy_model else []
     if not api_key:
-        raise RuntimeError(f"未检测到 {model_cfg.get('api_key_env')}，无法初始化 {role_name} 模型。")
-    return OpenAI(api_key=api_key, base_url=base_url, timeout=timeout_sec), model
+        raise RuntimeError(f"未检测到 {model_cfg.get('api_key_env')}，无法初始化 {role_name} 模型池。")
+    if not model_pool:
+        raise RuntimeError(f"未检测到 {pool_env_name or legacy_model_env}，无法初始化 {role_name} 模型池。")
+    return AIRoleRuntime(
+        role=role_name,
+        client=OpenAI(api_key=api_key, base_url=base_url, timeout=timeout_sec),
+        model_pool=model_pool,
+        timeout_sec=timeout_sec,
+        switch_on_error=switch_on_error,
+        max_attempts_per_call=max_attempts_per_call,
+    )
 
+
+def _print_ai_model_pool_config(advisor_runtime: AIRoleRuntime, code_runtime: AIRoleRuntime, cooldown_seconds: float) -> None:
+    print("\n========== AI 模型池配置 ==========")
+    print("策略顾问模型池：")
+    for idx, model in enumerate(advisor_runtime.model_pool, start=1):
+        print(f"{idx}. {model}")
+    print("\n代码生成模型池：")
+    for idx, model in enumerate(code_runtime.model_pool, start=1):
+        print(f"{idx}. {model}")
+    print(f"\n模型失败自动轮换：{'开启' if advisor_runtime.switch_on_error and code_runtime.switch_on_error else '关闭'}")
+    print(f"单次 AI 调用最大尝试次数：{max(advisor_runtime.max_attempts_per_call, code_runtime.max_attempts_per_call)}")
+    print(f"AI 请求超时：{max(advisor_runtime.timeout_sec, code_runtime.timeout_sec)} 秒")
+    print(f"AI 请求冷却：{cooldown_seconds:g} 秒")
 
 def _strategy_spec_prompt(class_name: str, runtime_goal: dict[str, Any], baseline_cfg: dict[str, Any], compact_memory: str, previous_failure_reason: str | None) -> str:
     target_cfg = runtime_goal.get("target", {}) or {}
@@ -1747,17 +1897,31 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     model_config = ensure_model_config_files()
     advisor_cfg = model_config.get("strategy_advisor", {})
     generator_cfg = model_config.get("code_generator", {})
-    repair_cfg = model_config.get("code_repair", {})
-    code_client, code_model = _build_model_client(generator_cfg, "code_generator", args.ai_timeout)
-    repair_client, repair_model = _build_model_client(repair_cfg, "code_repair", args.ai_timeout)
-    advisor_client, advisor_model = code_client, code_model
-    advisor_fallback = False
-    if bool(advisor_cfg.get("enabled", True)):
-        try:
-            advisor_client, advisor_model = _build_model_client(advisor_cfg, "strategy_advisor", args.ai_timeout)
-        except RuntimeError:
-            advisor_fallback = True
-            print(f"未检测到 {advisor_cfg.get('api_key_env')}，策略顾问模型将使用 {code_model} 代替。")
+    max_attempts_per_call = max(1, int(args.ai_model_max_attempts_per_call))
+    switch_on_error = bool(args.ai_model_switch_on_error)
+    advisor_runtime = _build_ai_role_runtime(
+        advisor_cfg,
+        "strategy_advisor",
+        args.ai_timeout,
+        max_attempts_per_call,
+        switch_on_error,
+    )
+    code_runtime = _build_ai_role_runtime(
+        generator_cfg,
+        "code_generator",
+        args.ai_timeout,
+        max_attempts_per_call,
+        switch_on_error,
+    )
+    code_repair_runtime = AIRoleRuntime(
+        role="code_generator",
+        client=code_runtime.client,
+        model_pool=list(code_runtime.model_pool),
+        timeout_sec=code_runtime.timeout_sec,
+        switch_on_error=code_runtime.switch_on_error,
+        max_attempts_per_call=code_runtime.max_attempts_per_call,
+    )
+    _print_ai_model_pool_config(advisor_runtime, code_runtime, float(args.ai_call_cooldown_seconds))
 
     best: dict[str, Any] | None = None
     session_best: dict[str, Any] | None = None
@@ -1844,6 +2008,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "final_score": 0.0,
         }
         version_statuses.append(status)
+        advisor_runtime.begin_call()
+        code_runtime.begin_call()
+        code_repair_runtime.begin_call()
         round_state = _new_round_defaults()
         train_metrics = round_state["train_metrics"]
         validation_metrics = round_state["validation_metrics"]
@@ -1870,6 +2037,22 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         validation_strong = bool(round_state["validation_strong"])
         trade_count_warning = str(round_state["trade_count_warning"])
         summary_write_failed = False
+
+        def current_ai_models_used() -> dict[str, Any]:
+            return {
+                "strategy_advisor": advisor_runtime.usage_snapshot(),
+                "code_generator": code_runtime.usage_snapshot(),
+            }
+
+        def enrich_leaderboard_entry(entry: dict[str, Any]) -> dict[str, Any]:
+            usage = current_ai_models_used()
+            advisor_usage = usage.get("strategy_advisor", {}) or {}
+            codegen_usage = usage.get("code_generator", {}) or {}
+            entry.setdefault("advisor_model_used", advisor_usage.get("used_model", ""))
+            entry.setdefault("codegen_model_used", codegen_usage.get("used_model", ""))
+            entry.setdefault("advisor_attempt_count", len(advisor_usage.get("attempts", []) or []))
+            entry.setdefault("codegen_attempt_count", len(codegen_usage.get("attempts", []) or []))
+            return entry
 
         def sync_round_state() -> None:
             round_state.update({
@@ -1905,6 +2088,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 mutation_type=mutation_type,
                 failure_reason=failure_reason,
             )
+            summary_data["ai_models_used"] = current_ai_models_used()
             if extra:
                 summary_data.update(extra)
             summary_path_local = version_dir / "summary.json"
@@ -1935,8 +2119,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
 
         print(f"\n========== 第 {i} 轮 / {ver} ==========")
         print("1. 正在生成 mutation_spec（冠军-挑战者小步改动）……")
-        print(f"当前策略顾问模型：{advisor_model}{' (fallback)' if advisor_fallback else ''}")
-        print(f"当前代码生成模型：{code_model}")
+        print(f"当前策略顾问模型池：{', '.join(advisor_runtime.model_pool)}")
+        print(f"当前代码生成模型池：{', '.join(code_runtime.model_pool)}")
         target_cfg = runtime_goal.get("target", {}) or {}
         baseline_cfg = runtime_goal.get("baseline", {}) or {}
         min_trades = int(target_cfg.get("min_trades", 25))
@@ -1974,13 +2158,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         print("正在调用策略顾问模型生成 mutation_spec……")
         try:
             spec_text = safe_ask_ai(
-                advisor_client,
-                advisor_model,
+                advisor_runtime,
                 [{"role": "user", "content": spec_prompt}],
-                timeout_sec=args.ai_timeout,
-                role_name="strategy_advisor",
                 state=ai_runtime_state,
-                max_retries=max(0, int(args.ai_max_retries)),
             )
             print("策略顾问模型返回完成。")
             status["advisor_status"] = "成功"
@@ -2064,17 +2244,13 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "- 避免把入场条件写成几乎永远不触发的苛刻组合。\n"
         )
         (version_dir / "codegen_prompt.txt").write_text(prompt, encoding="utf-8")
-        print("3. 正在调用 GPT-5.5 生成 Freqtrade 策略代码……")
+        print("3. 正在调用代码生成模型池生成 Freqtrade 策略代码……")
         response_text = ""
         try:
             response_text = safe_ask_ai(
-                code_client,
-                code_model,
+                code_runtime,
                 [{"role": "user", "content": prompt}],
-                timeout_sec=args.ai_timeout,
-                role_name="code_generator",
                 state=ai_runtime_state,
-                max_retries=max(0, int(args.ai_max_retries)),
             )
         except AIRequestFailed as exc:
             previous_failure_reason = f"代码生成模型调用失败：{str(exc)}"
@@ -2166,13 +2342,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             repair_prompt = f"请修复以下策略代码，仅输出可运行 Python：\n错误信息:\n{pyc.stderr}\n代码:\n{code}"
             try:
                 repaired = safe_ask_ai(
-                    repair_client,
-                    repair_model,
+                    code_repair_runtime,
                     [{"role": "user", "content": repair_prompt}],
-                    timeout_sec=args.ai_timeout,
-                    role_name="code_repair",
                     state=ai_runtime_state,
-                    max_retries=max(0, int(args.ai_max_retries)),
                 )
             except AIRequestFailed as exc:
                 repaired = ""
@@ -2666,6 +2838,21 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             print("连续 3 轮无交易，可能是 AI prompt 或策略模板过于保守，请检查生成策略代码。")
             break
 
+    for row in leaderboard:
+        summary_file = run_dir / str(row.get("version", "")) / "summary.json"
+        usage = {}
+        if summary_file.exists():
+            try:
+                usage = read_json(summary_file).get("ai_models_used", {}) or {}
+            except Exception:
+                usage = {}
+        advisor_usage = usage.get("strategy_advisor", {}) or {}
+        codegen_usage = usage.get("code_generator", {}) or {}
+        row.setdefault("advisor_model_used", advisor_usage.get("used_model", ""))
+        row.setdefault("codegen_model_used", codegen_usage.get("used_model", ""))
+        row.setdefault("advisor_attempt_count", len(advisor_usage.get("attempts", []) or []))
+        row.setdefault("codegen_attempt_count", len(codegen_usage.get("attempts", []) or []))
+
     leaderboard_sorted = sorted(leaderboard, key=lambda x: float(x.get("final_score", 0.0) or 0.0), reverse=True)
     best_version = None
     valid_rows = [row for row in leaderboard_sorted if row.get("is_valid")]
@@ -2951,9 +3138,12 @@ def main() -> None:
     parser.add_argument("--auto-approve", action="store_true")
     parser.add_argument("--skip-download", action="store_true")
     parser.add_argument("--force-download", action="store_true")
-    parser.add_argument("--ai-timeout", type=int, default=360, help="AI API 调用超时时间（秒）")
-    parser.add_argument("--ai-max-retries", type=int, default=int(os.getenv("AI_MAX_RETRIES", "5")), help="AI 调用失败时最多重试次数（不含首次）")
-    parser.add_argument("--ai-call-cooldown-seconds", type=float, default=float(os.getenv("AI_CALL_COOLDOWN_SECONDS", "5")), help="每次 AI 调用后到下一次调用前最小间隔秒数")
+    parser.add_argument("--ai-timeout", type=int, default=int(os.getenv("AI_MODEL_TIMEOUT_SECONDS", "180")), help="AI API 调用超时时间（秒）")
+    parser.add_argument("--ai-max-retries", type=int, default=int(os.getenv("AI_MAX_RETRIES", "5")), help="兼容旧参数；模型池轮换使用 --ai-model-max-attempts-per-call")
+    parser.add_argument("--ai-model-max-attempts-per-call", type=int, default=int(os.getenv("AI_MODEL_MAX_ATTEMPTS_PER_CALL", "5")), help="单次 AI 调用最大模型池尝试次数")
+    parser.add_argument("--ai-model-switch-on-error", dest="ai_model_switch_on_error", action="store_true", default=parse_yes_no(os.getenv("AI_MODEL_SWITCH_ON_ERROR", "true")) is not False, help="AI 调用失败时自动切换同角色模型池中的下一个模型")
+    parser.add_argument("--no-ai-model-switch-on-error", dest="ai_model_switch_on_error", action="store_false", help="关闭 AI 模型池失败自动轮换")
+    parser.add_argument("--ai-call-cooldown-seconds", type=float, default=float(os.getenv("AI_CALL_COOLDOWN_SECONDS", "10")), help="每次 AI 调用后到下一次调用前最小间隔秒数")
     parser.add_argument("--advisor-to-codegen-delay-seconds", type=float, default=float(os.getenv("ADVISOR_TO_CODEGEN_DELAY_SECONDS", "5")), help="策略顾问成功后到代码生成前额外等待秒数")
     parser.add_argument("--no-wizard", action="store_true")
     parser.add_argument("--save-goal", action="store_true")
