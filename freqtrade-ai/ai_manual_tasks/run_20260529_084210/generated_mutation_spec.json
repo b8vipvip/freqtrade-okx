@@ -1,0 +1,36 @@
+{
+  "session_parent_choice": "historical_best",
+  "session_parent_reason": "选择 current_best/historical_best v049 作为父本：训练区间 26 笔交易已在 25~80 目标区间内，profit_factor 1.058、回撤 0.456% 均优于 nearest_candidate；nearest_candidate 同为 26 笔但训练亏损 -2.949 USDT、profit_factor 0.473，仅适合作为反例参考。当前主要短板不是交易频率，而是 4 次固定止损合计 -5.591 USDT 吞噬 ROI 收益，因此本轮只做止损侧的小步收敛。",
+  "mutation_type": "adjust_stoploss",
+  "goal": "在不启用 exit_signal、不扩大 stoploss、不新增入场过滤且不增加交易频率的前提下，小幅收紧固定止损深度，优先降低单次固定止损亏损，并尽量保持训练总交易数仍落在 25~80 区间。",
+  "changes": [
+    {
+      "target": "stoploss",
+      "action": "仅将固定 stoploss 做小幅收紧：把当前固定止损阈值向 0 方向移动约 5%~8%（例如 current_stoploss * 0.92~0.95），不改变 trailing_stop 参数、不改变 ROI 表、不改变任何 entry 条件或 pair/tag 过滤。",
+      "reason": "current_best 与 nearest_candidate 的固定止损亏损均为 -5.591 USDT，说明主要损失来自固定止损深度；当前训练交易数 26 笔仅略高于下限，若新增过滤或削减 pair 容易跌破 25 笔，因此用 stoploss 的单点小步收紧来降低每次止损金额，同时避免改变入场覆盖面。"
+    }
+  ],
+  "risk_controls": [
+    "只允许一次参数级小改动：固定 stoploss 向 0 方向小幅收紧 5%~8%，禁止扩大为更负值。",
+    "回测后若训练总交易数低于 25 或高于 80，则回退该 mutation。",
+    "回测后若固定止损次数明显增加并导致 stop_loss_profit_abs 没有改善，则回退该 mutation。",
+    "保持 use_exit_signal=False，exit_signal_count 目标仍为 0。",
+    "不新增 OR 入场、不放宽入场、不提高交易频率、不启用做空/杠杆/加仓/马丁格尔。",
+    "不启用或扩大 trailing，仅保留父本原有 trailing 行为。"
+  ],
+  "do_not_change": [
+    "entry 条件与 enter_tag 逻辑",
+    "pair 白名单/黑名单与 pair_specific_filter",
+    "minimal_roi 表",
+    "trailing_stop 相关参数",
+    "use_exit_signal=False",
+    "position_adjustment、leverage、shorting 相关设置",
+    "startup_candle_count 与指标集合"
+  ],
+  "expected_effect": {
+    "trade_count": "基本持平，预期仍在 25~80；由于不改 entry，目标保持约 26 笔，不增加交易频率。",
+    "profit_factor": "若止损单笔亏损下降且 ROI 收益保持，profit_factor 有望小幅改善或至少保持在 0.56 目标之上。",
+    "drawdown": "固定止损深度变浅，最大回撤预期小幅下降或持平。",
+    "stoploss_loss": "目标是将固定止损合计亏损从约 -5.591 USDT 小幅收窄；重点观察 stop_loss_profit_abs 是否改善，而不是追求更多交易。"
+  }
+}
