@@ -517,6 +517,59 @@ def write_json(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def compute_global_strategy_stats() -> dict[str, int]:
+    """Scan all ai optimization run/version directories and return project-wide counters."""
+    run_dirs = sorted(p for p in RESULT_ROOT.glob("run_*") if p.is_dir())
+    stats = {
+        "run_count": len(run_dirs),
+        "nonempty_run_count": 0,
+        "version_dir_count": 0,
+        "strategy_file_count": 0,
+        "mutation_spec_count": 0,
+        "train_backtested_count": 0,
+        "validation_backtested_count": 0,
+        "summary_count": 0,
+        "valid_strategy_count": 0,
+        "new_best_count": 0,
+    }
+    for run_dir in run_dirs:
+        version_dirs = sorted(p for p in run_dir.glob("v*") if p.is_dir())
+        if version_dirs:
+            stats["nonempty_run_count"] += 1
+        stats["version_dir_count"] += len(version_dirs)
+        for version_dir in version_dirs:
+            if (version_dir / "strategy.py").exists():
+                stats["strategy_file_count"] += 1
+            if (version_dir / "mutation_spec.json").exists():
+                stats["mutation_spec_count"] += 1
+            if any((version_dir / "backtests").glob("train_*.zip")):
+                stats["train_backtested_count"] += 1
+            if any((version_dir / "backtests").glob("validation_*.zip")):
+                stats["validation_backtested_count"] += 1
+            summary_file = version_dir / "summary.json"
+            if not summary_file.exists():
+                continue
+            stats["summary_count"] += 1
+            try:
+                summary = read_json(summary_file)
+            except Exception:  # noqa: BLE001
+                continue
+            if summary.get("is_valid") is True:
+                stats["valid_strategy_count"] += 1
+            if summary.get("is_best") is True:
+                stats["new_best_count"] += 1
+    return stats
+
+
+def update_iteration_global_stats(iteration_stats: dict[str, Any]) -> None:
+    """Attach project-wide counters and the current retained memory size to iteration stats."""
+    strategy_memory_retained_count = len(_read_json_list_file(MEMORY_FILE)) if MEMORY_FILE.exists() else 0
+    global_stats = compute_global_strategy_stats()
+    global_stats["strategy_memory_retained_count"] = strategy_memory_retained_count
+    iteration_stats["strategy_memory_retained_count"] = strategy_memory_retained_count
+    iteration_stats["global_stats"] = global_stats
+
+
 def ensure_runtime_json_file(path: Path, example_path: Path) -> None:
     if path.exists():
         return
@@ -3260,7 +3313,8 @@ def run_manual_ai_backtest(runtime_goal: dict[str, Any], args: argparse.Namespac
         "invalid_strategy_count": 0,
         "new_best_update_count": 0,
         "current_iteration_version": ver,
-        "history_strategy_total_count": len(_read_json_list_file(MEMORY_FILE)) if MEMORY_FILE.exists() else 0,
+        "strategy_memory_retained_count": len(_read_json_list_file(MEMORY_FILE)) if MEMORY_FILE.exists() else 0,
+        "global_stats": {},
         "version_statuses": [],
         "manual_ai_mode": True,
     }
@@ -3276,6 +3330,7 @@ def run_manual_ai_backtest(runtime_goal: dict[str, Any], args: argparse.Namespac
         summary.update({"manual_ai_mode": True, "manual_strategy_source": str(strategy_source), "backtest_errors": backtest_errors, "ai_models_used": {"strategy_advisor": {"used_model": "manual_disabled", "attempts": []}, "code_generator": {"used_model": "manual_disabled", "attempts": []}}})
         write_json(version_dir / "summary.json", summary)
         write_json(run_dir / "leaderboard.json", {"items": [{"version": ver, "run_id": run_id, "strategy_class": class_name, "strategy_file": str(strategy_file), "is_valid": False, "is_best": False, "invalid_reason": reason, "final_score": 0.0}]})
+        update_iteration_global_stats(iteration_stats)
         write_json(run_dir / ITERATION_STATS_FILE_NAME, iteration_stats)
         print_log_saved_summary(args)
         print("\n========== 半自动策略回测完成 ==========")
@@ -3543,11 +3598,12 @@ def run_manual_ai_backtest(runtime_goal: dict[str, Any], args: argparse.Namespac
 
     leaderboard_entry = {"version": ver, "run_id": run_id, "strategy_class": class_name, "strategy_file": str(strategy_file), "code_hash": code_hash, "created_at": datetime.utcnow().isoformat(), "final_score": final_score, "train_profit_pct": _safe_float(train_metrics.get("profit_total_pct")), "train_profit_abs": _safe_float(train_metrics.get("profit_total_abs")), "avg_validation_profit_pct": avg_val_profit, "avg_validation_profit_factor": avg_val_pf, "max_validation_drawdown_pct": max_val_dd, "validation_metrics": validation_metrics, "trade_under_min": trade_under_min, "cannot_be_official_best_unless_validation_strong": cannot_be_official_best_unless_validation_strong, "validation_strong": validation_strong, "trade_count_warning": trade_count_warning, "profit_factor": _safe_float(train_metrics.get("profit_factor")), "max_drawdown_pct": _safe_float(train_metrics.get("max_drawdown")) * 100.0, "total_trades": _safe_int(train_metrics.get("total_trades")), "is_overfit": is_overfit, "is_best": is_best, "is_valid": is_valid, "invalid_reason": invalid_reason, "features": features, "spec_hash": spec_hash, "feature_signature": signature, "mutation_type": mutation_type, **_extract_exit_profit_fields(train_metrics)}
     write_json(run_dir / "leaderboard.json", {"items": [leaderboard_entry]})
-    write_json(run_dir / ITERATION_STATS_FILE_NAME, iteration_stats)
 
     memory_items = _read_json_list_file(MEMORY_FILE)
     memory_items.append(leaderboard_entry)
     _write_json_list_file(MEMORY_FILE, memory_items[-200:])
+    update_iteration_global_stats(iteration_stats)
+    write_json(run_dir / ITERATION_STATS_FILE_NAME, iteration_stats)
     if not is_valid:
         blacklist_items = _read_json_list_file(BLACKLIST_FILE)
         blacklist_items.append({**leaderboard_entry, "failure_reason": invalid_reason, "avoid_next": "避免重复本轮半自动失败结构。"})
@@ -3698,7 +3754,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         "invalid_strategy_count": 0,
         "new_best_update_count": 0,
         "current_iteration_version": "",
-        "history_strategy_total_count": 0,
+        "strategy_memory_retained_count": 0,
+        "global_stats": {},
         "random_sample_enabled": bool(random_sample_plan.get("enabled")),
         "random_sample_windows_count": len(random_sample_plan.get("windows", []) or []),
         "random_sample_total_backtests": 0,
@@ -3739,7 +3796,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         return ""
 
     def flush_iteration_stats() -> None:
-        iteration_stats["history_strategy_total_count"] = len(_read_json_list_file(MEMORY_FILE)) if MEMORY_FILE.exists() else 0
+        update_iteration_global_stats(iteration_stats)
         write_json(iteration_stats_path, iteration_stats)
     for i in range(1, iterations + 1):
         early_stop_reason = should_early_stop()
@@ -5263,8 +5320,22 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     print(f"有效策略数：{iteration_stats.get('valid_strategy_count')}")
     print(f"无效策略数：{iteration_stats.get('invalid_strategy_count')}")
     print(f"新 best 更新次数：{iteration_stats.get('new_best_update_count')}")
-    print(f"当前策略迭代版本：{iteration_stats.get('current_iteration_version')}")
-    print(f"累计历史策略版本数：{iteration_stats.get('history_strategy_total_count')}")
+    print(f"当前策略迭代版本：{iteration_stats.get('current_iteration_version')}（仅本次 run 内版本号）")
+    print(f"strategy_memory 当前保留条数：{iteration_stats.get('strategy_memory_retained_count')}")
+    global_stats = iteration_stats.get("global_stats") or {}
+    print("\n========== 全项目累计统计 ==========")
+    print(f"累计 run 总数：{global_stats.get('run_count', 0)}")
+    print(f"累计有效 run 数：{global_stats.get('nonempty_run_count', 0)}")
+    print(f"累计尝试版本数/v目录数：{global_stats.get('version_dir_count', 0)}")
+    print(f"累计生成 strategy.py 数：{global_stats.get('strategy_file_count', 0)}")
+    print(f"累计生成 mutation_spec.json 数：{global_stats.get('mutation_spec_count', 0)}")
+    print(f"累计训练回测版本数：{global_stats.get('train_backtested_count', 0)}")
+    print(f"累计验证回测版本数：{global_stats.get('validation_backtested_count', 0)}")
+    print(f"累计 summary.json 数：{global_stats.get('summary_count', 0)}")
+    print(f"累计有效策略数：{global_stats.get('valid_strategy_count', 0)}")
+    print(f"累计 new best 次数：{global_stats.get('new_best_count', 0)}")
+    print(f"strategy_memory 当前保留条数：{global_stats.get('strategy_memory_retained_count', iteration_stats.get('strategy_memory_retained_count'))}")
+    print("说明：strategy_memory 保留条数不是累计策略版本数。")
     print(f"统计文件：{iteration_stats_path}")
     print("详细状态：")
     for row in version_statuses:
