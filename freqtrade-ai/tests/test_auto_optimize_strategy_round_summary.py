@@ -292,3 +292,95 @@ def test_strip_random_samples_for_ai_prompt_removes_observation_only_fields() ->
     stripped = optimizer._strip_random_samples_for_ai_prompt(payload)
 
     assert stripped == {"final_score": 12.3, "nested": {"keep": "value"}}
+
+
+def test_strategy_fingerprint_includes_exit_timeframe_pair_and_protection_fields() -> None:
+    code = '''
+class Demo(IStrategy):
+    timeframe = "15m"
+    minimal_roi = {"0": 0.02, "60": 0.01}
+    stoploss = -0.03
+    trailing_stop = False
+    use_exit_signal = False
+
+    @property
+    def protections(self):
+        return [{"method": "CooldownPeriod", "stop_duration_candles": 4}]
+
+    def populate_entry_trend(self, df, metadata):
+        pair = metadata.get("pair")
+        cond = (df["rsi"] < 30) & (df["volume"] > 0) & (pair == "BTC/USDT")
+        df.loc[cond, ["enter_long", "enter_tag"]] = (1, "dip")
+        return df
+'''
+
+    features = optimizer.extract_strategy_features(code)
+    fingerprint = optimizer.build_strategy_fingerprint(features)
+
+    assert fingerprint["hash"]
+    payload = fingerprint["payload"]
+    assert payload["minimal_roi"] == '{"0": 0.02, "60": 0.01}'
+    assert payload["stoploss"] == "-0.03"
+    assert payload["trailing_stop"] == "False"
+    assert payload["use_exit_signal"] == "False"
+    assert payload["timeframe"] == "15m"
+    assert "cooldownperiod" in payload["cooldown_tokens"]
+    assert payload["pair_filters"]
+
+
+def test_minimal_round_summary_writes_fingerprint_and_duplicate_report() -> None:
+    state = optimizer._new_round_defaults()
+    state["strategy_fingerprint"] = {"hash": "abc123", "payload": {"timeframe": "15m"}}
+    state["duplicate_report"] = {"is_duplicate": True, "decision": "skip_backtest"}
+    state["invalid_reason"] = "策略与本次 run 已测试策略高度重复"
+
+    summary = _summary_for_state(state)
+
+    assert summary["strategy_fingerprint"]["hash"] == "abc123"
+    assert summary["duplicate_report"]["is_duplicate"] is True
+    assert summary["invalid_reason"] == "策略与本次 run 已测试策略高度重复"
+
+
+def test_provider_pool_from_env_builds_openai_compatible_clients(monkeypatch) -> None:
+    monkeypatch.setenv("STRATEGY_ADVISOR_PROVIDER_POOL", "apihost_claude_opus47,deepseek_official")
+    monkeypatch.setenv("AI_PROVIDER_APIHOST_CLAUDE_OPUS47_BASE_URL", "https://apihost.cn/v1")
+    monkeypatch.setenv("AI_PROVIDER_APIHOST_CLAUDE_OPUS47_API_KEY", "sk-test")
+    monkeypatch.setenv("AI_PROVIDER_APIHOST_CLAUDE_OPUS47_MODEL", "claude-opus-4-7")
+    monkeypatch.setenv("AI_PROVIDER_APIHOST_CLAUDE_OPUS47_TYPE", "openai_compatible")
+    monkeypatch.setenv("AI_PROVIDER_DEEPSEEK_OFFICIAL_BASE_URL", "你的deepseek_base_url")
+    monkeypatch.setenv("AI_PROVIDER_DEEPSEEK_OFFICIAL_API_KEY", "你的deepseek_key")
+    monkeypatch.setenv("AI_PROVIDER_DEEPSEEK_OFFICIAL_MODEL", "你的deepseek模型名")
+    monkeypatch.setenv("AI_PROVIDER_DEEPSEEK_OFFICIAL_TYPE", "openai_compatible")
+
+    runtime = optimizer._build_ai_role_runtime(
+        {"provider_pool_env": "STRATEGY_ADVISOR_PROVIDER_POOL"},
+        "strategy_advisor",
+        timeout_sec=5,
+        max_attempts_per_call=3,
+        switch_on_error=True,
+    )
+
+    assert runtime.model_pool == ["claude-opus-4-7"]
+    assert runtime.provider_pool[0]["name"] == "apihost_claude_opus47"
+    assert runtime.provider_pool[0]["base_url"] == "https://apihost.cn/v1"
+
+
+def test_provider_pool_env_errors_when_only_placeholders(monkeypatch) -> None:
+    monkeypatch.setenv("STRATEGY_CODEGEN_PROVIDER_POOL", "glm_official")
+    monkeypatch.setenv("AI_PROVIDER_GLM_OFFICIAL_BASE_URL", "你的glm_base_url")
+    monkeypatch.setenv("AI_PROVIDER_GLM_OFFICIAL_API_KEY", "你的glm_key")
+    monkeypatch.setenv("AI_PROVIDER_GLM_OFFICIAL_MODEL", "你的glm模型名")
+    monkeypatch.setenv("AI_PROVIDER_GLM_OFFICIAL_TYPE", "openai_compatible")
+
+    try:
+        optimizer._build_ai_role_runtime(
+            {"provider_pool_env": "STRATEGY_CODEGEN_PROVIDER_POOL"},
+            "code_generator",
+            timeout_sec=5,
+            max_attempts_per_call=3,
+            switch_on_error=True,
+        )
+    except RuntimeError as exc:
+        assert "没有可用 provider" in str(exc)
+    else:
+        raise AssertionError("placeholder provider pool should fail fast")
