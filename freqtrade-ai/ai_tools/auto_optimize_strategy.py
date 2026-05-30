@@ -1676,6 +1676,87 @@ def _compact_prompt_json(data: Any, max_chars: int = 6000) -> str:
     return text[:max_chars] + "...<truncated>"
 
 
+def _prompt_guidance_rules(runtime_goal: dict[str, Any], key: str) -> list[str]:
+    guidance = runtime_goal.get("prompt_guidance", {}) or {}
+    raw_rules = guidance.get(key, []) if isinstance(guidance, dict) else []
+    if not isinstance(raw_rules, list):
+        return []
+    return [str(rule).strip() for rule in raw_rules if str(rule).strip()]
+
+
+def _format_prompt_guidance_section(title: str, rules: list[str]) -> str:
+    if not rules:
+        return ""
+    lines = ["", title]
+    lines.extend(f"{idx}. {rule}" for idx, rule in enumerate(rules, start=1))
+    return "\n".join(lines) + "\n"
+
+
+def print_prompt_guidance_summary(runtime_goal: dict[str, Any]) -> None:
+    advisor_rules = _prompt_guidance_rules(runtime_goal, "advisor_rules")
+    codegen_rules = _prompt_guidance_rules(runtime_goal, "codegen_rules")
+    print("\n========== Prompt 额外规则 ==========")
+    print(f"策略顾问规则数量：{len(advisor_rules)}")
+    print(f"代码生成规则数量：{len(codegen_rules)}")
+
+
+def _round_validation_key(item: dict[str, Any], index: int) -> str:
+    return str(item.get("timerange") or item.get("period") or item.get("period_name") or item.get("label") or index)
+
+
+def _behavior_duplicate_report(
+    *,
+    train_metrics: dict[str, Any],
+    validation_metrics: list[dict[str, Any]],
+    official_best: dict[str, Any] | None,
+) -> dict[str, Any]:
+    duplicate_with = _strategy_label(official_best, "")
+    base_report = {
+        "is_duplicate": False,
+        "duplicate_with": duplicate_with,
+        "reason": "",
+    }
+    if not isinstance(official_best, dict) or not official_best or not duplicate_with or duplicate_with == "baseline":
+        return base_report
+
+    official_train = official_best.get("train_metrics", {}) or {}
+    official_validations = official_best.get("validation_metrics", []) or []
+    if not validation_metrics:
+        return base_report
+    if not isinstance(official_validations, list) or len(validation_metrics) != len(official_validations):
+        return base_report
+
+    train_checks = [
+        _safe_int(train_metrics.get("total_trades")) == _safe_int(official_train.get("total_trades")),
+        abs(_safe_float(train_metrics.get("profit_total_pct")) - _safe_float(official_train.get("profit_total_pct"))) < 0.005,
+        abs(_safe_float(train_metrics.get("profit_factor")) - _safe_float(official_train.get("profit_factor"))) < 0.005,
+        abs(_safe_float(train_metrics.get("max_drawdown_pct")) - _safe_float(official_train.get("max_drawdown_pct"))) < 0.02,
+    ]
+    if not all(train_checks):
+        return base_report
+
+    current_by_key = {_round_validation_key(item, idx): item for idx, item in enumerate(validation_metrics)}
+    official_by_key = {_round_validation_key(item, idx): item for idx, item in enumerate(official_validations)}
+    if set(current_by_key) != set(official_by_key):
+        return base_report
+
+    for key, current_item in current_by_key.items():
+        current_metrics = current_item.get("metrics", {}) or {}
+        official_metrics = (official_by_key[key].get("metrics", {}) or {})
+        if abs(_safe_int(current_metrics.get("total_trades")) - _safe_int(official_metrics.get("total_trades"))) > 1:
+            return base_report
+        if abs(_safe_float(current_metrics.get("profit_total_pct")) - _safe_float(official_metrics.get("profit_total_pct"))) >= 0.005:
+            return base_report
+        if abs(_safe_float(current_metrics.get("profit_factor")) - _safe_float(official_metrics.get("profit_factor"))) >= 0.01:
+            return base_report
+
+    return {
+        "is_duplicate": True,
+        "duplicate_with": duplicate_with,
+        "reason": "训练和验证行为指标几乎一致",
+    }
+
+
 def _round_summary_label(summary: dict[str, Any] | None) -> str:
     if not isinstance(summary, dict) or not summary:
         return "无"
@@ -1869,6 +1950,9 @@ def _new_round_defaults() -> dict[str, Any]:
         "similarity_report": None,
         "strategy_fingerprint": None,
         "duplicate_report": None,
+        "behavior_duplicate": {"is_duplicate": False, "duplicate_with": "", "reason": ""},
+        "is_behavior_duplicate": False,
+        "not_best_reason": "",
         "final_score": 0,
         "score_breakdown": {},
         "invalid_reason": "",
@@ -1944,6 +2028,9 @@ def _minimal_round_summary(
         "similarity_report": state.get("similarity_report"),
         "strategy_fingerprint": state.get("strategy_fingerprint"),
         "duplicate_report": state.get("duplicate_report"),
+        "behavior_duplicate": state.get("behavior_duplicate", {"is_duplicate": False, "duplicate_with": "", "reason": ""}),
+        "is_behavior_duplicate": bool(state.get("is_behavior_duplicate", False)),
+        "not_best_reason": state.get("not_best_reason", ""),
         "trade_under_min": bool(state.get("trade_under_min", False)),
         "cannot_be_official_best_unless_validation_strong": bool(state.get("cannot_be_official_best_unless_validation_strong", False)),
         "validation_strong": bool(state.get("validation_strong", False)),
@@ -3857,19 +3944,31 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         "version_statuses": version_statuses,
     }
 
-    def _count_trailing(predicate: Any) -> int:
+    def _is_duplicate_for_codegen_switch(row: dict[str, Any]) -> bool:
+        behavior_report = row.get("behavior_duplicate", {}) or {}
+        return (
+            str(row.get("invalid_reason") or "") == "策略与本次 run 已测试策略高度重复"
+            or bool(row.get("is_behavior_duplicate", False))
+            or bool(behavior_report.get("is_duplicate", False))
+            or str(row.get("not_best_reason") or "") == "策略行为与当前 official_best 几乎一致，不覆盖 best。"
+        )
+
+    def _count_trailing_in_rows(rows: list[dict[str, Any]], predicate: Any) -> int:
         count = 0
-        for row in reversed(version_statuses):
+        for row in reversed(rows):
             if predicate(row):
                 count += 1
             else:
                 break
         return count
 
+    def _count_trailing(predicate: Any) -> int:
+        return _count_trailing_in_rows(version_statuses, predicate)
+
     def should_early_stop() -> str:
         no_best_count = _count_trailing(lambda row: row.get("advisor_status") != "未执行" and not row.get("is_best"))
         final_score_failure_count = _count_trailing(lambda row: row.get("advisor_status") != "未执行" and _safe_float(row.get("final_score")) <= 0)
-        duplicate_count = _count_trailing(lambda row: str(row.get("invalid_reason") or "") == "策略与本次 run 已测试策略高度重复")
+        duplicate_count = _count_trailing(_is_duplicate_for_codegen_switch)
         iteration_stats["early_stop_checked_counters"] = {
             "no_new_best": no_best_count,
             "final_score_failures": final_score_failure_count,
@@ -3934,6 +4033,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         similarity_report = round_state["similarity_report"]
         strategy_fingerprint = round_state["strategy_fingerprint"]
         duplicate_report = round_state["duplicate_report"]
+        behavior_duplicate = round_state["behavior_duplicate"]
+        is_behavior_duplicate = bool(round_state["is_behavior_duplicate"])
+        not_best_reason = str(round_state["not_best_reason"])
         final_score = round_state["final_score"]
         score_breakdown = round_state["score_breakdown"]
         invalid_reason = round_state["invalid_reason"]
@@ -3984,6 +4086,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 "similarity_report": similarity_report,
                 "strategy_fingerprint": strategy_fingerprint,
                 "duplicate_report": duplicate_report,
+                "behavior_duplicate": behavior_duplicate,
+                "is_behavior_duplicate": is_behavior_duplicate,
+                "not_best_reason": not_best_reason,
                 "final_score": final_score,
                 "score_breakdown": score_breakdown,
                 "invalid_reason": invalid_reason,
@@ -4091,9 +4196,11 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         print("1. 正在生成 mutation_spec（冠军-挑战者小步改动）……")
         print(f"当前策略顾问模型池：{', '.join(advisor_runtime.model_pool)}")
         print(f"当前代码生成模型池：{', '.join(code_runtime.model_pool)}")
-        duplicate_streak_before_codegen = _count_trailing(lambda row: str(row.get("invalid_reason") or "") == "策略与本次 run 已测试策略高度重复")
-        if duplicate_streak_before_codegen >= 2 and len(code_runtime.provider_pool or code_runtime.model_pool) > 1:
-            code_runtime.forced_provider_offset = (duplicate_streak_before_codegen - 1) % len(code_runtime.provider_pool or code_runtime.model_pool)
+        previous_version_statuses = version_statuses[:-1]
+        duplicate_streak_before_codegen = _count_trailing_in_rows(previous_version_statuses, _is_duplicate_for_codegen_switch)
+        codegen_pool_size = len(code_runtime.provider_pool or code_runtime.model_pool)
+        if duplicate_streak_before_codegen >= 1 and codegen_pool_size > 1:
+            code_runtime.forced_provider_offset = duplicate_streak_before_codegen % codegen_pool_size
             print(f"已连续 {duplicate_streak_before_codegen} 次生成重复策略，本轮强制切换 codegen provider/模型起点 offset={code_runtime.forced_provider_offset}。")
         else:
             code_runtime.forced_provider_offset = 0
@@ -4165,6 +4272,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         spec_prompt += "\n跨 run strategy_blacklist=" + _compact_prompt_json(blacklist_items[-memory_max_items:], 4000) + "\n"
         spec_prompt += f"\nchampion_strategy_class={_strategy_label(in_memory_champion, 'baseline')}\n"
         spec_prompt += _v045_small_step_prompt_section({"meta": official_champion})
+        spec_prompt += _format_prompt_guidance_section(
+            "========== 用户额外策略顾问规则 ==========",
+            _prompt_guidance_rules(runtime_goal, "advisor_rules"),
+        )
         spec_prompt += f"\n已失败 mutation_type（避免重复）={sorted(set(used_failed_mutations).union(session_state['failed_mutation_types_this_run']))}\n"
         (version_dir / "advisor_prompt.txt").write_text(spec_prompt, encoding="utf-8")
         print("正在调用策略顾问模型生成 mutation_spec……")
@@ -4268,6 +4379,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "- 如果 mutation_spec 要求 ETH/USDT 专属过滤，代码里必须出现明确的 ETH/USDT 分支或等价 pair-specific 条件（例如 metadata['pair'] == 'ETH/USDT' 或 pair 变量判断）。\n"
             "- 如果 mutation_spec 要求新增指标（ema20、ema50、adx、atr_pct、bollinger_middleband、volume_mean_20 等），必须在 populate_indicators 中实际计算这些 dataframe 列，并在入场条件中引用相关列。\n"
             "- 避免把入场条件写成几乎永远不触发的苛刻组合。\n"
+        )
+        prompt += _format_prompt_guidance_section(
+            "========== 用户额外代码生成规则 ==========",
+            _prompt_guidance_rules(runtime_goal, "codegen_rules"),
         )
         (version_dir / "codegen_prompt.txt").write_text(prompt, encoding="utf-8")
         print("3. 正在调用代码生成模型池生成 Freqtrade 策略代码……")
@@ -4821,18 +4936,34 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         }
         write_json(run_dir / f"round_{i:03d}.json", round_data)
         is_best = is_valid and final_score > 0 and (best is None or final_score > float(best["final_score"]))
-        reason_detail = [] if is_best else _build_not_best_reason_detail(
+        not_best_reason = ""
+        behavior_duplicate = _behavior_duplicate_report(
             train_metrics=train_metrics,
             validation_metrics=validation_metrics,
-            final_score=final_score,
-            champion_meta=champion.get("meta", {}) or {},
-            target_cfg=target_cfg,
-            invalid_reason=invalid_reason,
+            official_best=session_state.get("official_champion"),
+        )
+        is_behavior_duplicate = bool(behavior_duplicate.get("is_duplicate"))
+        if is_best and is_behavior_duplicate:
+            is_best = False
+            not_best_reason = "策略行为与当前 official_best 几乎一致，不覆盖 best。"
+            print("行为级重复检测：与当前 official_best 指标几乎一致，不更新 best。")
+        reason_detail = [] if is_best else (
+            [not_best_reason] if not_best_reason else _build_not_best_reason_detail(
+                train_metrics=train_metrics,
+                validation_metrics=validation_metrics,
+                final_score=final_score,
+                champion_meta=champion.get("meta", {}) or {},
+                target_cfg=target_cfg,
+                invalid_reason=invalid_reason,
+            )
         )
 
         status["is_valid"] = bool(is_valid)
         status["is_best"] = bool(is_best)
         status["invalid_reason"] = str(invalid_reason or "")
+        status["not_best_reason"] = not_best_reason
+        status["behavior_duplicate"] = behavior_duplicate
+        status["is_behavior_duplicate"] = is_behavior_duplicate
         status["final_score"] = float(final_score)
         if validation_metrics:
             status["validation_backtest_status"] = "已完成"
@@ -4843,7 +4974,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         else:
             iteration_stats["invalid_strategy_count"] += 1
         if session_best is None or final_score > float(session_best.get("final_score", -1e18)):
-            session_best = {"version": ver, "class_name": class_name, "final_score": final_score, "is_valid": is_valid, "invalid_reason": invalid_reason}
+            session_best = {"version": ver, "class_name": class_name, "final_score": final_score, "is_valid": is_valid, "invalid_reason": invalid_reason, "not_best_reason": not_best_reason}
         score_breakdown = {
             "train_score": train_score,
             "validation_score": validation_score,
@@ -4908,7 +5039,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "final_score": final_score,
             "improvement_vs_champion": improvement_vs_champion,
             "failure_reason": failure_reason,
+            "not_best_reason": not_best_reason,
             "reason_detail": reason_detail,
+            "behavior_duplicate": behavior_duplicate,
+            "is_behavior_duplicate": is_behavior_duplicate,
             "is_best": is_best,
             "is_valid": is_valid,
             "invalid_reason": invalid_reason,
@@ -4954,6 +5088,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "features": features,
             "strategy_fingerprint": strategy_fingerprint,
             "duplicate_report": duplicate_report,
+            "behavior_duplicate": behavior_duplicate,
+            "not_best_reason": not_best_reason,
             "spec_hash": spec_hash,
             "failure_reason": failure_reason,
             "reason_detail": reason_detail,
@@ -5086,14 +5222,17 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             status["random_sample_status"] = "skipped"
             status["random_sample_count"] = 0
         if not is_best and not reason_detail:
-            reason_detail = _build_not_best_reason_detail(
-                train_metrics=train_metrics,
-                validation_metrics=validation_metrics,
-                final_score=final_score,
-                champion_meta=champion.get("meta", {}) or {},
-                target_cfg=target_cfg,
-                invalid_reason=invalid_reason,
-            )
+            if not_best_reason:
+                reason_detail = [not_best_reason]
+            else:
+                reason_detail = _build_not_best_reason_detail(
+                    train_metrics=train_metrics,
+                    validation_metrics=validation_metrics,
+                    final_score=final_score,
+                    champion_meta=champion.get("meta", {}) or {},
+                    target_cfg=target_cfg,
+                    invalid_reason=invalid_reason,
+                )
         summary.update({
             "holdout_metrics": holdout_metrics,
             "holdout_status": holdout_status,
@@ -5101,7 +5240,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "is_best": is_best,
             "is_valid": is_valid,
             "invalid_reason": invalid_reason,
+            "not_best_reason": not_best_reason,
             "reason_detail": reason_detail,
+            "behavior_duplicate": behavior_duplicate,
+            "is_behavior_duplicate": is_behavior_duplicate,
             "trade_under_min": trade_under_min,
             "cannot_be_official_best_unless_validation_strong": cannot_be_official_best_unless_validation_strong,
             "validation_strong": validation_strong,
@@ -5140,6 +5282,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "score_breakdown": score_breakdown,
             "strategy_fingerprint": strategy_fingerprint,
             "duplicate_report": duplicate_report,
+            "behavior_duplicate": behavior_duplicate,
+            "not_best_reason": not_best_reason,
             "mutation_type": mutation_type,
             "failure_reason": failure_reason,
         })
@@ -5665,6 +5809,7 @@ def main() -> None:
         else:
             effective_iterations = args.iterations if args.iterations is not None else int(runtime_goal.get("max_iterations", 5))
         runtime_goal["max_iterations"] = int(effective_iterations)
+        print_prompt_guidance_summary(runtime_goal)
         print(f"本次实际迭代轮数：{int(effective_iterations)}")
 
         if args.save_goal:
