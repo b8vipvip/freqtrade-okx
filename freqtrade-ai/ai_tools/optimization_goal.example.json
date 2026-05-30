@@ -78,5 +78,17 @@
     "max_drawdown_pct": 1.45,
     "total_trades": 47
   },
-  "language": "zh-CN"
+  "language": "zh-CN",
+  "prompt_guidance": {
+    "advisor_rules": [
+      "不要继续单纯收紧 ETH/USDT。",
+      "本轮必须保持训练交易数在目标区间内。",
+      "如果修改 entry 过滤器，必须说明预计保留多少交易数。"
+    ],
+    "codegen_rules": [
+      "必须真实落地 mutation_spec。",
+      "禁止只改 class name、注释、变量名。",
+      "生成代码后必须与父策略在 entry_conditions 或 indicators 上有可检测差异。"
+    ]
+  }
 }
