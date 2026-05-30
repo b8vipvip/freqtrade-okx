@@ -9,6 +9,7 @@ import fcntl
 import hashlib
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -18,7 +19,7 @@ import time
 import traceback
 import zipfile
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -1351,6 +1352,231 @@ def _normalize_validation_metric(item: dict[str, Any], fallback_label: str = "va
         "force_exit_profit_abs": _safe_float(m.get("force_exit_profit_abs")),
     }
 
+
+RANDOM_SAMPLE_USAGE = {
+    "used_for_final_score": False,
+    "used_for_best_selection": False,
+    "used_for_ai_prompt": False,
+    "manual_observation_only": True,
+}
+
+
+def _strip_random_samples_for_ai_prompt(data: Any) -> Any:
+    """Return a copy without random-sample details so advisor prompts ignore observation-only data."""
+    if isinstance(data, dict):
+        return {
+            k: _strip_random_samples_for_ai_prompt(v)
+            for k, v in data.items()
+            if not str(k).startswith("random_sample")
+        }
+    if isinstance(data, list):
+        return [_strip_random_samples_for_ai_prompt(v) for v in data]
+    return data
+
+
+def _parse_yyyymmdd(value: str, arg_name: str) -> datetime:
+    try:
+        return datetime.strptime(str(value), "%Y%m%d")
+    except ValueError as exc:
+        raise ValueError(f"{arg_name} 必须是 YYYYMMDD 格式，例如 20260101") from exc
+
+
+def _timerange_days(timerange: str) -> int:
+    if not TIMERANGE_RE.match(str(timerange or "")):
+        return 0
+    start_raw, end_raw = str(timerange).split("-", 1)
+    return max(0, (_parse_yyyymmdd(end_raw, "timerange.end") - _parse_yyyymmdd(start_raw, "timerange.start")).days)
+
+
+def _timerange_overlap_days(a: str, b: str) -> int:
+    if not TIMERANGE_RE.match(str(a or "")) or not TIMERANGE_RE.match(str(b or "")):
+        return 0
+    a_start_raw, a_end_raw = str(a).split("-", 1)
+    b_start_raw, b_end_raw = str(b).split("-", 1)
+    a_start = _parse_yyyymmdd(a_start_raw, "timerange.start")
+    a_end = _parse_yyyymmdd(a_end_raw, "timerange.end")
+    b_start = _parse_yyyymmdd(b_start_raw, "timerange.start")
+    b_end = _parse_yyyymmdd(b_end_raw, "timerange.end")
+    return max(0, (min(a_end, b_end) - max(a_start, b_start)).days)
+
+
+def _random_sample_enabled(args: argparse.Namespace) -> bool:
+    return _safe_int(getattr(args, "random_sample_windows", 0)) > 0
+
+
+def build_random_sample_plan(args: argparse.Namespace, runtime_goal: dict[str, Any], run_dir: Path) -> dict[str, Any]:
+    """Generate and persist the run-level random-sample window plan."""
+    requested = max(0, _safe_int(getattr(args, "random_sample_windows", 0)))
+    enabled = requested > 0
+    plan: dict[str, Any] = {
+        "enabled": enabled,
+        "count_requested": requested,
+        "min_days": _safe_int(getattr(args, "random_sample_min_days", 25)),
+        "max_days": _safe_int(getattr(args, "random_sample_max_days", 35)),
+        "data_start": getattr(args, "random_sample_data_start", None),
+        "data_end": getattr(args, "random_sample_data_end", None),
+        "seed": getattr(args, "random_sample_seed", None),
+        "max_overlap_days": 7,
+        "usage": dict(RANDOM_SAMPLE_USAGE),
+        "windows": [],
+    }
+    if not enabled:
+        return plan
+
+    start = _parse_yyyymmdd(str(plan["data_start"]), "--random-sample-data-start")
+    end = _parse_yyyymmdd(str(plan["data_end"]), "--random-sample-data-end")
+    min_days = int(plan["min_days"])
+    max_days = int(plan["max_days"])
+    if min_days <= 0 or max_days < min_days:
+        raise ValueError("--random-sample-min-days 必须大于 0，且不能大于 --random-sample-max-days")
+    total_days = (end - start).days
+    if total_days < min_days:
+        raise ValueError("随机采样数据范围短于最小窗口天数，无法生成随机采样窗口")
+
+    holdout_timeranges = {
+        str(h.get("timerange"))
+        for h in (runtime_goal.get("holdout_ranges", []) or [])
+        if isinstance(h, dict) and TIMERANGE_RE.match(str(h.get("timerange") or ""))
+    }
+    rng = random.Random(plan["seed"])
+    windows: list[dict[str, Any]] = []
+    attempts = max(500, requested * 500)
+    for _ in range(attempts):
+        if len(windows) >= requested:
+            break
+        days = rng.randint(min_days, min(max_days, total_days))
+        start_offset = rng.randint(0, total_days - days)
+        w_start = start + timedelta(days=start_offset)
+        w_end = w_start + timedelta(days=days)
+        timerange = f"{w_start:%Y%m%d}-{w_end:%Y%m%d}"
+        if timerange in holdout_timeranges:
+            continue
+        if any(w["timerange"] == timerange for w in windows):
+            continue
+        if any(_timerange_overlap_days(timerange, w["timerange"]) > int(plan["max_overlap_days"]) for w in windows):
+            continue
+        windows.append({"label": f"random_{len(windows) + 1:03d}", "timerange": timerange, "days": days})
+    if len(windows) < requested:
+        print(f"警告：随机采样窗口仅生成 {len(windows)}/{requested} 个；请扩大数据范围或降低窗口数量。")
+    plan["windows"] = windows
+    write_json(run_dir / "random_sample_plan.json", plan)
+    return plan
+
+
+def print_random_sample_config(plan: dict[str, Any]) -> None:
+    if not plan.get("enabled"):
+        print("额外随机采样：未启用")
+        return
+    print("\n========== 额外随机采样配置 ==========")
+    print(f"随机采样窗口数：{plan.get('count_requested')}")
+    print(f"随机采样数据范围：{plan.get('data_start')}-{plan.get('data_end')}")
+    print(f"窗口天数：{plan.get('min_days')}~{plan.get('max_days')}")
+    print("用途：仅人工观察，不参与评分，不提供给 AI")
+
+
+def _flatten_random_sample_metric(window: dict[str, Any], metrics: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "label": window.get("label", ""),
+        "timerange": window.get("timerange", ""),
+        "days": _safe_int(window.get("days")) or _timerange_days(str(window.get("timerange") or "")),
+        "total_trades": _safe_int(metrics.get("total_trades")),
+        "profit_total_abs": _safe_float(metrics.get("profit_total_abs")),
+        "profit_total_pct": _safe_float(metrics.get("profit_total_pct")),
+        "profit_factor": _safe_float(metrics.get("profit_factor")),
+        "max_drawdown_pct": _max_drawdown_pct(metrics),
+        "roi_profit_abs": _safe_float(metrics.get("roi_profit_abs")),
+        "stop_loss_profit_abs": _safe_float(metrics.get("stop_loss_profit_abs")),
+        "trailing_stop_loss_profit_abs": _safe_float(metrics.get("trailing_stop_loss_profit_abs")),
+        "force_exit_profit_abs": _safe_float(metrics.get("force_exit_profit_abs")),
+    }
+
+
+def run_random_sample_backtests(
+    *,
+    plan: dict[str, Any],
+    train_cmd: list[str],
+    results_dir: Path,
+    version_dir: Path,
+    class_name: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+    """Run observation-only random samples after all official scoring decisions are complete."""
+    windows = list(plan.get("windows", []) or [])
+    if not plan.get("enabled") or not windows:
+        return [], [], "skipped"
+    metrics_rows: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for window in windows:
+        label = str(window.get("label") or f"random_{len(metrics_rows) + 1:03d}")
+        timerange = str(window.get("timerange") or "")
+        if not TIMERANGE_RE.match(timerange):
+            errors.append({"label": label, "timerange": timerange, "error": "invalid_timerange"})
+            continue
+        print(f"正在回测额外随机采样窗口（仅人工观察）：{label} {timerange}")
+        cmd = train_cmd.copy()
+        cmd[cmd.index("--timerange") + 1] = timerange
+        before = set(_list_backtest_zips(results_dir))
+        started_at = time.time()
+        cp = run_cmd(cmd, ROOT_DIR)
+        _write_backtest_process_log(version_dir, f"random_sample_{label}", timerange, cp)
+        if cp.returncode != 0:
+            errors.append({"label": label, "timerange": timerange, "error": "backtest_failed", "stderr_tail": cp.stderr[-1000:]})
+            continue
+        result_zip, candidates = find_backtest_zip_for_strategy(results_dir, class_name, started_at, before)
+        if result_zip is None:
+            _log_backtest_zip_filter_failure(class_name, candidates)
+            errors.append({"label": label, "timerange": timerange, "error": "zip_missing_or_wrong_strategy"})
+            continue
+        zip_local = _copy_backtest_zip_to_version(result_zip, version_dir, "random_sample", timerange, label)
+        result, actual_keys = parse_backtest_from_zip(zip_local, class_name, strict=False)
+        if result is None:
+            errors.append({"label": label, "timerange": timerange, "error": "backtest_parse_failed", "actual_strategies": actual_keys})
+            continue
+        metrics_rows.append(_flatten_random_sample_metric(window, _extract_metrics(result)))
+    status = "completed" if len(metrics_rows) == len(windows) and not errors else ("failed" if errors else "completed")
+    return metrics_rows, errors, status
+
+
+def summarize_random_sample_observation(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    if not rows:
+        return {
+            "random_sample_observation_only": True,
+            "count": 0,
+            "average_profit_total_pct": 0.0,
+            "average_profit_factor": 0.0,
+            "worst_window": None,
+            "obviously_unstable": False,
+        }
+    avg_profit = sum(_safe_float(r.get("profit_total_pct")) for r in rows) / len(rows)
+    avg_pf = sum(_safe_float(r.get("profit_factor")) for r in rows) / len(rows)
+    worst = min(rows, key=lambda r: _safe_float(r.get("profit_total_pct")))
+    unstable = any(_safe_float(r.get("profit_total_pct")) < -0.5 or _safe_float(r.get("profit_factor")) < 0.8 for r in rows)
+    return {
+        "random_sample_observation_only": True,
+        "count": len(rows),
+        "average_profit_total_pct": avg_profit,
+        "average_profit_factor": avg_pf,
+        "worst_window": worst,
+        "obviously_unstable": bool(unstable),
+    }
+
+
+def print_random_sample_observation(rows: list[dict[str, Any]]) -> None:
+    print("\n========== 额外随机采样窗口观察 ==========")
+    print("说明：以下结果仅供人工观察，不参与 final_score，不影响 best，不提供给下一轮 AI。")
+    for row in rows:
+        print(
+            f"{row.get('label')} {row.get('timerange')}：交易数 {_safe_int(row.get('total_trades'))}，"
+            f"收益 {_safe_float(row.get('profit_total_pct')):.2f}%，PF {_safe_float(row.get('profit_factor')):.2f}，"
+            f"DD {_safe_float(row.get('max_drawdown_pct')):.2f}%"
+        )
+    observation = summarize_random_sample_observation(rows)
+    worst = observation.get("worst_window") or {}
+    print("\n人工观察结论：")
+    print(f"- 随机窗口平均收益率：{_safe_float(observation.get('average_profit_total_pct')):.2f}%")
+    print(f"- 随机窗口平均 PF：{_safe_float(observation.get('average_profit_factor')):.2f}")
+    print(f"- 最差随机窗口：{worst.get('label', '无')} {worst.get('timerange', '')} 收益 {_safe_float(worst.get('profit_total_pct')):.2f}%")
+    print(f"- 是否存在明显不稳：{'是' if observation.get('obviously_unstable') else '否'}")
+
 def _build_baseline_best(goal: dict[str, Any]) -> dict[str, Any]:
     baseline = goal.get("baseline", {}) or {}
     return {
@@ -1584,6 +1810,10 @@ def _new_round_defaults() -> dict[str, Any]:
         "validation_strong": False,
         "trade_count_warning": "",
         "backtest_errors": [],
+        "random_sample_metrics": [],
+        "random_sample_usage": dict(RANDOM_SAMPLE_USAGE),
+        "random_sample_observation": summarize_random_sample_observation([]),
+        "random_sample_errors": [],
     }
 
 
@@ -1648,6 +1878,10 @@ def _minimal_round_summary(
         "validation_strong": bool(state.get("validation_strong", False)),
         "trade_count_warning": state.get("trade_count_warning", ""),
         "backtest_errors": state.get("backtest_errors", []),
+        "random_sample_metrics": state.get("random_sample_metrics", []),
+        "random_sample_usage": state.get("random_sample_usage", dict(RANDOM_SAMPLE_USAGE)),
+        "random_sample_observation": state.get("random_sample_observation", summarize_random_sample_observation([])),
+        "random_sample_errors": state.get("random_sample_errors", []),
     }
 
 
@@ -3290,6 +3524,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     ai_runtime_state = {"last_ai_call_time": 0.0, "ai_call_cooldown_seconds": float(args.ai_call_cooldown_seconds)}
     iteration_stats_path = run_dir / ITERATION_STATS_FILE_NAME
     version_statuses: list[dict[str, Any]] = []
+    random_sample_plan = build_random_sample_plan(args, runtime_goal, run_dir)
+    print_random_sample_config(random_sample_plan)
+
     iteration_stats: dict[str, Any] = {
         "planned_iterations": int(runtime_goal.get("max_iterations", args.iterations)),
         "advisor_success_count": 0,
@@ -3304,6 +3541,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         "new_best_update_count": 0,
         "current_iteration_version": "",
         "history_strategy_total_count": 0,
+        "random_sample_enabled": bool(random_sample_plan.get("enabled")),
+        "random_sample_windows_count": len(random_sample_plan.get("windows", []) or []),
+        "random_sample_total_backtests": 0,
         "version_statuses": version_statuses,
     }
 
@@ -3330,6 +3570,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "is_best": False,
             "invalid_reason": "",
             "final_score": 0.0,
+            "random_sample_status": "skipped",
+            "random_sample_count": 0,
         }
         version_statuses.append(status)
         advisor_runtime.begin_call()
@@ -3362,6 +3604,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         trade_count_warning = str(round_state["trade_count_warning"])
         summary_write_failed = False
         backtest_errors: list[dict[str, Any]] = round_state["backtest_errors"]
+        random_sample_metrics: list[dict[str, Any]] = round_state["random_sample_metrics"]
+        random_sample_errors: list[dict[str, Any]] = round_state["random_sample_errors"]
+        random_sample_observation: dict[str, Any] = round_state["random_sample_observation"]
 
         def current_ai_models_used() -> dict[str, Any]:
             return {
@@ -3401,6 +3646,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 "validation_strong": validation_strong,
                 "trade_count_warning": trade_count_warning,
                 "backtest_errors": backtest_errors,
+                "random_sample_metrics": random_sample_metrics,
+                "random_sample_usage": dict(RANDOM_SAMPLE_USAGE),
+                "random_sample_observation": random_sample_observation,
+                "random_sample_errors": random_sample_errors,
             })
 
         def write_iteration_summary(extra: dict[str, Any] | None = None) -> Path:
@@ -3509,7 +3758,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             if prev_train_trades == 0 else
             "优先保证训练区间有稳定交易，不要把过滤条件堆得过严。"
         )
-        last_round_summary = session_state.get("last_round_summary")
+        last_round_summary = _strip_random_samples_for_ai_prompt(session_state.get("last_round_summary"))
         last_round_failure = ""
         if isinstance(last_round_summary, dict) and last_round_summary:
             last_round_failure = str(last_round_summary.get("invalid_reason") or last_round_summary.get("failure_reason") or "通过")
@@ -3557,7 +3806,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         spec_prompt += "本次 run 已出现失败模式=" + _compact_prompt_json(session_state["common_failure_patterns_this_run"], 3000) + "\n"
         spec_prompt += "请不要重复上一轮失败方向；必须在 reason/session_parent_reason 中说明本轮为什么选择当前 mutation_type。\n"
         if last_run_summary_mem:
-            spec_prompt += "\n跨 run last_run_summary=" + _compact_prompt_json(last_run_summary_mem, 4000) + "\n"
+            spec_prompt += "\n跨 run last_run_summary=" + _compact_prompt_json(_strip_random_samples_for_ai_prompt(last_run_summary_mem), 4000) + "\n"
         spec_prompt += "\n跨 run strategy_lessons=" + _compact_prompt_json(lessons_items[-memory_max_items:], 4000) + "\n"
         spec_prompt += "\n跨 run strategy_blacklist=" + _compact_prompt_json(blacklist_items[-memory_max_items:], 4000) + "\n"
         spec_prompt += f"\nchampion_strategy_class={_strategy_label(in_memory_champion, 'baseline')}\n"
@@ -4313,6 +4562,29 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 holdout_reason = "未找到可执行 holdout 区间，未执行 holdout"
         elif holdout_status == "not_run" and not holdout_reason:
             holdout_reason = "未达到候选 best 条件，未执行 holdout"
+
+        if random_sample_plan.get("enabled"):
+            random_sample_metrics, random_sample_errors, random_sample_status = run_random_sample_backtests(
+                plan=random_sample_plan,
+                train_cmd=train_cmd,
+                results_dir=results_dir,
+                version_dir=version_dir,
+                class_name=class_name,
+            )
+            random_sample_observation = summarize_random_sample_observation(random_sample_metrics)
+            status["random_sample_status"] = random_sample_status
+            status["random_sample_count"] = len(random_sample_metrics)
+            iteration_stats["random_sample_total_backtests"] += len(random_sample_metrics) + len(random_sample_errors)
+            write_json(version_dir / "random_sample_metrics.json", {
+                "usage": dict(RANDOM_SAMPLE_USAGE),
+                "metrics": random_sample_metrics,
+                "observation": random_sample_observation,
+                "errors": random_sample_errors,
+            })
+            print_random_sample_observation(random_sample_metrics)
+        else:
+            status["random_sample_status"] = "skipped"
+            status["random_sample_count"] = 0
         if not is_best and not reason_detail:
             reason_detail = _build_not_best_reason_detail(
                 train_metrics=train_metrics,
@@ -4516,9 +4788,18 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             best_entry_tag_metrics = list(bsd.get("entry_tag_metrics", []) or [])
     trade_count_warning = next((str(r.get("trade_count_warning")) for r in leaderboard_sorted if r.get("trade_count_warning")), "")
     all_backtest_errors: list[dict[str, Any]] = []
+    random_sample_run_observations: list[dict[str, Any]] = []
     for summary_file in sorted(run_dir.glob("v*/summary.json")):
         try:
-            all_backtest_errors.extend(read_json(summary_file).get("backtest_errors", []) or [])
+            summary_for_errors = read_json(summary_file)
+            all_backtest_errors.extend(summary_for_errors.get("backtest_errors", []) or [])
+            observation = summary_for_errors.get("random_sample_observation") or {}
+            if observation.get("count"):
+                random_sample_run_observations.append({
+                    "version": summary_file.parent.name,
+                    "strategy_class": summary_for_errors.get("strategy_class", ""),
+                    **observation,
+                })
         except Exception:
             continue
     _print_backtest_mismatch_summary(all_backtest_errors)
@@ -4546,6 +4827,15 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         "failed_versions": [r.get("version") for r in invalid_rows],
         "common_failure_patterns": common_failure_patterns,
         "backtest_errors": all_backtest_errors,
+        "random_sample_observation_only": True,
+        "random_sample_summary": {
+            "enabled": bool(random_sample_plan.get("enabled")),
+            "windows_count": len(random_sample_plan.get("windows", []) or []),
+            "used_for_final_score": False,
+            "used_for_best_selection": False,
+            "used_for_ai_prompt": False,
+            "observations": random_sample_run_observations,
+        },
         "nearest_advisor_notes": nearest_advisor_notes,
         "recommended_next_mutation_types": ["add_entry_filter", "tighten_entry_trigger", "remove_bad_entry_condition", "pair_specific_filter", "tag_specific_filter"],
         "forbidden_next_mutation_types": sorted(set(used_failed_mutations).union(session_state.get("failed_mutation_types_this_run", []))),
@@ -4788,6 +5078,12 @@ def main() -> None:
     parser.add_argument("--manual-ai-task-dir", default=None, help="半自动任务包目录，可用于读取 generated_mutation_spec.json 等上下文")
     parser.add_argument("--manual-git-push", action="store_true", default=False, help="生成任务包后自动 git add / commit / push")
     parser.add_argument("--manual-git-branch", default=None, help="半自动任务包 Git 分支；默认 ai-manual/<task_name>")
+    parser.add_argument("--random-sample-windows", type=int, default=0, help="每个策略在正式训练/验证/holdout/best 判断后额外随机采样回测窗口数；默认 0 关闭")
+    parser.add_argument("--random-sample-min-days", type=int, default=25, help="随机采样窗口最小天数，默认 25")
+    parser.add_argument("--random-sample-max-days", type=int, default=35, help="随机采样窗口最大天数，默认 35")
+    parser.add_argument("--random-sample-data-start", default=None, help="随机采样数据起始日期 YYYYMMDD，例如 20260101")
+    parser.add_argument("--random-sample-data-end", default=None, help="随机采样数据结束日期 YYYYMMDD，例如 20260601")
+    parser.add_argument("--random-sample-seed", default=None, help="随机采样种子；默认 None")
     log_push_group = parser.add_mutually_exclusive_group()
     log_push_group.add_argument("--push-logs-to-git", dest="push_logs_to_git", action="store_true", default=None, help="强制开启运行日志推送到独立日志仓库")
     log_push_group.add_argument("--no-push-logs-to-git", dest="push_logs_to_git", action="store_false", help="强制关闭运行日志推送到独立日志仓库")
@@ -4796,6 +5092,20 @@ def main() -> None:
     args = parser.parse_args()
     if args.manual_ai_prepare and args.manual_ai_run:
         parser.error("--manual-ai-prepare 和 --manual-ai-run 不能同时使用")
+    if args.random_sample_windows < 0:
+        parser.error("--random-sample-windows 不能小于 0")
+    if args.random_sample_windows > 0:
+        if not args.random_sample_data_start or not args.random_sample_data_end:
+            parser.error("启用 --random-sample-windows 时必须同时提供 --random-sample-data-start 和 --random-sample-data-end")
+        if args.random_sample_min_days <= 0 or args.random_sample_max_days < args.random_sample_min_days:
+            parser.error("--random-sample-min-days 必须大于 0，且不能大于 --random-sample-max-days")
+        try:
+            start = _parse_yyyymmdd(args.random_sample_data_start, "--random-sample-data-start")
+            end = _parse_yyyymmdd(args.random_sample_data_end, "--random-sample-data-end")
+        except ValueError as exc:
+            parser.error(str(exc))
+        if end <= start:
+            parser.error("--random-sample-data-end 必须晚于 --random-sample-data-start")
     lock_fp = acquire_auto_optimize_lock(args.allow_concurrent_runs)
     if lock_fp is False:
         return

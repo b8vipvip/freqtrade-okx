@@ -256,3 +256,39 @@ def test_common_failure_patterns_are_data_driven_not_fixed() -> None:
     assert "验证区间表现不稳定" in patterns
     assert "固定止损吞噬 ROI" in patterns
     assert "PF 低" in patterns
+
+
+def test_random_sample_plan_respects_bounds_overlap_and_holdout(tmp_path) -> None:
+    args = optimizer.argparse.Namespace(
+        random_sample_windows=3,
+        random_sample_min_days=25,
+        random_sample_max_days=35,
+        random_sample_data_start="20260101",
+        random_sample_data_end="20260430",
+        random_sample_seed="unit-test",
+    )
+    runtime_goal = {"holdout_ranges": [{"label": "holdout", "timerange": "20260201-20260301"}]}
+
+    plan = optimizer.build_random_sample_plan(args, runtime_goal, tmp_path)
+
+    assert (tmp_path / "random_sample_plan.json").exists()
+    assert plan["enabled"] is True
+    assert len(plan["windows"]) == 3
+    for window in plan["windows"]:
+        assert 25 <= window["days"] <= 35
+        assert window["timerange"] != "20260201-20260301"
+    for idx, left in enumerate(plan["windows"]):
+        for right in plan["windows"][idx + 1 :]:
+            assert optimizer._timerange_overlap_days(left["timerange"], right["timerange"]) <= 7
+
+
+def test_strip_random_samples_for_ai_prompt_removes_observation_only_fields() -> None:
+    payload = {
+        "final_score": 12.3,
+        "random_sample_metrics": [{"label": "random_001"}],
+        "nested": {"random_sample_summary": {"enabled": True}, "keep": "value"},
+    }
+
+    stripped = optimizer._strip_random_samples_for_ai_prompt(payload)
+
+    assert stripped == {"final_score": 12.3, "nested": {"keep": "value"}}
