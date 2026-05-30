@@ -78,5 +78,24 @@
     "max_drawdown_pct": 1.45,
     "total_trades": 47
   },
+  "prompt_guidance": {
+  "advisor_rules": [
+    "当前不要继续单纯收紧 ETH/USDT。",
+    "上一轮 add_entry_filter 导致训练交易数只有 10，说明过滤过猛。",
+    "本轮必须保持训练交易数 20~30。",
+    "优先改善 202603 亏损，但不能以大幅降低交易数为代价。",
+    "禁止生成训练交易数低于 18 的过滤器。",
+    "不要继续生成与 v001/v004 行为几乎一致的策略。",
+    "固定止损吞噬 ROI 是核心问题，但不要扩大 stoploss，应通过提高入场质量或优化 ROI 覆盖解决。"
+  ],
+  "codegen_rules": [
+    "必须真实落地 mutation_spec。",
+    "禁止只改 class name、注释、变量名。",
+    "如果新增过滤条件，populate_entry_trend 必须实际出现对应条件。",
+    "如果新增指标，populate_indicators 必须实际计算。",
+    "如果生成的策略与父策略行为等价，应主动报错，不要输出等价代码。",
+    "上一轮如果因为策略重复失败，本轮禁止继续使用同一个 codegen provider，且必须改变 entry_conditions 或 indicators，不允许只改变类名、注释、变量名。"
+  ]
+  },
   "language": "zh-CN"
 }
