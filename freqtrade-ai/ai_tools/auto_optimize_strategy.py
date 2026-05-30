@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import fcntl
 import hashlib
 import json
 import os
@@ -51,6 +52,7 @@ LESSONS_EXAMPLE_FILE = ROOT_DIR / "ai_tools" / "strategy_lessons.example.json"
 MODEL_CONFIG_FILE = ROOT_DIR / "ai_tools" / "model_config.json"
 MODEL_CONFIG_EXAMPLE_FILE = ROOT_DIR / "ai_tools" / "model_config.example.json"
 TIMERANGE_RE = re.compile(r"^\d{8}-\d{8}$")
+AUTO_OPTIMIZE_LOCK_FILE = Path("/tmp/freqtrade_ai_auto_optimize.lock")
 
 
 def load_dotenv_file(path: Path) -> None:
@@ -773,17 +775,21 @@ def _list_backtest_zips(results_dir: Path) -> list[Path]:
     return sorted(results_dir.glob("backtest-result-*.zip"), key=lambda p: p.stat().st_mtime)
 
 
-def _select_backtest_zip(results_dir: Path, before_set: set[Path], cmd_end_ts: float) -> Path:
-    all_zips = _list_backtest_zips(results_dir)
-    new_zips = [z for z in all_zips if z not in before_set]
-    candidates = new_zips if new_zips else [z for z in all_zips if z.stat().st_mtime >= cmd_end_ts]
-    if not candidates:
-        raise FileNotFoundError("未找到本轮回测新增的 backtest-result-*.zip")
-    return sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)[0]
+def _backtest_zip_candidates(results_dir: Path, started_at: float, existing_zips: set[Path]) -> list[Path]:
+    """Return only zips that could have been produced by the current backtest."""
+    candidates: list[Path] = []
+    for zip_path in _list_backtest_zips(results_dir):
+        try:
+            is_new = zip_path not in existing_zips
+            is_recent = zip_path.stat().st_mtime >= started_at
+        except OSError:
+            continue
+        if is_new or is_recent:
+            candidates.append(zip_path)
+    return sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
-def parse_backtest_from_zip(zip_path: Path, strategy_class: str) -> dict[str, Any]:
-    print(f"正在解析 zip: {zip_path}")
+def _read_backtest_zip_payload(zip_path: Path) -> tuple[dict[str, Any], str]:
     with zipfile.ZipFile(zip_path) as zf:
         names = [
             n for n in zf.namelist()
@@ -795,18 +801,135 @@ def parse_backtest_from_zip(zip_path: Path, strategy_class: str) -> dict[str, An
         if not primary:
             raise RuntimeError(f"zip 内未找到 backtest-result-*.json: {zip_path}")
         json_name = sorted(primary)[-1]
-        print(f"正在读取 json: {json_name}")
         with zf.open(json_name) as fp:
             data = json.load(fp)
+    if not isinstance(data, dict):
+        raise RuntimeError(f"回测结果 JSON 顶层不是 object: {zip_path}")
+    return data, json_name
+
+
+def _read_backtest_zip_strategy_keys(zip_path: Path) -> list[str]:
+    data, _ = _read_backtest_zip_payload(zip_path)
+    strategy_data = data.get("strategy")
+    if not isinstance(strategy_data, dict):
+        return []
+    return sorted(str(k) for k in strategy_data.keys())
+
+
+def find_backtest_zip_for_strategy(
+    backtest_dir: Path,
+    strategy_class: str,
+    started_at: float,
+    existing_zips: set[Path],
+) -> tuple[Path | None, list[dict[str, Any]]]:
+    """Find a current-run backtest zip whose strategy keys include strategy_class."""
+    details: list[dict[str, Any]] = []
+    for zip_path in _backtest_zip_candidates(backtest_dir, started_at, existing_zips):
+        try:
+            strategy_keys = _read_backtest_zip_strategy_keys(zip_path)
+            error = ""
+        except Exception as exc:  # noqa: BLE001 - bad zips must not stop optimization.
+            strategy_keys = []
+            error = f"{type(exc).__name__}: {exc}"
+        details.append({"zip": str(zip_path), "actual_strategies": strategy_keys, "error": error})
+        if strategy_class in strategy_keys:
+            return zip_path, details
+    return None, details
+
+
+def _log_backtest_zip_filter_failure(strategy_class: str, candidates: list[dict[str, Any]]) -> None:
+    print("回测结果 zip 筛选失败：")
+    print(f"期望策略：{strategy_class}")
+    print("候选 zip：")
+    if not candidates:
+        print("- 无")
+    for item in candidates:
+        actual = ", ".join(item.get("actual_strategies") or []) or "无"
+        suffix = f"，读取错误：{item.get('error')}" if item.get("error") else ""
+        print(f"- {item.get('zip')}，实际策略：{actual}{suffix}")
+    print("处理结果：当前区间回测结果无效，当前轮标记无效，继续下一轮。")
+
+
+def _copy_backtest_zip_to_version(zip_path: Path, version_dir: Path, stage: str, timerange: str, label: str | None = None) -> Path:
+    safe_label = f"_{re.sub(r'[^A-Za-z0-9_.-]+', '_', label)}" if label else ""
+    dest_name = f"{stage}{safe_label}_{timerange}.zip"
+    dest = version_dir / "backtests" / dest_name
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(zip_path, dest)
+    return dest
+
+
+def _write_backtest_process_log(version_dir: Path, stage: str, timerange: str, cp: subprocess.CompletedProcess[str]) -> Path:
+    log_dir = version_dir / "backtest_logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    safe_stage = re.sub(r"[^A-Za-z0-9_.-]+", "_", stage)
+    safe_timerange = re.sub(r"[^A-Za-z0-9_.-]+", "_", timerange)
+    path = log_dir / f"{safe_stage}_{safe_timerange}.log"
+    path.write_text(
+        f"[{stage} {timerange}]\nRETURNCODE: {cp.returncode}\nSTDOUT:\n{cp.stdout}\n\nSTDERR:\n{cp.stderr}\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _record_backtest_error(
+    errors: list[dict[str, Any]],
+    *,
+    stage: str,
+    timerange: str,
+    expected_strategy: str,
+    error: str,
+    wrong_zip: str = "",
+    actual_strategies: list[str] | None = None,
+) -> None:
+    errors.append({
+        "stage": stage,
+        "timerange": timerange,
+        "expected_strategy": expected_strategy,
+        "wrong_zip": wrong_zip,
+        "actual_strategies": actual_strategies or [],
+        "error": error,
+    })
+
+
+def _print_backtest_mismatch_summary(errors: list[dict[str, Any]]) -> None:
+    mismatch_errors = [e for e in errors if e.get("error") in {"wrong_strategy_zip_detected", "backtest_parse_failed", "zip_missing"}]
+    if not mismatch_errors:
+        return
+    print("\n检测到回测 zip 错配：")
+    for item in mismatch_errors:
+        actual = ", ".join(item.get("actual_strategies") or []) or "未知"
+        print(f"当前策略：{item.get('expected_strategy')}")
+        print(f"错误 zip 实际策略：{actual}")
+        if item.get("wrong_zip"):
+            print(f"错误 zip：{item.get('wrong_zip')}")
+    print("原因：可能存在并发回测或全局 latest zip 误判。")
+    print("处理：当前轮已标记无效，程序继续后续轮次。")
+
+
+def parse_backtest_from_zip(zip_path: Path, strategy_class: str, strict: bool = True) -> tuple[dict[str, Any] | None, list[str]]:
+    print(f"正在解析 zip: {zip_path}")
+    try:
+        data, json_name = _read_backtest_zip_payload(zip_path)
+    except Exception:
+        if strict:
+            raise
+        return None, []
+    print(f"正在读取 json: {json_name}")
 
     strategy_data = data.get("strategy")
     if not isinstance(strategy_data, dict):
-        raise RuntimeError("回测结果缺少 strategy 字段")
+        if strict:
+            raise RuntimeError("回测结果缺少 strategy 字段")
+        return None, []
+    actual_strategy_keys = sorted(str(k) for k in strategy_data.keys())
     if strategy_class not in strategy_data:
-        raise RuntimeError(f"未在回测结果中找到当前策略 {strategy_class}")
+        if strict:
+            raise RuntimeError(f"未在回测结果中找到当前策略 {strategy_class}，实际策略：{actual_strategy_keys}")
+        return None, actual_strategy_keys
     result = strategy_data[strategy_class]
     print(f"找到策略: {strategy_class}")
-    return result
+    return result, actual_strategy_keys
 
 
 def run_cmd(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -825,8 +948,14 @@ def run_single_backtest_metrics(config: str, class_name: str, timeframe: str, ti
     cp = run_cmd(cmd, ROOT_DIR)
     if cp.returncode != 0:
         raise RuntimeError(f"回测失败：{class_name}\n{cp.stderr}")
-    result_zip = _select_backtest_zip(results_dir, before_zips, start_ts)
-    return _extract_metrics(parse_backtest_from_zip(result_zip, class_name))
+    result_zip, candidates = find_backtest_zip_for_strategy(results_dir, class_name, start_ts, before_zips)
+    if result_zip is None:
+        _log_backtest_zip_filter_failure(class_name, candidates)
+        raise RuntimeError(f"未找到包含当前策略 {class_name} 的本次回测 zip")
+    result, actual_keys = parse_backtest_from_zip(result_zip, class_name, strict=False)
+    if result is None:
+        raise RuntimeError(f"未在回测结果中找到当前策略 {class_name}，实际策略：{actual_keys}")
+    return _extract_metrics(result)
 
 
 def _safe_float(value: Any) -> float:
@@ -1368,6 +1497,7 @@ def _new_round_defaults() -> dict[str, Any]:
         "cannot_be_official_best_unless_validation_strong": False,
         "validation_strong": False,
         "trade_count_warning": "",
+        "backtest_errors": [],
     }
 
 
@@ -1431,6 +1561,7 @@ def _minimal_round_summary(
         "cannot_be_official_best_unless_validation_strong": bool(state.get("cannot_be_official_best_unless_validation_strong", False)),
         "validation_strong": bool(state.get("validation_strong", False)),
         "trade_count_warning": state.get("trade_count_warning", ""),
+        "backtest_errors": state.get("backtest_errors", []),
     }
 
 
@@ -2660,13 +2791,14 @@ def run_manual_ai_backtest(runtime_goal: dict[str, Any], args: argparse.Namespac
     }
     status = {"version": ver, "strategy_class": class_name, "advisor_status": "半自动跳过", "codegen_status": "半自动外部生成", "syntax_check_status": "未执行", "static_check_status": "未执行", "train_backtest_status": "未执行", "validation_backtest_status": "未执行", "is_valid": False, "is_best": False, "invalid_reason": "", "final_score": 0.0}
     iteration_stats["version_statuses"].append(status)
+    backtest_errors: list[dict[str, Any]] = []
 
     def finish_invalid(reason: str) -> None:
         status["invalid_reason"] = reason
         status["is_valid"] = False
         iteration_stats["invalid_strategy_count"] = 1
         summary = _minimal_round_summary(version=ver, strategy_class=class_name, strategy_file=str(strategy_file), state=_new_round_defaults(), mutation_type=mutation_type, failure_reason=reason)
-        summary.update({"manual_ai_mode": True, "manual_strategy_source": str(strategy_source), "ai_models_used": {"strategy_advisor": {"used_model": "manual_disabled", "attempts": []}, "code_generator": {"used_model": "manual_disabled", "attempts": []}}})
+        summary.update({"manual_ai_mode": True, "manual_strategy_source": str(strategy_source), "backtest_errors": backtest_errors, "ai_models_used": {"strategy_advisor": {"used_model": "manual_disabled", "attempts": []}, "code_generator": {"used_model": "manual_disabled", "attempts": []}}})
         write_json(version_dir / "summary.json", summary)
         write_json(run_dir / "leaderboard.json", {"items": [{"version": ver, "run_id": run_id, "strategy_class": class_name, "strategy_file": str(strategy_file), "is_valid": False, "is_best": False, "invalid_reason": reason, "final_score": 0.0}]})
         write_json(run_dir / ITERATION_STATS_FILE_NAME, iteration_stats)
@@ -2705,13 +2837,27 @@ def run_manual_ai_backtest(runtime_goal: dict[str, Any], args: argparse.Namespac
     before = set(_list_backtest_zips(results_dir))
     ts = time.time()
     cp = run_cmd(train_cmd, ROOT_DIR)
+    _write_backtest_process_log(version_dir, "train", train.timerange, cp)
     (version_dir / "backtest_logs.txt").write_text(f"[Train {train.timerange}]\nSTDOUT:\n{cp.stdout}\n\nSTDERR:\n{cp.stderr}\n", encoding="utf-8")
     if cp.returncode != 0:
         print(cp.stderr)
         finish_invalid("训练区间回测失败")
         return
-    train_zip = _select_backtest_zip(results_dir, before, ts)
-    train_metrics = _extract_metrics(parse_backtest_from_zip(train_zip, class_name))
+    train_zip, train_candidates = find_backtest_zip_for_strategy(results_dir, class_name, ts, before)
+    if train_zip is None:
+        _log_backtest_zip_filter_failure(class_name, train_candidates)
+        actual = list(train_candidates[0].get("actual_strategies") or []) if train_candidates else []
+        wrong_zip = str(train_candidates[0].get("zip") or "") if train_candidates else ""
+        _record_backtest_error(backtest_errors, stage="train", timerange=train.timerange, expected_strategy=class_name, wrong_zip=wrong_zip, actual_strategies=actual, error="wrong_strategy_zip_detected" if wrong_zip else "zip_missing")
+        finish_invalid("训练区间回测结果 zip 不匹配或缺失")
+        return
+    train_zip_local = _copy_backtest_zip_to_version(train_zip, version_dir, "train", train.timerange)
+    train_result, actual_train_keys = parse_backtest_from_zip(train_zip_local, class_name, strict=False)
+    if train_result is None:
+        _record_backtest_error(backtest_errors, stage="train", timerange=train.timerange, expected_strategy=class_name, wrong_zip=str(train_zip), actual_strategies=actual_train_keys, error="backtest_parse_failed")
+        finish_invalid("训练区间回测结果解析失败")
+        return
+    train_metrics = _extract_metrics(train_result)
     pair_metrics = _normalize_pair_metrics(train_metrics.get("pairs", []))
     entry_tag_metrics = _normalize_entry_tag_metrics(train_metrics.get("entry_tags", []))
     write_json(version_dir / "train_metrics.json", train_metrics)
@@ -2755,18 +2901,36 @@ def run_manual_ai_backtest(runtime_goal: dict[str, Any], args: argparse.Namespac
             before = set(_list_backtest_zips(results_dir))
             ts = time.time()
             vcp = run_cmd(vcmd, ROOT_DIR)
+            _write_backtest_process_log(version_dir, f"validation_{p.name}", p.timerange, vcp)
             with (version_dir / "backtest_logs.txt").open("a", encoding="utf-8") as logf:
                 logf.write(f"\n[Validation {p.name} {p.timerange}]\nSTDOUT:\n{vcp.stdout}\n\nSTDERR:\n{vcp.stderr}\n")
             if vcp.returncode != 0:
                 print(vcp.stderr)
-                continue
-            vzip = _select_backtest_zip(results_dir, before, ts)
-            vm = _extract_metrics(parse_backtest_from_zip(vzip, class_name))
+                _record_backtest_error(backtest_errors, stage="validation", timerange=p.timerange, expected_strategy=class_name, error="backtest_failed")
+                validation_status = "backtest_failed"
+                break
+            vzip, v_candidates = find_backtest_zip_for_strategy(results_dir, class_name, ts, before)
+            if vzip is None:
+                _log_backtest_zip_filter_failure(class_name, v_candidates)
+                actual = list(v_candidates[0].get("actual_strategies") or []) if v_candidates else []
+                wrong_zip = str(v_candidates[0].get("zip") or "") if v_candidates else ""
+                _record_backtest_error(backtest_errors, stage="validation", timerange=p.timerange, expected_strategy=class_name, wrong_zip=wrong_zip, actual_strategies=actual, error="wrong_strategy_zip_detected" if wrong_zip else "zip_missing")
+                validation_status = "backtest_parse_failed"
+                break
+            vzip_local = _copy_backtest_zip_to_version(vzip, version_dir, "validation", p.timerange)
+            v_result, actual_v_keys = parse_backtest_from_zip(vzip_local, class_name, strict=False)
+            if v_result is None:
+                _record_backtest_error(backtest_errors, stage="validation", timerange=p.timerange, expected_strategy=class_name, wrong_zip=str(vzip), actual_strategies=actual_v_keys, error="backtest_parse_failed")
+                validation_status = "backtest_parse_failed"
+                break
+            vm = _extract_metrics(v_result)
             validation_metrics.append({"period": p.name, "timerange": p.timerange, "metrics": vm})
             val_scores.append(_score(vm, p))
             iteration_stats["validation_backtest_total_count"] += 1
             _print_round_table(ver, p.timerange, vm)
-        if validation_metrics:
+        if validation_status in {"backtest_failed", "backtest_parse_failed"}:
+            status["validation_backtest_status"] = "失败"
+        elif validation_metrics:
             validation_status = "completed"
             status["validation_backtest_status"] = "已验证回测"
             iteration_stats["validation_backtest_count"] = 1
@@ -2794,6 +2958,11 @@ def run_manual_ai_backtest(runtime_goal: dict[str, Any], args: argparse.Namespac
     elif train_trades > max_trades:
         is_valid = False
         invalid_reason = "训练区间交易数超过目标上限"
+    if backtest_errors:
+        is_valid = False
+        is_best = False
+        final_score = 0
+        invalid_reason = invalid_reason or "回测结果解析失败或 zip 不匹配"
     elif is_valid and not baseline_ok:
         is_valid = False
         invalid_reason = baseline_reason or "未通过 baseline 检查"
@@ -2817,10 +2986,26 @@ def run_manual_ai_backtest(runtime_goal: dict[str, Any], args: argparse.Namespac
             before = set(_list_backtest_zips(results_dir))
             ts = time.time()
             hcp = run_cmd(hcmd, ROOT_DIR)
+            _write_backtest_process_log(version_dir, f"holdout_{idx:02d}", h_timerange, hcp)
             if hcp.returncode != 0:
-                continue
-            hzip = _select_backtest_zip(results_dir, before, ts)
-            hm = _extract_metrics(parse_backtest_from_zip(hzip, class_name))
+                _record_backtest_error(backtest_errors, stage="holdout", timerange=h_timerange, expected_strategy=class_name, error="backtest_failed")
+                holdout_failed = True
+                break
+            hzip, h_candidates = find_backtest_zip_for_strategy(results_dir, class_name, ts, before)
+            if hzip is None:
+                _log_backtest_zip_filter_failure(class_name, h_candidates)
+                actual = list(h_candidates[0].get("actual_strategies") or []) if h_candidates else []
+                wrong_zip = str(h_candidates[0].get("zip") or "") if h_candidates else ""
+                _record_backtest_error(backtest_errors, stage="holdout", timerange=h_timerange, expected_strategy=class_name, wrong_zip=wrong_zip, actual_strategies=actual, error="wrong_strategy_zip_detected" if wrong_zip else "zip_missing")
+                holdout_failed = True
+                break
+            hzip_local = _copy_backtest_zip_to_version(hzip, version_dir, "holdout", h_timerange, str(h.get("label") or f"holdout_{idx:02d}"))
+            h_result, actual_h_keys = parse_backtest_from_zip(hzip_local, class_name, strict=False)
+            if h_result is None:
+                _record_backtest_error(backtest_errors, stage="holdout", timerange=h_timerange, expected_strategy=class_name, wrong_zip=str(hzip), actual_strategies=actual_h_keys, error="backtest_parse_failed")
+                holdout_failed = True
+                break
+            hm = _extract_metrics(h_result)
             holdout_metrics.append({"label": str(h.get("label") or f"holdout_{idx:02d}"), "timerange": h_timerange, "metrics": hm})
             if _safe_float(hm.get("profit_total_pct")) < -2.5 or _safe_float(hm.get("profit_factor")) < 0.45 or _safe_float(hm.get("max_drawdown_pct")) > 3.0:
                 holdout_failed = True
@@ -2876,6 +3061,7 @@ def run_manual_ai_backtest(runtime_goal: dict[str, Any], args: argparse.Namespac
         "cannot_be_official_best_unless_validation_strong": cannot_be_official_best_unless_validation_strong,
         "validation_strong": validation_strong,
         "trade_count_warning": trade_count_warning,
+        "backtest_errors": backtest_errors,
         "ai_models_used": {"strategy_advisor": {"used_model": "manual_disabled", "attempts": []}, "code_generator": {"used_model": "manual_disabled", "attempts": []}},
     }
     write_json(version_dir / "summary.json", summary)
@@ -3076,6 +3262,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         validation_strong = bool(round_state["validation_strong"])
         trade_count_warning = str(round_state["trade_count_warning"])
         summary_write_failed = False
+        backtest_errors: list[dict[str, Any]] = round_state["backtest_errors"]
 
         def current_ai_models_used() -> dict[str, Any]:
             return {
@@ -3114,6 +3301,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 "cannot_be_official_best_unless_validation_strong": cannot_be_official_best_unless_validation_strong,
                 "validation_strong": validation_strong,
                 "trade_count_warning": trade_count_warning,
+                "backtest_errors": backtest_errors,
             })
 
         def write_iteration_summary(extra: dict[str, Any] | None = None) -> Path:
@@ -3454,18 +3642,60 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         train_before_zips = set(_list_backtest_zips(results_dir))
         train_start_ts = time.time()
         train_cp = run_cmd(train_cmd, ROOT_DIR)
+        _write_backtest_process_log(version_dir, "train", train.timerange, train_cp)
         (version_dir / "backtest_logs.txt").write_text(
-            f"[Train {train.timerange}]\nSTDOUT:\n{train_cp.stdout}\n\nSTDERR:\n{train_cp.stderr}\n",
+            f"[Train {train.timerange}]\nRETURNCODE: {train_cp.returncode}\nSTDOUT:\n{train_cp.stdout}\n\nSTDERR:\n{train_cp.stderr}\n",
             encoding="utf-8",
         )
         if train_cp.returncode != 0:
             print(train_cp.stderr)
-            if "Impossible to load Strategy" in (train_cp.stdout + train_cp.stderr):
-                raise RuntimeError(f"第 {i} 轮回测失败：Impossible to load Strategy（{class_name}）。已停止后续轮次。")
+            status["train_backtest_status"] = "失败"
+            invalid_reason = "训练区间回测失败"
+            _record_backtest_error(
+                backtest_errors,
+                stage="train",
+                timerange=train.timerange,
+                expected_strategy=class_name,
+                error="backtest_failed",
+            )
+            write_iteration_summary({"backtest_errors": backtest_errors})
+            iteration_stats["invalid_strategy_count"] += 1
+            status["is_valid"] = False
+            status["invalid_reason"] = invalid_reason
+            flush_iteration_stats()
             continue
         print("正在解析回测结果……")
-        train_zip = _select_backtest_zip(results_dir, train_before_zips, train_start_ts)
-        train_result = parse_backtest_from_zip(train_zip, class_name)
+        train_zip, train_candidates = find_backtest_zip_for_strategy(results_dir, class_name, train_start_ts, train_before_zips)
+        if train_zip is None:
+            _log_backtest_zip_filter_failure(class_name, train_candidates)
+            actual = []
+            wrong_zip = ""
+            if train_candidates:
+                wrong_zip = str(train_candidates[0].get("zip") or "")
+                actual = list(train_candidates[0].get("actual_strategies") or [])
+            _record_backtest_error(backtest_errors, stage="train", timerange=train.timerange, expected_strategy=class_name, wrong_zip=wrong_zip, actual_strategies=actual, error="wrong_strategy_zip_detected" if wrong_zip else "zip_missing")
+            _print_backtest_mismatch_summary(backtest_errors)
+            status["train_backtest_status"] = "解析失败"
+            invalid_reason = "训练区间回测结果 zip 不匹配或缺失"
+            write_iteration_summary({"backtest_errors": backtest_errors})
+            iteration_stats["invalid_strategy_count"] += 1
+            status["is_valid"] = False
+            status["invalid_reason"] = invalid_reason
+            flush_iteration_stats()
+            continue
+        train_zip_local = _copy_backtest_zip_to_version(train_zip, version_dir, "train", train.timerange)
+        train_result, actual_train_keys = parse_backtest_from_zip(train_zip_local, class_name, strict=False)
+        if train_result is None:
+            _record_backtest_error(backtest_errors, stage="train", timerange=train.timerange, expected_strategy=class_name, wrong_zip=str(train_zip), actual_strategies=actual_train_keys, error="backtest_parse_failed")
+            _print_backtest_mismatch_summary(backtest_errors)
+            status["train_backtest_status"] = "解析失败"
+            invalid_reason = "训练区间回测结果解析失败"
+            write_iteration_summary({"backtest_errors": backtest_errors})
+            iteration_stats["invalid_strategy_count"] += 1
+            status["is_valid"] = False
+            status["invalid_reason"] = invalid_reason
+            flush_iteration_stats()
+            continue
         train_metrics = _extract_metrics(train_result)
         pair_metrics = _normalize_pair_metrics(train_metrics.get("pairs", []))
         entry_tag_metrics = _normalize_entry_tag_metrics(train_metrics.get("entry_tags", []))
@@ -3521,19 +3751,45 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 val_before_zips = set(_list_backtest_zips(results_dir))
                 val_start_ts = time.time()
                 val_cp = run_cmd(vcmd, ROOT_DIR)
+                _write_backtest_process_log(version_dir, f"validation_{p.name}", p.timerange, val_cp)
                 with (version_dir / "backtest_logs.txt").open("a", encoding="utf-8") as logf:
-                    logf.write(f"\n[Validation {p.name} {p.timerange}]\nSTDOUT:\n{val_cp.stdout}\n\nSTDERR:\n{val_cp.stderr}\n")
+                    logf.write(f"\n[Validation {p.name} {p.timerange}]\nRETURNCODE: {val_cp.returncode}\nSTDOUT:\n{val_cp.stdout}\n\nSTDERR:\n{val_cp.stderr}\n")
                 if val_cp.returncode != 0:
                     print(val_cp.stderr)
-                    continue
+                    _record_backtest_error(backtest_errors, stage="validation", timerange=p.timerange, expected_strategy=class_name, error="backtest_failed")
+                    validation_status = "backtest_failed"
+                    invalid_reason = "验证区间回测失败"
+                    break
                 print("正在解析回测结果……")
-                val_zip = _select_backtest_zip(results_dir, val_before_zips, val_start_ts)
-                vm = _extract_metrics(parse_backtest_from_zip(val_zip, class_name))
+                val_zip, val_candidates = find_backtest_zip_for_strategy(results_dir, class_name, val_start_ts, val_before_zips)
+                if val_zip is None:
+                    _log_backtest_zip_filter_failure(class_name, val_candidates)
+                    actual = []
+                    wrong_zip = ""
+                    if val_candidates:
+                        wrong_zip = str(val_candidates[0].get("zip") or "")
+                        actual = list(val_candidates[0].get("actual_strategies") or [])
+                    _record_backtest_error(backtest_errors, stage="validation", timerange=p.timerange, expected_strategy=class_name, wrong_zip=wrong_zip, actual_strategies=actual, error="wrong_strategy_zip_detected" if wrong_zip else "zip_missing")
+                    _print_backtest_mismatch_summary(backtest_errors)
+                    validation_status = "backtest_parse_failed"
+                    invalid_reason = "验证区间回测结果 zip 不匹配或缺失"
+                    break
+                val_zip_local = _copy_backtest_zip_to_version(val_zip, version_dir, "validation", p.timerange)
+                val_result, actual_val_keys = parse_backtest_from_zip(val_zip_local, class_name, strict=False)
+                if val_result is None:
+                    _record_backtest_error(backtest_errors, stage="validation", timerange=p.timerange, expected_strategy=class_name, wrong_zip=str(val_zip), actual_strategies=actual_val_keys, error="backtest_parse_failed")
+                    _print_backtest_mismatch_summary(backtest_errors)
+                    validation_status = "backtest_parse_failed"
+                    invalid_reason = "验证区间回测结果解析失败"
+                    break
+                vm = _extract_metrics(val_result)
                 validation_metrics.append({"period": p.name, "timerange": p.timerange, "metrics": vm})
                 iteration_stats["validation_backtest_total_count"] += 1
                 _print_round_table(ver, p.timerange, vm)
                 val_scores.append(_score(vm, p))
-            if validation_metrics:
+            if validation_status in {"backtest_failed", "backtest_parse_failed"}:
+                status["validation_backtest_status"] = "失败"
+            elif validation_metrics:
                 validation_status = "completed"
                 status["validation_backtest_status"] = "已验证回测"
                 iteration_stats["validation_backtest_count"] += 1
@@ -3592,6 +3848,11 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         if is_valid and not baseline_ok:
             is_valid = False
             invalid_reason = baseline_reason
+        if backtest_errors:
+            is_valid = False
+            is_best = False
+            final_score = 0
+            invalid_reason = invalid_reason or "回测结果解析失败或 zip 不匹配"
         if not is_valid:
             previous_failure_reason = invalid_reason
         failure_reasons = []
@@ -3721,6 +3982,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "allow_near_min_trades_best": allow_near_min_trades_best,
             "min_trades_grace_ratio": min_trades_grace_ratio,
             "trade_count_warning": trade_count_warning,
+            "backtest_errors": backtest_errors,
         }
         summary_path = write_iteration_summary(summary)
         avg_validation_profit_pct, avg_validation_profit_factor, max_validation_drawdown_pct = _aggregate_validation_metrics(validation_metrics)
@@ -3801,10 +4063,37 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 before = set(_list_backtest_zips(results_dir))
                 ts = time.time()
                 hcp = run_cmd(hcmd, ROOT_DIR)
+                _write_backtest_process_log(version_dir, f"holdout_{h_label}", h_timerange, hcp)
                 if hcp.returncode != 0:
-                    continue
-                hzip = _select_backtest_zip(results_dir, before, ts)
-                hm = _extract_metrics(parse_backtest_from_zip(hzip, class_name))
+                    _record_backtest_error(backtest_errors, stage="holdout", timerange=h_timerange, expected_strategy=class_name, error="backtest_failed")
+                    holdout_failed = True
+                    holdout_status = "backtest_failed"
+                    holdout_reason = "holdout 回测失败"
+                    break
+                hzip, h_candidates = find_backtest_zip_for_strategy(results_dir, class_name, ts, before)
+                if hzip is None:
+                    _log_backtest_zip_filter_failure(class_name, h_candidates)
+                    actual = []
+                    wrong_zip = ""
+                    if h_candidates:
+                        wrong_zip = str(h_candidates[0].get("zip") or "")
+                        actual = list(h_candidates[0].get("actual_strategies") or [])
+                    _record_backtest_error(backtest_errors, stage="holdout", timerange=h_timerange, expected_strategy=class_name, wrong_zip=wrong_zip, actual_strategies=actual, error="wrong_strategy_zip_detected" if wrong_zip else "zip_missing")
+                    _print_backtest_mismatch_summary(backtest_errors)
+                    holdout_failed = True
+                    holdout_status = "backtest_parse_failed"
+                    holdout_reason = "holdout 回测结果 zip 不匹配或缺失"
+                    break
+                hzip_local = _copy_backtest_zip_to_version(hzip, version_dir, "holdout", h_timerange, h_label)
+                h_result, actual_h_keys = parse_backtest_from_zip(hzip_local, class_name, strict=False)
+                if h_result is None:
+                    _record_backtest_error(backtest_errors, stage="holdout", timerange=h_timerange, expected_strategy=class_name, wrong_zip=str(hzip), actual_strategies=actual_h_keys, error="backtest_parse_failed")
+                    _print_backtest_mismatch_summary(backtest_errors)
+                    holdout_failed = True
+                    holdout_status = "backtest_parse_failed"
+                    holdout_reason = "holdout 回测结果解析失败"
+                    break
+                hm = _extract_metrics(h_result)
                 holdout_metrics.append({"label": h_label, "timerange": h_timerange, "metrics": hm})
                 if _safe_float(hm.get("profit_total_pct")) < -2.5 or _safe_float(hm.get("profit_factor")) < 0.45 or _safe_float(hm.get("max_drawdown_pct")) > 3.0:
                     holdout_failed = True
@@ -3999,6 +4288,13 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             best_pair_metrics = list(bsd.get("pair_metrics", []) or [])
             best_entry_tag_metrics = list(bsd.get("entry_tag_metrics", []) or [])
     trade_count_warning = next((str(r.get("trade_count_warning")) for r in leaderboard_sorted if r.get("trade_count_warning")), "")
+    all_backtest_errors: list[dict[str, Any]] = []
+    for summary_file in sorted(run_dir.glob("v*/summary.json")):
+        try:
+            all_backtest_errors.extend(read_json(summary_file).get("backtest_errors", []) or [])
+        except Exception:
+            continue
+    _print_backtest_mismatch_summary(all_backtest_errors)
     common_failure_patterns = _build_common_failure_patterns(invalid_rows, target_cfg)
     nearest_advisor_notes = _build_nearest_advisor_notes(nearest_candidate)
     last_run_summary = {
@@ -4012,6 +4308,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         "trade_count_warning": trade_count_warning,
         "failed_versions": [r.get("version") for r in invalid_rows],
         "common_failure_patterns": common_failure_patterns,
+        "backtest_errors": all_backtest_errors,
         "nearest_advisor_notes": nearest_advisor_notes,
         "recommended_next_mutation_types": ["add_entry_filter", "tighten_entry_trigger", "remove_bad_entry_condition", "pair_specific_filter", "tag_specific_filter"],
         "forbidden_next_mutation_types": sorted(used_failed_mutations),
@@ -4175,6 +4472,36 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     print_log_saved_summary(args)
 
 
+
+def acquire_auto_optimize_lock(allow_concurrent_runs: bool) -> Any | None:
+    if allow_concurrent_runs:
+        return None
+    AUTO_OPTIMIZE_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lock_fp = AUTO_OPTIMIZE_LOCK_FILE.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("检测到已有自动优化任务正在运行。")
+        print("为避免回测 zip 互相污染，本次任务已中止。")
+        print("如确认没有任务在运行，可删除锁文件：")
+        print(f"rm -f {AUTO_OPTIMIZE_LOCK_FILE}")
+        lock_fp.close()
+        return False
+    lock_fp.seek(0)
+    lock_fp.truncate()
+    lock_fp.write(f"pid={os.getpid()} started_at={datetime.utcnow().isoformat()}Z\n")
+    lock_fp.flush()
+    return lock_fp
+
+
+def release_auto_optimize_lock(lock_fp: Any | None) -> None:
+    if not lock_fp:
+        return
+    try:
+        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
+    finally:
+        lock_fp.close()
+
 def main() -> None:
     load_project_env()
     parser = argparse.ArgumentParser()
@@ -4218,10 +4545,14 @@ def main() -> None:
     log_push_group.add_argument("--push-logs-to-git", dest="push_logs_to_git", action="store_true", default=None, help="强制开启运行日志推送到独立日志仓库")
     log_push_group.add_argument("--no-push-logs-to-git", dest="push_logs_to_git", action="store_false", help="强制关闭运行日志推送到独立日志仓库")
     parser.add_argument("--log-repo-path", default=None, help="覆盖 LOG_REPO_PATH，指定独立日志仓库本地路径")
+    parser.add_argument("--allow-concurrent-runs", action="store_true", default=False, help="允许多个 auto_optimize_strategy.py 并发运行（默认禁止，避免回测 zip 污染）")
     args = parser.parse_args()
-    configure_log_repo_args(args)
     if args.manual_ai_prepare and args.manual_ai_run:
         parser.error("--manual-ai-prepare 和 --manual-ai-run 不能同时使用")
+    lock_fp = acquire_auto_optimize_lock(args.allow_concurrent_runs)
+    if lock_fp is False:
+        return
+    configure_log_repo_args(args)
 
     run_dir = RESULT_ROOT / f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -4286,6 +4617,7 @@ def main() -> None:
         log_push_result = push_run_logs_to_log_repo(run_dir, args)
         print_log_repo_push_summary(log_push_result)
         restore_terminal_logging(log_ctx)
+        release_auto_optimize_lock(lock_fp)
 
 
 if __name__ == "__main__":
