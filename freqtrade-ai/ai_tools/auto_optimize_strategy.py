@@ -606,6 +606,38 @@ def parse_yes_no(value: str) -> bool | None:
     return None
 
 
+def parse_cli_y_or_n(value: str, option_name: str) -> str:
+    normalized = value.strip().lower()
+    if normalized not in {"y", "n"}:
+        raise argparse.ArgumentTypeError(f"{option_name} 只允许 y 或 n")
+    return normalized
+
+
+def ask_confirm(question: str, default: bool = False, args: argparse.Namespace | None = None) -> bool:
+    if args is not None and getattr(args, "confirm", "n") == "n":
+        print(f"{question}：中途人工确认已关闭，自动选择不确认/跳过（--confirm n）。")
+        return False
+
+    d = "是" if default else "否"
+    while True:
+        v = input(f"{question}（默认：{d}，输入 y/n）：").strip()
+        if not v:
+            return default
+        p = parse_yes_no(v)
+        if p is not None:
+            return p
+        print("输入无效，请输入 y 或 n。")
+
+
+def print_interaction_config(args: argparse.Namespace) -> None:
+    setup_label = "进入" if getattr(args, "setup", "n") == "y" and not getattr(args, "no_wizard", False) else "跳过"
+    setup_reason = "--no-wizard" if getattr(args, "no_wizard", False) else f"--setup {getattr(args, 'setup', 'n')}"
+    confirm_label = "开启" if getattr(args, "confirm", "n") == "y" else "关闭"
+    print("\n========== 启动交互配置 ==========")
+    print(f"交互式设置：{setup_label}（{setup_reason}）")
+    print(f"中途人工确认：{confirm_label}（--confirm {getattr(args, 'confirm', 'n')}）")
+
+
 def ask_text(prompt: str, default: str) -> str:
     v = input(f"{prompt}（默认：{default}）：").strip()
     return v if v else default
@@ -675,10 +707,10 @@ def ensure_model_config_files() -> dict[str, Any]:
 
 def run_wizard(goal: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     print("\n===== 自动优化中文设置向导 =====")
-    enter = input("是否进入交互式设置？（默认：是，回车=是，输入 n=跳过）：").strip()
-    parsed = parse_yes_no(enter) if enter else True
-    if parsed is False:
+    if getattr(args, "setup", "n") != "y":
+        print("交互式设置已跳过（--setup n）。")
         return goal
+    print("交互式设置已进入（--setup y）。")
 
     runtime = json.loads(json.dumps(goal))
     runtime.setdefault("language", "zh-CN")
@@ -686,7 +718,7 @@ def run_wizard(goal: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]
     runtime["config"] = ask_text("配置文件路径", str(runtime.get("config", args.config)))
     cfg_path = ROOT_DIR / runtime["config"]
     if not cfg_path.exists():
-        cont = ask_bool(f"配置文件不存在：{runtime['config']}，是否继续", False)
+        cont = ask_confirm(f"配置文件不存在：{runtime['config']}，是否继续", False, args)
         if not cont:
             raise RuntimeError("用户取消：配置文件不存在")
 
@@ -784,8 +816,7 @@ def run_wizard(goal: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]
     print(f"是否允许 exit_signal：{runtime.get('target', {}).get('prefer_exit_signal')}")
     print(f"当前基准：{runtime.get('baseline')}")
 
-    start = input("是否开始自动优化？（回车/y=开始，n=取消）：").strip()
-    if start and parse_yes_no(start) is False:
+    if not ask_confirm("是否开始自动优化", True, args):
         raise RuntimeError("用户取消执行")
 
     return runtime
@@ -4710,8 +4741,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 similarity_report["decision"] = "user_prompt"
                 print("新策略与历史失败黑名单高度相似，且不是当前 session_parent。")
                 print("建议重新生成。")
-                yn = input("是否仍然执行回测？(y/n)\n").strip()
-                if parse_yes_no(yn) is not True:
+                if not ask_confirm("是否仍然执行回测", False, args):
                     similarity_report["decision"] = "user_reject"
                     write_json(version_dir / "similarity_report.json", similarity_report)
                     invalid_reason = "用户拒绝回测相似失败策略。"
@@ -5968,6 +5998,8 @@ def main() -> None:
     parser.add_argument("--no-ai-model-switch-on-error", dest="ai_model_switch_on_error", action="store_false", help="关闭 AI 模型池失败自动轮换")
     parser.add_argument("--ai-call-cooldown-seconds", type=float, default=float(os.getenv("AI_CALL_COOLDOWN_SECONDS", "10")), help="每次 AI 调用后到下一次调用前最小间隔秒数")
     parser.add_argument("--advisor-to-codegen-delay-seconds", type=float, default=float(os.getenv("ADVISOR_TO_CODEGEN_DELAY_SECONDS", "5")), help="策略顾问成功后到代码生成前额外等待秒数")
+    parser.add_argument("--setup", type=lambda value: parse_cli_y_or_n(value, "--setup"), default="n", help="是否启动后直接进入交互式设置：y=进入，n=跳过；默认 n")
+    parser.add_argument("--confirm", type=lambda value: parse_cli_y_or_n(value, "--confirm"), default="n", help="是否开启中途人工确认：y=询问，n=自动选择默认跳过；默认 n")
     parser.add_argument("--no-wizard", action="store_true")
     parser.add_argument("--save-goal", action="store_true")
     parser.add_argument("--config", default="user_data/config.5coins.json")
@@ -6035,6 +6067,7 @@ def main() -> None:
     args._log_context = log_ctx
     try:
         print_log_start_banner(log_ctx)
+        print_interaction_config(args)
         check_log_repo_startup(args)
         goal_path = ROOT_DIR / args.goal
         ensure_goal_file(goal_path)
