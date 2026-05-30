@@ -440,6 +440,8 @@ class AIRoleRuntime:
     max_attempts_per_call: int = 5
     attempts: list[dict[str, Any]] = field(default_factory=list)
     used_model: str = ""
+    provider_pool: list[dict[str, Any]] = field(default_factory=list)
+    used_provider: str = ""
 
     @property
     def display_name(self) -> str:
@@ -448,11 +450,18 @@ class AIRoleRuntime:
     def begin_call(self) -> None:
         self.attempts = []
         self.used_model = ""
+        self.used_provider = ""
 
     def usage_snapshot(self) -> dict[str, Any]:
+        provider_pool_summary = [
+            {"name": item.get("name", ""), "model": item.get("model", ""), "base_url": item.get("base_url", "")}
+            for item in self.provider_pool
+        ]
         return {
             "model_pool": list(self.model_pool),
+            "provider_pool": provider_pool_summary,
             "used_model": self.used_model,
+            "used_provider": self.used_provider,
             "attempts": list(self.attempts),
         }
 
@@ -473,6 +482,7 @@ DEFAULT_MODEL_CONFIG: dict[str, Any] = {
         "api_key_env": "CLAUDE_API_KEY",
         "model_env": "CLAUDE_MODEL",
         "model_pool_env": "CLAUDE_MODEL_POOL",
+        "provider_pool_env": "STRATEGY_ADVISOR_PROVIDER_POOL",
         "default_model": "claude-opus-4-7",
     },
     "code_generator": {
@@ -482,6 +492,7 @@ DEFAULT_MODEL_CONFIG: dict[str, Any] = {
         "api_key_env": "OPENAI_API_KEY",
         "model_env": "OPENAI_MODEL",
         "model_pool_env": "OPENAI_MODEL_POOL",
+        "provider_pool_env": "STRATEGY_CODEGEN_PROVIDER_POOL",
         "default_model": "gpt-5.5",
     },
     "code_repair": {
@@ -491,6 +502,7 @@ DEFAULT_MODEL_CONFIG: dict[str, Any] = {
         "api_key_env": "OPENAI_API_KEY",
         "model_env": "OPENAI_MODEL",
         "model_pool_env": "OPENAI_MODEL_POOL",
+        "provider_pool_env": "STRATEGY_CODEGEN_PROVIDER_POOL",
         "default_model": "gpt-5.5",
     },
 }
@@ -1800,6 +1812,8 @@ def _new_round_defaults() -> dict[str, Any]:
         "pair_metrics": [],
         "entry_tag_metrics": [],
         "similarity_report": None,
+        "strategy_fingerprint": None,
+        "duplicate_report": None,
         "final_score": 0,
         "score_breakdown": {},
         "invalid_reason": "",
@@ -1873,6 +1887,8 @@ def _minimal_round_summary(
         "is_valid": bool(state.get("is_valid", False)),
         "invalid_reason": state.get("invalid_reason", ""),
         "similarity_report": state.get("similarity_report"),
+        "strategy_fingerprint": state.get("strategy_fingerprint"),
+        "duplicate_report": state.get("duplicate_report"),
         "trade_under_min": bool(state.get("trade_under_min", False)),
         "cannot_be_official_best_unless_validation_strong": bool(state.get("cannot_be_official_best_unless_validation_strong", False)),
         "validation_strong": bool(state.get("validation_strong", False)),
@@ -1910,12 +1926,21 @@ def extract_strategy_features(strategy_code: str) -> dict[str, Any]:
         m = re.search(pattern, strategy_code, flags=re.IGNORECASE | re.DOTALL)
         return m.group(1).strip() if m else None
 
+    def _extract_block(pattern: str) -> str | None:
+        m = re.search(pattern, strategy_code, flags=re.IGNORECASE | re.DOTALL)
+        if not m:
+            return None
+        return "\n".join(line.strip() for line in m.group(1).splitlines() if line.strip())[:2000]
+
     def _norm_list(tokens: list[str]) -> list[str]:
         return sorted(set(t.strip().lower() for t in tokens if t and t.strip()))
 
-    indicators = _norm_list(re.findall(r"\b(rsi|ema\d*|macd|bbands|bollinger|adx|atr|volume|sma\d*)\b", lc))
+    indicators = _norm_list(re.findall(r"\b(rsi|ema\d*|macd|bbands|bollinger|adx|atr|volume|sma\d*|stoch|mfi|cci|roc|willr|vwma|vwap)\b", lc))
     entry_conditions = _norm_list(re.findall(r"\((df\[.*?\]\s*[<>=!]+\s*[^\)]+)\)", strategy_code, flags=re.DOTALL))
     entry_tags = _norm_list(re.findall(r"[\"']([A-Za-z0-9_\-]+)[\"']\s*(?:,|\)|\])", _extract(r"entry_tag\s*=\s*(.*)") or ""))
+    pair_filters = _norm_list(re.findall(r"(?:metadata\.get\([\"']pair[\"']\)|metadata\[[\"']pair[\"']\]|pair\s+in\s+\[[^\]]+\]|pair\s*==\s*[\"'][^\"']+[\"'])", strategy_code, flags=re.IGNORECASE | re.DOTALL))
+    protection_cooldown = _extract_block(r"def\s+protections\s*\([^)]*\).*?:\s*(.*?)(?:\n\s*def\s+|\n\s*class\s+|\Z)")
+    cooldown_tokens = _norm_list(re.findall(r"\b(cooldown|stoplossguard|maxdrawdown|lowprofitpairs|protection|protections|cooldownperiod)\b", lc))
 
     return {
         "minimal_roi": _extract(r"minimal_roi\s*=\s*(\{.*?\})"),
@@ -1924,32 +1949,60 @@ def extract_strategy_features(strategy_code: str) -> dict[str, Any]:
         "use_exit_signal": _extract(r"use_exit_signal\s*=\s*(True|False)"),
         "timeframe": _extract(r"timeframe\s*=\s*[\"']([^\"']+)[\"']"),
         "indicators": indicators,
-        "entry_conditions": entry_conditions[:20],
-        "entry_tags": entry_tags[:8],
+        "entry_conditions": entry_conditions[:30],
+        "entry_tags": entry_tags[:12],
+        "pair_filters": pair_filters[:20],
+        "protection_cooldown": protection_cooldown,
+        "cooldown_tokens": cooldown_tokens,
     }
 
 
-def _feature_signature(features: dict[str, Any]) -> str:
-    key = {
+def _strategy_fingerprint_payload(features: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "indicators": features.get("indicators", []),
+        "entry_conditions": features.get("entry_conditions", []),
+        "entry_tags": features.get("entry_tags", []),
         "minimal_roi": features.get("minimal_roi"),
         "stoploss": features.get("stoploss"),
         "trailing_stop": features.get("trailing_stop"),
-        "entry_conditions": features.get("entry_conditions", []),
-        "entry_tags": features.get("entry_tags", []),
-        "indicators": features.get("indicators", []),
+        "use_exit_signal": features.get("use_exit_signal"),
+        "timeframe": features.get("timeframe"),
+        "pair_filters": features.get("pair_filters", []),
+        "protection_cooldown": features.get("protection_cooldown"),
+        "cooldown_tokens": features.get("cooldown_tokens", []),
     }
-    return hashlib.sha256(json.dumps(key, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+
+def build_strategy_fingerprint(features: dict[str, Any]) -> dict[str, Any]:
+    payload = _strategy_fingerprint_payload(features)
+    digest = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:20]
+    return {"hash": digest, "payload": payload}
+
+
+def _feature_signature(features: dict[str, Any]) -> str:
+    return build_strategy_fingerprint(features)["hash"]
 
 
 def strategy_similarity(a: dict[str, Any], b: dict[str, Any]) -> tuple[float, list[str]]:
-    weights = {"entry_conditions": 0.30, "entry_tags": 0.15, "stoploss": 0.15, "minimal_roi": 0.15, "trailing_stop": 0.10, "indicators": 0.15}
+    weights = {
+        "entry_conditions": 0.28,
+        "entry_tags": 0.12,
+        "stoploss": 0.12,
+        "minimal_roi": 0.12,
+        "trailing_stop": 0.08,
+        "use_exit_signal": 0.06,
+        "timeframe": 0.06,
+        "indicators": 0.10,
+        "pair_filters": 0.04,
+        "protection_cooldown": 0.02,
+    }
     score = 0.0
     reasons: list[str] = []
-    for k in ["stoploss", "minimal_roi", "trailing_stop"]:
+    for k in ["stoploss", "minimal_roi", "trailing_stop", "use_exit_signal", "timeframe", "protection_cooldown"]:
         if str(a.get(k)) == str(b.get(k)) and a.get(k) is not None:
             score += weights[k]
             reasons.append(f"{k} 相同")
-    for k in ["entry_conditions", "entry_tags", "indicators"]:
+    for k in ["entry_conditions", "entry_tags", "indicators", "pair_filters"]:
         sa, sb = set(a.get(k, [])), set(b.get(k, []))
         if sa and sb:
             j = len(sa & sb) / max(1, len(sa | sb))
@@ -2122,8 +2175,11 @@ def safe_ask_ai(
     role_runtime.begin_call()
     if role_runtime.role not in {"strategy_advisor", "code_generator"}:
         raise ValueError(f"safe_ask_ai 仅支持 strategy_advisor/code_generator，收到：{role_runtime.role}")
-    model_pool = [m for m in role_runtime.model_pool if m]
-    if not model_pool:
+    provider_pool = [item for item in role_runtime.provider_pool if item.get("model") and item.get("client")]
+    if not provider_pool:
+        provider_pool = [{"name": "legacy_env", "model": model, "client": role_runtime.client, "base_url": ""} for model in role_runtime.model_pool if model]
+    model_pool = [str(item.get("model") or "") for item in provider_pool if item.get("model")]
+    if not provider_pool:
         raise AIModelPoolExhaustedError(f"{role_runtime.display_name}模型池为空", attempts=[])
 
     max_attempts = max(1, int(role_runtime.max_attempts_per_call or 1))
@@ -2132,9 +2188,14 @@ def safe_ask_ai(
     last_status_code: int | None = None
 
     for attempt_idx in range(max_attempts):
-        model_idx = attempt_idx % len(model_pool) if role_runtime.switch_on_error else 0
-        model = model_pool[model_idx]
-        next_model = model_pool[(model_idx + 1) % len(model_pool)] if len(model_pool) > 1 else model
+        provider_idx = attempt_idx % len(provider_pool) if role_runtime.switch_on_error else 0
+        provider = provider_pool[provider_idx]
+        next_provider = provider_pool[(provider_idx + 1) % len(provider_pool)] if len(provider_pool) > 1 else provider
+        provider_name = str(provider.get("name") or "legacy_env")
+        model = str(provider.get("model") or "")
+        client = provider.get("client") or role_runtime.client
+        next_model = str(next_provider.get("model") or model)
+        next_provider_name = str(next_provider.get("name") or "legacy_env")
         now = time.time()
         last_call = float(state.get("last_ai_call_time", 0.0) or 0.0)
         cooldown = max(0.0, float(state.get("ai_call_cooldown_seconds", 0.0) or 0.0))
@@ -2143,6 +2204,7 @@ def safe_ask_ai(
         print("准备调用 AI：")
         print(f"角色：{role_runtime.role}")
         print(f"模型池：{', '.join(model_pool)}")
+        print(f"当前 provider：{provider_name}")
         print(f"当前模型：{model}")
         print(f"尝试次数：{attempt_idx + 1}/{max_attempts}")
         if elapsed_since_last < 0:
@@ -2167,7 +2229,7 @@ def safe_ask_ai(
         heartbeat_thread.start()
         try:
             try:
-                res = role_runtime.client.chat.completions.create(model=model, messages=messages, temperature=0.2)
+                res = client.chat.completions.create(model=model, messages=messages, temperature=0.2)
             except (InternalServerError, RateLimitError, APITimeoutError, APIConnectionError, APIStatusError, TimeoutError, Exception) as exc:
                 error_message, status_code = _format_ai_error(exc)
                 last_error_message = error_message or exc.__class__.__name__
@@ -2175,6 +2237,7 @@ def safe_ask_ai(
                 tos_block = _is_403_provider_tos_block(last_error_message, status_code)
                 retriable = tos_block or _is_retriable_ai_error(last_error_message, status_code, exc)
                 role_runtime.attempts.append({
+                    "provider": provider_name,
                     "model": model,
                     "status": "failed",
                     "error": last_error_message,
@@ -2193,10 +2256,11 @@ def safe_ask_ai(
                 wait_sec = _ai_backoff_seconds(attempt_idx + 1, tos_block=tos_block)
                 print("AI 调用失败：")
                 print(f"角色：{role_runtime.role}")
+                print(f"provider：{provider_name}")
                 print(f"模型：{model}")
                 print(f"错误：{last_error_message}")
                 if attempt_idx + 1 < max_attempts:
-                    print(f"将在 {wait_sec} 秒后切换到下一个模型：{next_model}")
+                    print(f"将在 {wait_sec} 秒后切换到下一个 provider/模型：{next_provider_name}/{next_model}")
                     print(f"尝试次数：{attempt_idx + 1}/{max_attempts}")
                     time.sleep(wait_sec)
                     continue
@@ -2213,10 +2277,12 @@ def safe_ask_ai(
 
         content = (res.choices[0].message.content or "").strip()
         elapsed = int(time.time() - start_ts)
+        role_runtime.used_provider = provider_name
         role_runtime.used_model = model
-        role_runtime.attempts.append({"model": model, "status": "success"})
+        role_runtime.attempts.append({"provider": provider_name, "model": model, "status": "success"})
         print("AI 调用成功：")
         print(f"角色：{role_runtime.role}")
+        print(f"实际使用 provider：{provider_name}")
         print(f"实际使用模型：{model}")
         print(f"用时：{elapsed} 秒")
         print(f"返回字符数：{len(content)}")
@@ -2233,6 +2299,41 @@ def _parse_model_pool(raw: str | None) -> list[str]:
     return [item.strip() for item in (raw or "").split(",") if item.strip()]
 
 
+def _provider_env_prefix(provider_name: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", provider_name.strip()).strip("_").upper()
+    return f"AI_PROVIDER_{normalized}"
+
+
+def _looks_like_placeholder_secret(value: str) -> bool:
+    lowered = value.strip().lower()
+    return not lowered or lowered in {"你的key", "your_key", "your-api-key", "你的deepseek_key", "你的glm_key"} or lowered.startswith("你的")
+
+
+def _build_provider_pool_from_env(provider_pool_env: str, timeout_sec: int) -> tuple[list[dict[str, Any]], list[str]]:
+    providers: list[dict[str, Any]] = []
+    skipped: list[str] = []
+    for provider_name in _parse_model_pool(os.getenv(provider_pool_env)):
+        prefix = _provider_env_prefix(provider_name)
+        provider_type = (os.getenv(f"{prefix}_TYPE") or "openai_compatible").strip().lower()
+        base_url = (os.getenv(f"{prefix}_BASE_URL") or "").strip() or None
+        api_key = (os.getenv(f"{prefix}_API_KEY") or "").strip()
+        model = (os.getenv(f"{prefix}_MODEL") or "").strip()
+        if provider_type != "openai_compatible":
+            skipped.append(f"{provider_name}: 不支持的 TYPE={provider_type}")
+            continue
+        if _looks_like_placeholder_secret(api_key) or not model or model.startswith("你的") or (base_url and str(base_url).strip().startswith("你的")):
+            skipped.append(f"{provider_name}: 缺少 BASE_URL、API_KEY 或 MODEL")
+            continue
+        providers.append({
+            "name": provider_name,
+            "type": provider_type,
+            "base_url": base_url or "",
+            "model": model,
+            "client": OpenAI(api_key=api_key, base_url=base_url, timeout=timeout_sec),
+        })
+    return providers, skipped
+
+
 def _build_ai_role_runtime(
     model_cfg: dict[str, Any],
     role_name: str,
@@ -2240,9 +2341,32 @@ def _build_ai_role_runtime(
     max_attempts_per_call: int,
     switch_on_error: bool,
 ) -> AIRoleRuntime:
+    default_provider_pool_env_by_role = {
+        "strategy_advisor": "STRATEGY_ADVISOR_PROVIDER_POOL",
+        "code_generator": "STRATEGY_CODEGEN_PROVIDER_POOL",
+        "code_repair": "STRATEGY_CODEGEN_PROVIDER_POOL",
+    }
+    provider_pool_env = str(model_cfg.get("provider_pool_env") or default_provider_pool_env_by_role.get(role_name, ""))
+    provider_pool: list[dict[str, Any]] = []
+    skipped_providers: list[str] = []
+    if provider_pool_env and os.getenv(provider_pool_env):
+        provider_pool, skipped_providers = _build_provider_pool_from_env(provider_pool_env, timeout_sec)
+        if provider_pool:
+            return AIRoleRuntime(
+                role=role_name,
+                client=provider_pool[0]["client"],
+                model_pool=[str(item.get("model") or "") for item in provider_pool],
+                timeout_sec=timeout_sec,
+                switch_on_error=switch_on_error,
+                max_attempts_per_call=max_attempts_per_call,
+                provider_pool=provider_pool,
+            )
+        skipped_text = "；".join(skipped_providers) if skipped_providers else "未解析到有效 provider"
+        raise RuntimeError(f"{provider_pool_env} 已设置，但 {role_name} 没有可用 provider：{skipped_text}")
+
     base_url = (os.getenv(str(model_cfg.get("base_url_env", ""))) or "").strip() or None
     api_key = (os.getenv(str(model_cfg.get("api_key_env", ""))) or "").strip()
-    default_pool_env_by_role = {"strategy_advisor": "CLAUDE_MODEL_POOL", "code_generator": "OPENAI_MODEL_POOL"}
+    default_pool_env_by_role = {"strategy_advisor": "CLAUDE_MODEL_POOL", "code_generator": "OPENAI_MODEL_POOL", "code_repair": "OPENAI_MODEL_POOL"}
     pool_env_name = str(model_cfg.get("model_pool_env") or default_pool_env_by_role.get(role_name, ""))
     legacy_model_env = str(model_cfg.get("model_env", ""))
     model_pool = _parse_model_pool(os.getenv(pool_env_name)) if pool_env_name else []
@@ -2253,24 +2377,38 @@ def _build_ai_role_runtime(
         raise RuntimeError(f"未检测到 {model_cfg.get('api_key_env')}，无法初始化 {role_name} 模型池。")
     if not model_pool:
         raise RuntimeError(f"未检测到 {pool_env_name or legacy_model_env}，无法初始化 {role_name} 模型池。")
+    client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout_sec)
+    legacy_provider_pool = [{
+        "name": "legacy_env",
+        "type": "openai_compatible",
+        "base_url": base_url or "",
+        "model": model,
+        "client": client,
+    } for model in model_pool]
     return AIRoleRuntime(
         role=role_name,
-        client=OpenAI(api_key=api_key, base_url=base_url, timeout=timeout_sec),
+        client=client,
         model_pool=model_pool,
         timeout_sec=timeout_sec,
         switch_on_error=switch_on_error,
         max_attempts_per_call=max_attempts_per_call,
+        provider_pool=legacy_provider_pool,
     )
 
 
 def _print_ai_model_pool_config(advisor_runtime: AIRoleRuntime, code_runtime: AIRoleRuntime, cooldown_seconds: float) -> None:
+    def _print_pool(title: str, runtime: AIRoleRuntime) -> None:
+        print(title)
+        pool = runtime.provider_pool or [{"name": "legacy_env", "model": model, "base_url": ""} for model in runtime.model_pool]
+        for idx, item in enumerate(pool, start=1):
+            base_url = str(item.get("base_url") or "")
+            base_url_text = f" @ {base_url}" if base_url else ""
+            print(f"{idx}. {item.get('name', 'legacy_env')} / {item.get('model', '')}{base_url_text}")
+
     print("\n========== AI 模型池配置 ==========")
-    print("策略顾问模型池：")
-    for idx, model in enumerate(advisor_runtime.model_pool, start=1):
-        print(f"{idx}. {model}")
-    print("\n代码生成模型池：")
-    for idx, model in enumerate(code_runtime.model_pool, start=1):
-        print(f"{idx}. {model}")
+    _print_pool("策略顾问 provider/模型池：", advisor_runtime)
+    print()
+    _print_pool("代码生成 provider/模型池：", code_runtime)
     print(f"\n模型失败自动轮换：{'开启' if advisor_runtime.switch_on_error and code_runtime.switch_on_error else '关闭'}")
     print(f"单次 AI 调用最大尝试次数：{max(advisor_runtime.max_attempts_per_call, code_runtime.max_attempts_per_call)}")
     print(f"AI 请求超时：{max(advisor_runtime.timeout_sec, code_runtime.timeout_sec)} 秒")
@@ -2294,6 +2432,23 @@ def _strategy_spec_prompt(class_name: str, runtime_goal: dict[str, Any], baselin
         "重点：减少固定止损吞噬 ROI，不是增加交易数量。禁止/不推荐：increase_trade_frequency,loosen_entry,enable_trailing,adjust_stoploss_only,widen_stoploss。优先：add_entry_filter,tighten_entry_trigger,remove_bad_entry_condition,pair_specific_filter,tag_specific_filter。"
     )
 
+
+
+def _v045_small_step_prompt_section(champion: dict[str, Any]) -> str:
+    meta = champion.get("meta", {}) if isinstance(champion, dict) else {}
+    name = str((meta or {}).get("strategy_class") or (meta or {}).get("class_name") or "")
+    if "MultiCoin_AI_Strategy_20260530_014158_v045" not in name:
+        return ""
+    return (
+        "\n========== v045 低频稳健阶段强约束 ==========\n"
+        "当前正式 best 是 MultiCoin_AI_Strategy_20260530_014158_v045。下一轮必须围绕 v045 小步优化，禁止大改结构。\n"
+        "v045 训练：25 笔，+0.0207 USDT，PF 1.0027，DD 0.66%。\n"
+        "v045 验证：202604 +0.4342 USDT / PF 1.0764；202603 +0.7088 USDT / PF 1.0936；202602 +3.3647 USDT / PF 1.8883。\n"
+        "只允许 mutation_type: pair_specific_filter, tag_specific_filter, remove_bad_entry_condition, small_entry_filter_adjustment。\n"
+        "禁止: increase_trade_frequency, loosen_entry, widen_stoploss, enable_exit_signal, enable_trailing, 大幅修改 ROI。\n"
+        "目标：训练交易数保持 20~30；202604/202603/202602 三个验证月继续全部不亏；最差验证 PF > 1.0；固定止损亏损降低；训练区间不要明显转负。\n"
+        "如果必须选择系统允许枚举外的 small_entry_filter_adjustment，请在 mutation_type 用 tighten_entry_trigger 或 add_entry_filter，并在 reason 明确它只是 small_entry_filter_adjustment。\n"
+    )
 
 def maybe_reset_best_strategy(reset_best: bool) -> bool:
     if not reset_best:
@@ -3465,6 +3620,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         timeout_sec=code_runtime.timeout_sec,
         switch_on_error=code_runtime.switch_on_error,
         max_attempts_per_call=code_runtime.max_attempts_per_call,
+        provider_pool=list(code_runtime.provider_pool),
     )
     _print_ai_model_pool_config(advisor_runtime, code_runtime, float(args.ai_call_cooldown_seconds))
 
@@ -3524,6 +3680,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     ai_runtime_state = {"last_ai_call_time": 0.0, "ai_call_cooldown_seconds": float(args.ai_call_cooldown_seconds)}
     iteration_stats_path = run_dir / ITERATION_STATS_FILE_NAME
     version_statuses: list[dict[str, Any]] = []
+    tested_strategy_fingerprints: list[dict[str, Any]] = []
+    early_stop_reason = ""
     random_sample_plan = build_random_sample_plan(args, runtime_goal, run_dir)
     print_random_sample_config(random_sample_plan)
 
@@ -3544,13 +3702,54 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         "random_sample_enabled": bool(random_sample_plan.get("enabled")),
         "random_sample_windows_count": len(random_sample_plan.get("windows", []) or []),
         "random_sample_total_backtests": 0,
+        "early_stop_triggered": False,
+        "early_stop_reason": "",
+        "early_stop_checked_counters": {
+            "no_new_best": 0,
+            "final_score_failures": 0,
+            "duplicate_strategies": 0,
+        },
         "version_statuses": version_statuses,
     }
+
+    def _count_trailing(predicate: Any) -> int:
+        count = 0
+        for row in reversed(version_statuses):
+            if predicate(row):
+                count += 1
+            else:
+                break
+        return count
+
+    def should_early_stop() -> str:
+        no_best_count = _count_trailing(lambda row: row.get("advisor_status") != "未执行" and not row.get("is_best"))
+        final_score_failure_count = _count_trailing(lambda row: row.get("advisor_status") != "未执行" and _safe_float(row.get("final_score")) <= 0)
+        duplicate_count = _count_trailing(lambda row: str(row.get("invalid_reason") or "") == "策略与本次 run 已测试策略高度重复")
+        iteration_stats["early_stop_checked_counters"] = {
+            "no_new_best": no_best_count,
+            "final_score_failures": final_score_failure_count,
+            "duplicate_strategies": duplicate_count,
+        }
+        if int(args.early_stop_patience) > 0 and no_best_count >= int(args.early_stop_patience):
+            return f"已连续 {int(args.early_stop_patience)} 轮没有新 best，触发 early stopping。"
+        if int(args.early_stop_final_score_failures) > 0 and final_score_failure_count >= int(args.early_stop_final_score_failures):
+            return f"已连续 {int(args.early_stop_final_score_failures)} 轮 final_score<=0，触发 early stopping。"
+        if int(args.early_stop_duplicate_strategies) > 0 and duplicate_count >= int(args.early_stop_duplicate_strategies):
+            return f"已连续 {int(args.early_stop_duplicate_strategies)} 轮策略 fingerprint 与历史高度重复，触发 early stopping。"
+        return ""
 
     def flush_iteration_stats() -> None:
         iteration_stats["history_strategy_total_count"] = len(_read_json_list_file(MEMORY_FILE)) if MEMORY_FILE.exists() else 0
         write_json(iteration_stats_path, iteration_stats)
     for i in range(1, iterations + 1):
+        early_stop_reason = should_early_stop()
+        if early_stop_reason:
+            iteration_stats["early_stop_triggered"] = True
+            iteration_stats["early_stop_reason"] = early_stop_reason
+            print(early_stop_reason)
+            print("本次运行提前结束。")
+            flush_iteration_stats()
+            break
         ver = f"v{i:03d}"
         iteration_stats["current_iteration_version"] = ver
         class_name = f"{strategy_family}_{run_id}_{ver}"
@@ -3588,6 +3787,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         pair_metrics = round_state["pair_metrics"]
         entry_tag_metrics = round_state["entry_tag_metrics"]
         similarity_report = round_state["similarity_report"]
+        strategy_fingerprint = round_state["strategy_fingerprint"]
+        duplicate_report = round_state["duplicate_report"]
         final_score = round_state["final_score"]
         score_breakdown = round_state["score_breakdown"]
         invalid_reason = round_state["invalid_reason"]
@@ -3636,6 +3837,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 "pair_metrics": pair_metrics,
                 "entry_tag_metrics": entry_tag_metrics,
                 "similarity_report": similarity_report,
+                "strategy_fingerprint": strategy_fingerprint,
+                "duplicate_report": duplicate_report,
                 "final_score": final_score,
                 "score_breakdown": score_breakdown,
                 "invalid_reason": invalid_reason,
@@ -3810,6 +4013,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         spec_prompt += "\n跨 run strategy_lessons=" + _compact_prompt_json(lessons_items[-memory_max_items:], 4000) + "\n"
         spec_prompt += "\n跨 run strategy_blacklist=" + _compact_prompt_json(blacklist_items[-memory_max_items:], 4000) + "\n"
         spec_prompt += f"\nchampion_strategy_class={_strategy_label(in_memory_champion, 'baseline')}\n"
+        spec_prompt += _v045_small_step_prompt_section({"meta": official_champion})
         spec_prompt += f"\n已失败 mutation_type（避免重复）={sorted(set(used_failed_mutations).union(session_state['failed_mutation_types_this_run']))}\n"
         (version_dir / "advisor_prompt.txt").write_text(spec_prompt, encoding="utf-8")
         print("正在调用策略顾问模型生成 mutation_spec……")
@@ -3898,6 +4102,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "12) 目标不是追求 0 回撤，而是在足够交易数下综合表现优于 baseline。\n"
             f"{failure_context}"
             f"{compact_memory}\n"
+            f"{_v045_small_step_prompt_section({'meta': official_champion})}\n"
             "当前 baseline：\n"
             f"- 总收益(USDT)：{baseline_cfg.get('profit_total_abs', -7.43)}\n"
             f"- 收益率(%)：{baseline_cfg.get('profit_total_pct', -0.74)}\n"
@@ -3932,7 +4137,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         iteration_stats["codegen_success_count"] += 1
         code = extract_python_code(response_text)
         features = extract_strategy_features(code)
-        signature = _feature_signature(features)
+        strategy_fingerprint = build_strategy_fingerprint(features)
+        signature = strategy_fingerprint["hash"]
         code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
         similarity_threshold = float(args.similarity_threshold)
         similarity_report = {"is_similar": False, "similarity_score": 0.0, "similar_to": "", "similar_type": "none", "reasons": [], "decision": "auto_continue", "user_prompt_required": False}
@@ -3996,6 +4202,70 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 similarity_report["decision"] = "user_override_continue"
         print(f"- 是否允许自动继续：{'是' if similarity_report['decision'] in {'auto_continue', 'user_override_continue'} else '否'}")
         write_json(version_dir / "similarity_report.json", similarity_report)
+
+        duplicate_report = {
+            "is_duplicate": False,
+            "strategy_fingerprint": strategy_fingerprint,
+            "matched_hash": "",
+            "matched_version": "",
+            "matched_strategy_class": "",
+            "similarity_score": 0.0,
+            "reasons": [],
+            "decision": "continue",
+        }
+        for tested in tested_strategy_fingerprints:
+            tested_fp = tested.get("strategy_fingerprint", {}) or {}
+            tested_features = tested.get("features", {}) or {}
+            fp_equal = str((tested_fp.get("hash") or "")) == str(strategy_fingerprint.get("hash"))
+            fp_score, fp_reasons = strategy_similarity(features, tested_features)
+            if fp_equal or fp_score >= 0.92:
+                duplicate_report.update({
+                    "is_duplicate": True,
+                    "matched_hash": str(tested_fp.get("hash") or ""),
+                    "matched_version": str(tested.get("version") or ""),
+                    "matched_strategy_class": str(tested.get("strategy_class") or ""),
+                    "similarity_score": 1.0 if fp_equal else round(float(fp_score), 4),
+                    "reasons": (["strategy_fingerprint 完全相同"] if fp_equal else fp_reasons),
+                    "decision": "skip_backtest",
+                })
+                break
+        write_json(version_dir / "strategy_fingerprint.json", strategy_fingerprint)
+        write_json(version_dir / "duplicate_report.json", duplicate_report)
+        if duplicate_report["is_duplicate"]:
+            invalid_reason = "策略与本次 run 已测试策略高度重复"
+            previous_failure_reason = invalid_reason
+            status["train_backtest_status"] = "跳过"
+            status["validation_backtest_status"] = "跳过"
+            status["is_valid"] = False
+            status["is_best"] = False
+            status["invalid_reason"] = invalid_reason
+            status["final_score"] = 0.0
+            iteration_stats["invalid_strategy_count"] += 1
+            print("策略与本次 run 已测试策略高度重复，跳过训练/验证回测。")
+            print(f"重复对象：{duplicate_report['matched_version']} {duplicate_report['matched_strategy_class']}，相似度 {float(duplicate_report['similarity_score']):.2f}")
+            summary_path = write_iteration_summary({
+                "features": features,
+                "strategy_fingerprint": strategy_fingerprint,
+                "duplicate_report": duplicate_report,
+                "final_score": 0.0,
+                "invalid_reason": invalid_reason,
+            })
+            update_session_state_after_round(summary_path=summary_path)
+            leaderboard.append(enrich_leaderboard_entry({
+                "version": ver,
+                "run_id": run_id,
+                "strategy_class": class_name,
+                "strategy_file": str(strategy_file),
+                "strategy_fingerprint": strategy_fingerprint,
+                "duplicate_report": duplicate_report,
+                "is_valid": False,
+                "is_best": False,
+                "invalid_reason": invalid_reason,
+                "final_score": 0.0,
+            }))
+            flush_iteration_stats()
+            continue
+
         strategy_file.parent.mkdir(parents=True, exist_ok=True)
         strategy_file.write_text(code, encoding="utf-8")
         shutil.copy2(strategy_file, version_dir / "strategy.py")
@@ -4045,6 +4315,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 "code_hash": code_hash,
                 "created_at": datetime.utcnow().isoformat(),
                 "features": features,
+                "strategy_fingerprint": strategy_fingerprint,
                 "failure_reason": invalid_reason,
                 "avoid_next": "确保 populate_entry_trend 对 enter_long 赋值为 1/True。",
                 "final_score": 0.0,
@@ -4079,6 +4350,12 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             update_session_state_after_round(summary_path=summary_path, strategy_record=card)
             continue
         status["static_check_status"] = "成功"
+        tested_strategy_fingerprints.append({
+            "version": ver,
+            "strategy_class": class_name,
+            "strategy_fingerprint": strategy_fingerprint,
+            "features": features,
+        })
 
         print(f"6. 正在回测训练区间：{train.timerange}")
         train_cmd = [
@@ -4427,6 +4704,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "is_valid": is_valid,
             "invalid_reason": invalid_reason,
             "similarity_report": read_json(version_dir / "similarity_report.json") if (version_dir / "similarity_report.json").exists() else {},
+            "strategy_fingerprint": strategy_fingerprint,
+            "duplicate_report": duplicate_report,
             "trade_under_min": trade_under_min,
             "cannot_be_official_best_unless_validation_strong": cannot_be_official_best_unless_validation_strong,
             "validation_strong": validation_strong,
@@ -4464,6 +4743,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "invalid_reason": invalid_reason,
             "overfit_result": {"is_overfit": is_overfit},
             "features": features,
+            "strategy_fingerprint": strategy_fingerprint,
+            "duplicate_report": duplicate_report,
             "spec_hash": spec_hash,
             "failure_reason": failure_reason,
             "reason_detail": reason_detail,
@@ -4490,6 +4771,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             blacklist_items.append({
                 "code_hash": code_hash,
                 "feature_signature": signature,
+                "strategy_fingerprint": strategy_fingerprint,
                 "features": features,
                 "failure_reason": failure_reason,
                 "avoid_next": "避免重复高频宽松且亏损放大的结构。",
@@ -4501,6 +4783,15 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             })
         holdout_failed = False
         holdout_ranges = list(runtime_goal.get("holdout_ranges", []) or [])
+        if is_best and "MultiCoin_AI_Strategy_20260530_014158_v045" in str((session_state.get("official_champion") or {}).get("strategy_class") or ""):
+            required_v045_holdouts = [
+                {"label": "v045_holdout_202601", "timerange": "20260101-20260131"},
+                {"label": "v045_holdout_20260115_20260215", "timerange": "20260115-20260215"},
+            ]
+            existing_holdout_timeranges = {str(item.get("timerange") or "") for item in holdout_ranges if isinstance(item, dict)}
+            for required_holdout in required_v045_holdouts:
+                if required_holdout["timerange"] not in existing_holdout_timeranges:
+                    holdout_ranges.append(required_holdout)
         if is_best and holdout_ranges:
             holdout_status = "completed"
             holdout_reason = ""
@@ -4638,6 +4929,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 "max_drawdown_pct": max_validation_drawdown_pct,
             },
             "score_breakdown": score_breakdown,
+            "strategy_fingerprint": strategy_fingerprint,
+            "duplicate_report": duplicate_report,
             "mutation_type": mutation_type,
             "failure_reason": failure_reason,
         })
@@ -4820,6 +5113,11 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         "session_best": session_best,
         "session_nearest_candidate": session_state.get("session_nearest_candidate"),
         "round_history": session_state.get("round_history", []),
+        "early_stop": {
+            "triggered": bool(iteration_stats.get("early_stop_triggered")),
+            "reason": iteration_stats.get("early_stop_reason", ""),
+            "counters": iteration_stats.get("early_stop_checked_counters", {}),
+        },
         "failed_mutation_types_this_run": session_state.get("failed_mutation_types_this_run", []),
         "successful_mutation_types_this_run": session_state.get("successful_mutation_types_this_run", []),
         "attempted_mutation_types_this_run": session_state.get("attempted_mutation_types_this_run", []),
@@ -5079,6 +5377,9 @@ def main() -> None:
     parser.add_argument("--manual-git-push", action="store_true", default=False, help="生成任务包后自动 git add / commit / push")
     parser.add_argument("--manual-git-branch", default=None, help="半自动任务包 Git 分支；默认 ai-manual/<task_name>")
     parser.add_argument("--random-sample-windows", type=int, default=0, help="每个策略在正式训练/验证/holdout/best 判断后额外随机采样回测窗口数；默认 0 关闭")
+    parser.add_argument("--early-stop-patience", type=int, default=12, help="连续 N 轮没有新 best 时提前停止；默认 12，<=0 关闭")
+    parser.add_argument("--early-stop-final-score-failures", type=int, default=8, help="连续 N 轮 final_score<=0 时提前停止；默认 8，<=0 关闭")
+    parser.add_argument("--early-stop-duplicate-strategies", type=int, default=5, help="连续 N 轮策略 fingerprint 与本次 run 已测策略高度重复时提前停止；默认 5，<=0 关闭")
     parser.add_argument("--random-sample-min-days", type=int, default=25, help="随机采样窗口最小天数，默认 25")
     parser.add_argument("--random-sample-max-days", type=int, default=35, help="随机采样窗口最大天数，默认 35")
     parser.add_argument("--random-sample-data-start", default=None, help="随机采样数据起始日期 YYYYMMDD，例如 20260101")

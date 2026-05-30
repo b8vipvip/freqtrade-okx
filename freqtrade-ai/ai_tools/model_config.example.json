@@ -6,7 +6,8 @@
     "api_key_env": "CLAUDE_API_KEY",
     "model_env": "CLAUDE_MODEL",
     "default_model": "claude-opus-4-7",
-    "model_pool_env": "CLAUDE_MODEL_POOL"
+    "model_pool_env": "CLAUDE_MODEL_POOL",
+    "provider_pool_env": "STRATEGY_ADVISOR_PROVIDER_POOL"
   },
   "code_generator": {
     "enabled": true,
@@ -15,7 +16,8 @@
     "api_key_env": "OPENAI_API_KEY",
     "model_env": "OPENAI_MODEL",
     "default_model": "gpt-5.5",
-    "model_pool_env": "OPENAI_MODEL_POOL"
+    "model_pool_env": "OPENAI_MODEL_POOL",
+    "provider_pool_env": "STRATEGY_CODEGEN_PROVIDER_POOL"
   },
   "code_repair": {
     "enabled": true,
@@ -24,6 +26,7 @@
     "api_key_env": "OPENAI_API_KEY",
     "model_env": "OPENAI_MODEL",
     "default_model": "gpt-5.5",
-    "model_pool_env": "OPENAI_MODEL_POOL"
+    "model_pool_env": "OPENAI_MODEL_POOL",
+    "provider_pool_env": "STRATEGY_CODEGEN_PROVIDER_POOL"
   }
 }
