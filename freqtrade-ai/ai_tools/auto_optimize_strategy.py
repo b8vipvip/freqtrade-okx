@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import difflib
 import fcntl
 import hashlib
 import json
@@ -442,6 +443,7 @@ class AIRoleRuntime:
     used_model: str = ""
     provider_pool: list[dict[str, Any]] = field(default_factory=list)
     used_provider: str = ""
+    forced_provider_offset: int = 0
 
     @property
     def display_name(self) -> str:
@@ -2065,6 +2067,91 @@ def strategy_similarity(a: dict[str, Any], b: dict[str, Any]) -> tuple[float, li
     return min(1.0, score), reasons
 
 
+def repeated_fingerprint_fields(a: dict[str, Any], b: dict[str, Any]) -> list[str]:
+    repeated: list[str] = []
+    for field in _strategy_fingerprint_payload(a).keys():
+        av = a.get(field)
+        bv = b.get(field)
+        if isinstance(av, list) or isinstance(bv, list):
+            if set(av or []) == set(bv or []) and (av or bv):
+                repeated.append(field)
+        elif av is not None and str(av) == str(bv):
+            repeated.append(field)
+    return repeated
+
+
+def _mutation_expected_changes(mutation_spec: dict[str, Any]) -> list[str]:
+    mutation_type = str(mutation_spec.get("mutation_type") or "")
+    expected: list[str] = []
+    if mutation_type in {"pair_specific_filter", "tag_specific_filter", "add_entry_filter", "tighten_entry_trigger"}:
+        expected.append("populate_entry_trend 中必须新增/收紧可检测 entry 条件")
+    if mutation_type in {"pair_specific_filter", "tag_specific_filter"} or "ETH/USDT" in json.dumps(mutation_spec, ensure_ascii=False):
+        expected.append("必须出现 ETH/USDT 明确分支或等价 pair-specific 条件")
+    spec_text = json.dumps(mutation_spec, ensure_ascii=False).lower()
+    indicator_names = ["ema20", "ema50", "adx", "atr_pct", "bollinger_middleband", "volume_mean_20"]
+    required_indicators = [name for name in indicator_names if name.lower() in spec_text]
+    if required_indicators:
+        expected.append("populate_indicators 必须计算指标: " + ", ".join(required_indicators))
+    structural_names = ["entry_conditions", "pair_filters", "indicators", "minimal_roi", "stoploss", "protection_cooldown"]
+    expected.append("至少改变一个可检测策略结构: " + ", ".join(structural_names))
+    return expected
+
+
+def _detected_feature_changes(features: dict[str, Any], matched_features: dict[str, Any]) -> list[str]:
+    changes: list[str] = []
+    for field in _strategy_fingerprint_payload(features).keys():
+        av = features.get(field)
+        bv = matched_features.get(field)
+        if isinstance(av, list) or isinstance(bv, list):
+            added = sorted(set(av or []) - set(bv or []))
+            removed = sorted(set(bv or []) - set(av or []))
+            if added or removed:
+                changes.append(f"{field}: added={added[:8]}, removed={removed[:8]}")
+        elif str(av) != str(bv):
+            changes.append(f"{field}: {bv!r} -> {av!r}")
+    return changes
+
+
+def build_duplicate_diff_summary(
+    *,
+    version: str,
+    matched_version: str,
+    similarity_score: float,
+    mutation_type: str,
+    expected_changes: list[str],
+    detected_changes: list[str],
+    repeated_fields: list[str],
+    current_code: str,
+    matched_code: str,
+) -> str:
+    lines = [
+        f"duplicate_version: {version}",
+        f"duplicate_with_version: {matched_version or 'unknown'}",
+        f"similarity_score: {similarity_score:.4f}",
+        f"mutation_type: {mutation_type or 'unknown'}",
+        "",
+        "expected_changes:",
+        *(f"- {item}" for item in expected_changes),
+        "",
+        "detected_changes:",
+        *(f"- {item}" for item in (detected_changes or ["无可检测结构变化"])),
+        "",
+        "repeated_fingerprint_fields:",
+        *(f"- {item}" for item in repeated_fields),
+        "",
+        "unified_diff:",
+    ]
+    diff = difflib.unified_diff(
+        matched_code.splitlines(),
+        current_code.splitlines(),
+        fromfile=f"{matched_version or 'matched'}/strategy.py",
+        tofile=f"{version}/strategy.duplicate.py",
+        lineterm="",
+    )
+    lines.extend(list(diff)[:400] or ["(代码 diff 为空)"])
+    return "\n".join(lines) + "\n"
+
+
 def build_compact_strategy_context(memory: list[dict[str, Any]], baseline: dict[str, Any], max_items: int = 5, max_chars: int = 2500) -> str:
     failed = [x for x in memory if not x.get("is_valid")]
     failed = failed[-max_items:]
@@ -2241,7 +2328,8 @@ def safe_ask_ai(
     last_status_code: int | None = None
 
     for attempt_idx in range(max_attempts):
-        provider_idx = attempt_idx % len(provider_pool) if role_runtime.switch_on_error else 0
+        start_offset = int(getattr(role_runtime, "forced_provider_offset", 0) or 0) % len(provider_pool)
+        provider_idx = (start_offset + attempt_idx) % len(provider_pool) if role_runtime.switch_on_error else start_offset
         provider = provider_pool[provider_idx]
         next_provider = provider_pool[(provider_idx + 1) % len(provider_pool)] if len(provider_pool) > 1 else provider
         provider_name = str(provider.get("name") or "legacy_env")
@@ -3792,7 +3880,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         if int(args.early_stop_final_score_failures) > 0 and final_score_failure_count >= int(args.early_stop_final_score_failures):
             return f"已连续 {int(args.early_stop_final_score_failures)} 轮 final_score<=0，触发 early stopping。"
         if int(args.early_stop_duplicate_strategies) > 0 and duplicate_count >= int(args.early_stop_duplicate_strategies):
-            return f"已连续 {int(args.early_stop_duplicate_strategies)} 轮策略 fingerprint 与历史高度重复，触发 early stopping。"
+            return "连续生成重复策略，停止以避免浪费 API。"
         return ""
 
     def flush_iteration_stats() -> None:
@@ -4003,6 +4091,12 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         print("1. 正在生成 mutation_spec（冠军-挑战者小步改动）……")
         print(f"当前策略顾问模型池：{', '.join(advisor_runtime.model_pool)}")
         print(f"当前代码生成模型池：{', '.join(code_runtime.model_pool)}")
+        duplicate_streak_before_codegen = _count_trailing(lambda row: str(row.get("invalid_reason") or "") == "策略与本次 run 已测试策略高度重复")
+        if duplicate_streak_before_codegen >= 2 and len(code_runtime.provider_pool or code_runtime.model_pool) > 1:
+            code_runtime.forced_provider_offset = (duplicate_streak_before_codegen - 1) % len(code_runtime.provider_pool or code_runtime.model_pool)
+            print(f"已连续 {duplicate_streak_before_codegen} 次生成重复策略，本轮强制切换 codegen provider/模型起点 offset={code_runtime.forced_provider_offset}。")
+        else:
+            code_runtime.forced_provider_offset = 0
         target_cfg = runtime_goal.get("target", {}) or {}
         baseline_cfg = runtime_goal.get("baseline", {}) or {}
         min_trades = int(target_cfg.get("min_trades", 25))
@@ -4168,6 +4262,11 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             f"- 交易数：{baseline_cfg.get('total_trades', 47)}\n"
             "输出要求：\n"
             "- 只输出可运行的完整 Python 策略代码，不要解释。\n"
+            "- 必须真实落地 mutation_spec，不能只改 class name、不能只改注释、不能只改变量名。\n"
+            "- 必须至少改变一个可由 fingerprint 检测到的策略结构：entry_conditions / pair-specific branch / indicator / ROI / stoploss / protections 之一。\n"
+            "- 如果 mutation_spec.mutation_type 是 pair_specific_filter、tag_specific_filter、add_entry_filter、tighten_entry_trigger，必须在 populate_entry_trend 中生成对应的实际条件，并影响 enter_long。\n"
+            "- 如果 mutation_spec 要求 ETH/USDT 专属过滤，代码里必须出现明确的 ETH/USDT 分支或等价 pair-specific 条件（例如 metadata['pair'] == 'ETH/USDT' 或 pair 变量判断）。\n"
+            "- 如果 mutation_spec 要求新增指标（ema20、ema50、adx、atr_pct、bollinger_middleband、volume_mean_20 等），必须在 populate_indicators 中实际计算这些 dataframe 列，并在入场条件中引用相关列。\n"
             "- 避免把入场条件写成几乎永远不触发的苛刻组合。\n"
         )
         (version_dir / "codegen_prompt.txt").write_text(prompt, encoding="utf-8")
@@ -4269,7 +4368,13 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "similarity_score": 0.0,
             "reasons": [],
             "decision": "continue",
+            "repeated_fingerprint_fields": [],
+            "mutation_type": mutation_type,
+            "expected_changes": _mutation_expected_changes(strategy_spec),
+            "detected_changes": [],
+            "why_rejected": "",
         }
+        matched_tested: dict[str, Any] | None = None
         for tested in tested_strategy_fingerprints:
             tested_fp = tested.get("strategy_fingerprint", {}) or {}
             tested_features = tested.get("features", {}) or {}
@@ -4284,11 +4389,56 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                     "similarity_score": 1.0 if fp_equal else round(float(fp_score), 4),
                     "reasons": (["strategy_fingerprint 完全相同"] if fp_equal else fp_reasons),
                     "decision": "skip_backtest",
+                    "repeated_fingerprint_fields": repeated_fingerprint_fields(features, tested_features),
+                    "detected_changes": _detected_feature_changes(features, tested_features),
+                    "why_rejected": "当前策略 fingerprint 与本次 run 已测试策略完全相同或相似度达到重复阈值，跳过正式 strategy.py 保存与回测。",
                 })
+                matched_tested = tested
                 break
         write_json(version_dir / "strategy_fingerprint.json", strategy_fingerprint)
         write_json(version_dir / "duplicate_report.json", duplicate_report)
+        print("========== 重复判定拆分 ==========")
+        print(f"historical_similarity: similar_to={similarity_report['similar_to'] or '无'}, score={float(similarity_report['similarity_score']):.2f}, decision={similarity_report['decision']}")
+        print(f"current_run_similarity: duplicate_with={duplicate_report['matched_version'] or '无'}, score={float(duplicate_report['similarity_score']):.2f}, is_duplicate={'是' if duplicate_report['is_duplicate'] else '否'}")
+        print(f"final_duplicate_decision: {duplicate_report['decision']}")
         if duplicate_report["is_duplicate"]:
+            duplicate_strategy_path = version_dir / "strategy.duplicate.py"
+            duplicate_strategy_path.write_text(code, encoding="utf-8")
+            matched_code = ""
+            matched_version = duplicate_report.get("matched_version") or ""
+            if matched_version:
+                matched_strategy_path = run_dir / str(matched_version) / "strategy.py"
+                if matched_strategy_path.exists():
+                    matched_code = matched_strategy_path.read_text(encoding="utf-8", errors="ignore")
+            if not matched_code and matched_tested:
+                matched_code = str(matched_tested.get("code") or "")
+            duplicate_reason = {
+                "duplicate_with_version": duplicate_report.get("matched_version", ""),
+                "similarity_score": duplicate_report.get("similarity_score", 0.0),
+                "repeated_fingerprint_fields": duplicate_report.get("repeated_fingerprint_fields", []),
+                "mutation_type": mutation_type,
+                "expected_changes": duplicate_report.get("expected_changes", []),
+                "detected_changes": duplicate_report.get("detected_changes", []),
+                "why_rejected": duplicate_report.get("why_rejected", ""),
+            }
+            write_json(version_dir / "duplicate_reason.json", duplicate_reason)
+            (version_dir / "duplicate_diff_summary.txt").write_text(
+                build_duplicate_diff_summary(
+                    version=ver,
+                    matched_version=str(duplicate_report.get("matched_version") or ""),
+                    similarity_score=float(duplicate_report.get("similarity_score") or 0.0),
+                    mutation_type=mutation_type,
+                    expected_changes=list(duplicate_report.get("expected_changes") or []),
+                    detected_changes=list(duplicate_report.get("detected_changes") or []),
+                    repeated_fields=list(duplicate_report.get("repeated_fingerprint_fields") or []),
+                    current_code=code,
+                    matched_code=matched_code,
+                ),
+                encoding="utf-8",
+            )
+            print(f"重复策略草稿已保存：{duplicate_strategy_path}")
+            print(f"重复原因已保存：{version_dir / 'duplicate_reason.json'}")
+            print(f"重复 diff 摘要已保存：{version_dir / 'duplicate_diff_summary.txt'}")
             invalid_reason = "策略与本次 run 已测试策略高度重复"
             previous_failure_reason = invalid_reason
             status["train_backtest_status"] = "跳过"
@@ -4412,6 +4562,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "strategy_class": class_name,
             "strategy_fingerprint": strategy_fingerprint,
             "features": features,
+            "strategy_file": str(version_dir / "strategy.py"),
+            "code": code,
         })
 
         print(f"6. 正在回测训练区间：{train.timerange}")
@@ -5450,7 +5602,7 @@ def main() -> None:
     parser.add_argument("--random-sample-windows", type=int, default=0, help="每个策略在正式训练/验证/holdout/best 判断后额外随机采样回测窗口数；默认 0 关闭")
     parser.add_argument("--early-stop-patience", type=int, default=12, help="连续 N 轮没有新 best 时提前停止；默认 12，<=0 关闭")
     parser.add_argument("--early-stop-final-score-failures", type=int, default=8, help="连续 N 轮 final_score<=0 时提前停止；默认 8，<=0 关闭")
-    parser.add_argument("--early-stop-duplicate-strategies", type=int, default=5, help="连续 N 轮策略 fingerprint 与本次 run 已测策略高度重复时提前停止；默认 5，<=0 关闭")
+    parser.add_argument("--early-stop-duplicate-strategies", type=int, default=3, help="连续 N 轮策略 fingerprint 与本次 run 已测策略高度重复时提前停止；默认 3，<=0 关闭")
     parser.add_argument("--random-sample-min-days", type=int, default=25, help="随机采样窗口最小天数，默认 25")
     parser.add_argument("--random-sample-max-days", type=int, default=35, help="随机采样窗口最大天数，默认 35")
     parser.add_argument("--random-sample-data-start", default=None, help="随机采样数据起始日期 YYYYMMDD，例如 20260101")
