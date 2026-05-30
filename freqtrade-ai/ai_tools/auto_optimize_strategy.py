@@ -1368,6 +1368,92 @@ def _build_baseline_best(goal: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _strategy_label(data: dict[str, Any] | None, default: str = "无") -> str:
+    if not isinstance(data, dict) or not data:
+        return default
+    return str(data.get("strategy_class") or data.get("class_name") or data.get("version") or default)
+
+
+def _compact_prompt_json(data: Any, max_chars: int = 6000) -> str:
+    if data is None:
+        return "null"
+    text = json.dumps(data, ensure_ascii=False, default=str)
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "...<truncated>"
+
+
+def _round_summary_label(summary: dict[str, Any] | None) -> str:
+    if not isinstance(summary, dict) or not summary:
+        return "无"
+    version = summary.get("version") or summary.get("iteration") or "未知轮次"
+    valid_text = "有效" if summary.get("is_valid") else "无效"
+    reason = summary.get("invalid_reason") or summary.get("failure_reason") or "通过"
+    return f"{version}，{valid_text}，原因 {reason}"
+
+
+def _append_unique(items: list[str], value: Any) -> None:
+    text = str(value or "").strip()
+    if text and text not in items:
+        items.append(text)
+
+
+def _strategy_record_from_round(
+    *,
+    version: str,
+    class_name: str,
+    strategy_file: Path,
+    train_metrics: dict[str, Any] | None,
+    validation_metrics: list[dict[str, Any]] | None,
+    final_score: float,
+    is_valid: bool,
+    invalid_reason: str,
+    features: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    train = train_metrics or {}
+    return {
+        "version": version,
+        "strategy_class": class_name,
+        "strategy_file": str(strategy_file),
+        "train_metrics": train,
+        "validation_metrics": validation_metrics or [],
+        "final_score": final_score,
+        "is_valid": is_valid,
+        "invalid_reason": invalid_reason,
+        "features": features or {},
+    }
+
+
+def _nearest_score_for_session(candidate: dict[str, Any] | None, target_cfg: dict[str, Any], baseline_cfg: dict[str, Any]) -> tuple[float, float, float, float, float]:
+    if not isinstance(candidate, dict) or not candidate:
+        return (1e18, 1e18, 1e18, 1e18, 1e18)
+    train = candidate.get("train_metrics", {}) or {}
+    total_trades = _safe_int(train.get("total_trades") if "total_trades" in train else candidate.get("total_trades"))
+    if total_trades <= 0:
+        return (1e18, 1e18, 1e18, 1e18, 1e18)
+    min_trades = _safe_int(target_cfg.get("min_trades", 25))
+    max_trades = _safe_int(target_cfg.get("max_trades", 80))
+    target_dd = _safe_float(target_cfg.get("max_drawdown_pct", 3.0))
+    baseline_profit = _safe_float(baseline_cfg.get("profit_total_pct"))
+    profit_pct = _safe_float(train.get("profit_total_pct") if "profit_total_pct" in train else candidate.get("train_profit_pct"))
+    profit_factor = _safe_float(train.get("profit_factor") if "profit_factor" in train else candidate.get("profit_factor"))
+    drawdown_pct = _safe_float(train.get("max_drawdown_pct") if "max_drawdown_pct" in train else candidate.get("max_drawdown_pct"))
+    trade_penalty = max(0, min_trades - total_trades) + max(0, total_trades - max_trades)
+    return (
+        max(0.0, abs(profit_pct - baseline_profit)),
+        max(0.0, drawdown_pct - target_dd),
+        float(trade_penalty),
+        -profit_factor,
+        -_safe_float(candidate.get("final_score")),
+    )
+
+
+def _is_better_session_nearest(candidate: dict[str, Any] | None, current: dict[str, Any] | None, target_cfg: dict[str, Any], baseline_cfg: dict[str, Any]) -> bool:
+    if not isinstance(candidate, dict) or not candidate:
+        return False
+    return _nearest_score_for_session(candidate, target_cfg, baseline_cfg) < _nearest_score_for_session(current, target_cfg, baseline_cfg)
+
+
 def _load_champion(runtime_goal: dict[str, Any]) -> dict[str, Any]:
     if BEST_STRATEGY_FILE.exists():
         try:
@@ -3158,6 +3244,19 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     historical_best_mem = _load_json_or_none(BEST_STRATEGY_FILE)
     nearest_mem = _load_json_or_none(NEAREST_CANDIDATE_FILE)
     last_run_summary_mem = _load_json_or_none(LAST_RUN_SUMMARY_FILE)
+    loaded_champion_meta = champion.get("meta", {}) or _build_baseline_best(runtime_goal)
+    session_state: dict[str, Any] = {
+        "official_champion": loaded_champion_meta,
+        "in_memory_champion": loaded_champion_meta,
+        "session_best": None,
+        "session_nearest_candidate": nearest_mem,
+        "last_round_summary": None,
+        "round_history": [],
+        "failed_mutation_types_this_run": [],
+        "successful_mutation_types_this_run": [],
+        "common_failure_patterns_this_run": [],
+        "attempted_mutation_types_this_run": [],
+    }
     print("========== 记忆加载状态 ==========")
     h_status = "reset" if _is_reset_best(historical_best_mem) else ("存在" if historical_best_mem else "不存在")
     print(f"historical_best：{h_status}")
@@ -3344,6 +3443,53 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                     print(f"写入最小 summary 仍失败：{second_exc}。继续下一轮。")
             return summary_path_local
 
+        def update_session_state_after_round(
+            *,
+            summary_path: Path | None = None,
+            summary_data: dict[str, Any] | None = None,
+            strategy_record: dict[str, Any] | None = None,
+            became_best: bool = False,
+            nearest_candidate_record: dict[str, Any] | None = None,
+        ) -> None:
+            round_summary = summary_data
+            if round_summary is None and summary_path is not None and summary_path.exists():
+                try:
+                    round_summary = read_json(summary_path)
+                except Exception:
+                    round_summary = None
+            if not isinstance(round_summary, dict):
+                round_summary = {
+                    "version": ver,
+                    "strategy_class": class_name,
+                    "is_valid": bool(is_valid),
+                    "is_best": bool(is_best),
+                    "invalid_reason": invalid_reason,
+                    "failure_reason": failure_reason or invalid_reason,
+                    "mutation_type": mutation_type,
+                }
+            round_summary.setdefault("version", ver)
+            round_summary.setdefault("mutation_type", mutation_type)
+            session_state["last_round_summary"] = round_summary
+            session_state["round_history"].append(round_summary)
+            _append_unique(session_state["attempted_mutation_types_this_run"], mutation_type)
+            if round_summary.get("is_valid"):
+                _append_unique(session_state["successful_mutation_types_this_run"], mutation_type)
+            else:
+                _append_unique(session_state["failed_mutation_types_this_run"], mutation_type)
+                _append_unique(session_state["common_failure_patterns_this_run"], round_summary.get("invalid_reason") or round_summary.get("failure_reason"))
+
+            if became_best and strategy_record:
+                session_state["official_champion"] = strategy_record
+                session_state["in_memory_champion"] = strategy_record
+                session_state["session_best"] = strategy_record
+                print(f"第 {ver} 轮成为新 best，下一轮将以该策略作为 in_memory_champion/session_parent 参考。")
+                return
+
+            candidate = nearest_candidate_record or strategy_record
+            if candidate and not became_best and _is_better_session_nearest(candidate, session_state.get("session_nearest_candidate"), target_cfg, baseline_cfg):
+                session_state["session_nearest_candidate"] = candidate
+                print(f"第 {ver} 轮未成为 best，但已更新为本次 run 的 nearest_candidate，下一轮将作为参考。")
+
         print(f"\n========== 第 {i} 轮 / {ver} ==========")
         print("1. 正在生成 mutation_spec（冠军-挑战者小步改动）……")
         print(f"当前策略顾问模型池：{', '.join(advisor_runtime.model_pool)}")
@@ -3363,24 +3509,59 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             if prev_train_trades == 0 else
             "优先保证训练区间有稳定交易，不要把过滤条件堆得过严。"
         )
-        failure_context = f"上一轮失败原因：{previous_failure_reason}\n" if previous_failure_reason else ""
+        last_round_summary = session_state.get("last_round_summary")
+        last_round_failure = ""
+        if isinstance(last_round_summary, dict) and last_round_summary:
+            last_round_failure = str(last_round_summary.get("invalid_reason") or last_round_summary.get("failure_reason") or "通过")
+        failure_context = f"上一轮失败原因：{last_round_failure or previous_failure_reason}\n" if (last_round_failure or previous_failure_reason) else ""
         failure_context += "最近失败策略共同原因通常不是没有盈利单，而是固定止损或 trailing_stop_loss 吃掉 ROI 收益。\n"
         compact_memory = build_compact_strategy_context(memory_items, baseline_cfg, memory_max_items, memory_max_chars) if memory_enabled else ""
+        official_champion = session_state.get("official_champion") or _build_baseline_best(runtime_goal)
+        in_memory_champion = session_state.get("in_memory_champion") or official_champion
+        session_best_record = session_state.get("session_best")
+        session_nearest_record = session_state.get("session_nearest_candidate")
         session_parent_candidates = {
-            "historical_best": historical_best_mem if historical_best_mem and not _is_reset_best(historical_best_mem) else None,
-            "nearest_candidate": nearest_mem,
+            "historical_best": official_champion,
+            "session_best": session_best_record,
+            "nearest_candidate": session_nearest_record,
             "baseline": {"strategy_class": "baseline", "train_metrics": baseline_cfg},
         }
-        official_champion_name = "historical_best" if session_parent_candidates["historical_best"] else "baseline"
+        official_champion_name = _strategy_label(official_champion, "baseline")
+        in_memory_champion_name = _strategy_label(in_memory_champion, "baseline")
+        prompt_has_last_round = bool(last_round_summary)
+        print("========== 本轮迭代上下文 ==========")
+        print(f"当前轮：{ver}")
+        print(f"上一轮结果：{_round_summary_label(last_round_summary)}")
+        print(f"当前 in_memory_champion：{in_memory_champion_name}")
+        print(f"当前 session_best：{_strategy_label(session_best_record)}")
+        print(f"当前 session_nearest_candidate：{_strategy_label(session_nearest_record)}")
+        print(f"本次 run 已失败 mutation_type：{session_state['failed_mutation_types_this_run'] or '无'}")
+        print(f"本次 run 已成功 mutation_type：{session_state['successful_mutation_types_this_run'] or '无'}")
+        print(f"本轮 advisor prompt 已包含上一轮结果：{'是' if prompt_has_last_round else '否'}")
         print(f"当前正式 champion：{official_champion_name}")
+        print(f"当前 in_memory_champion：{in_memory_champion_name}")
         print("当前 session_parent 候选：")
-        print(f"- historical_best: {(session_parent_candidates['historical_best'] or {}).get('strategy_class', '无')}")
-        print(f"- nearest_candidate: {(session_parent_candidates['nearest_candidate'] or {}).get('strategy_class', '无')}")
-        spec_prompt = _strategy_spec_prompt(class_name, runtime_goal, baseline_cfg, compact_memory, previous_failure_reason)
+        print(f"- historical_best: {_strategy_label(session_parent_candidates['historical_best'])}")
+        print(f"- session_best: {_strategy_label(session_parent_candidates['session_best'])}")
+        print(f"- nearest_candidate: {_strategy_label(session_parent_candidates['nearest_candidate'])}")
+        spec_prompt = _strategy_spec_prompt(class_name, runtime_goal, baseline_cfg, compact_memory, last_round_failure or previous_failure_reason)
+        spec_prompt += "\n\n========== 同一次 run 动态 session_state（必须优先于跨 run 旧记忆）==========\n"
+        spec_prompt += "当前 official_champion=" + _compact_prompt_json(official_champion, 5000) + "\n"
+        spec_prompt += "当前 in_memory_champion=" + _compact_prompt_json(in_memory_champion, 5000) + "\n"
+        spec_prompt += "当前 session_best=" + _compact_prompt_json(session_best_record, 5000) + "\n"
+        spec_prompt += "当前 session_nearest_candidate=" + _compact_prompt_json(session_nearest_record, 5000) + "\n"
+        spec_prompt += "上一轮 last_round_summary=" + _compact_prompt_json(last_round_summary, 5000) + "\n"
+        spec_prompt += "本次 run 已尝试 mutation_type=" + _compact_prompt_json(session_state["attempted_mutation_types_this_run"], 2000) + "\n"
+        spec_prompt += "本次 run 已失败 mutation_type=" + _compact_prompt_json(session_state["failed_mutation_types_this_run"], 2000) + "\n"
+        spec_prompt += "本次 run 已成功 mutation_type=" + _compact_prompt_json(session_state["successful_mutation_types_this_run"], 2000) + "\n"
+        spec_prompt += "本次 run 已出现失败模式=" + _compact_prompt_json(session_state["common_failure_patterns_this_run"], 3000) + "\n"
+        spec_prompt += "请不要重复上一轮失败方向；必须在 reason/session_parent_reason 中说明本轮为什么选择当前 mutation_type。\n"
         if last_run_summary_mem:
-            spec_prompt += "\nlast_run_summary=" + json.dumps(last_run_summary_mem, ensure_ascii=False)[:4000] + "\n"
-        spec_prompt += f"\nchampion_strategy_class={champion.get('meta', {}).get('strategy_class', 'baseline')}\n"
-        spec_prompt += f"\n已失败 mutation_type（避免重复）={sorted(used_failed_mutations)}\n"
+            spec_prompt += "\n跨 run last_run_summary=" + _compact_prompt_json(last_run_summary_mem, 4000) + "\n"
+        spec_prompt += "\n跨 run strategy_lessons=" + _compact_prompt_json(lessons_items[-memory_max_items:], 4000) + "\n"
+        spec_prompt += "\n跨 run strategy_blacklist=" + _compact_prompt_json(blacklist_items[-memory_max_items:], 4000) + "\n"
+        spec_prompt += f"\nchampion_strategy_class={_strategy_label(in_memory_champion, 'baseline')}\n"
+        spec_prompt += f"\n已失败 mutation_type（避免重复）={sorted(set(used_failed_mutations).union(session_state['failed_mutation_types_this_run']))}\n"
         (version_dir / "advisor_prompt.txt").write_text(spec_prompt, encoding="utf-8")
         print("正在调用策略顾问模型生成 mutation_spec……")
         try:
@@ -3401,7 +3582,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             err_msg = str(exc)
             previous_failure_reason = f"策略顾问模型调用失败：{err_msg}"
             invalid_reason = previous_failure_reason
-            write_iteration_summary()
+            summary_path = write_iteration_summary()
+            update_session_state_after_round(summary_path=summary_path)
             leaderboard.append({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": invalid_reason})
             status["advisor_status"] = "AI 调用失败"
             status["invalid_reason"] = invalid_reason
@@ -3417,7 +3599,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         if not spec_text:
             previous_failure_reason = "strategy_advisor 生成 mutation_spec 失败。"
             invalid_reason = "mutation_spec JSON 解析失败"
-            write_iteration_summary()
+            summary_path = write_iteration_summary()
+            update_session_state_after_round(summary_path=summary_path)
             leaderboard.append({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": invalid_reason})
             print(f"strategy_spec 原始返回已保存：{version_dir / 'strategy_spec.raw.txt'}")
             print(f"8. 第 {i} 轮完成：无效，原因：{invalid_reason}")
@@ -3427,7 +3610,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         except (ValueError, json.JSONDecodeError):
             previous_failure_reason = "mutation_spec 不是有效 JSON object。"
             invalid_reason = "mutation_spec JSON 解析失败"
-            write_iteration_summary()
+            summary_path = write_iteration_summary()
+            update_session_state_after_round(summary_path=summary_path)
             leaderboard.append({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": invalid_reason})
             print(f"strategy_spec 解析失败，请检查：{version_dir / 'strategy_spec.raw.txt'}")
             print(f"8. 第 {i} 轮完成：无效，原因：{invalid_reason}")
@@ -3436,6 +3620,11 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         print(f"2. mutation_spec 已保存：{version_dir / 'mutation_spec.json'}")
         spec_hash = hashlib.sha256(json.dumps(strategy_spec, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
         mutation_type = str(strategy_spec.get("mutation_type", "") or "")
+        with (version_dir / "advisor_prompt.txt").open("a", encoding="utf-8") as prompt_audit:
+            prompt_audit.write("\n\n========== advisor 返回的本轮选择（审计）==========\n")
+            prompt_audit.write(f"本轮选择 mutation_type={mutation_type or '未提供'}\n")
+            prompt_audit.write(f"本轮为什么选择当前 mutation_type={strategy_spec.get('reason') or strategy_spec.get('session_parent_reason') or '未提供'}\n")
+            prompt_audit.write("完整 mutation_spec=" + json.dumps(strategy_spec, ensure_ascii=False, indent=2) + "\n")
         prompt = (
             f"请基于 champion 策略代码进行一次最小修改生成 challenger，只输出 Python 代码。类名必须为 {class_name}，继承 IStrategy，"
             f"timeframe='{timeframe}'，并实现 populate_indicators/populate_entry_trend/populate_exit_trend。\n"
@@ -3485,7 +3674,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             print("本轮停止：代码生成模型多次失败，跳过本轮回测。")
             if response_text:
                 (version_dir / "codegen.raw.txt").write_text(response_text, encoding="utf-8")
-            write_iteration_summary()
+            summary_path = write_iteration_summary()
+            update_session_state_after_round(summary_path=summary_path)
             leaderboard.append({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": invalid_reason})
             continue
         (version_dir / "codegen.raw.txt").write_text(response_text, encoding="utf-8")
@@ -3500,6 +3690,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         parent_pool = [
             ("session_parent", champion.get("meta") if champion.get("meta") else None),
             ("historical_best", session_parent_candidates.get("historical_best")),
+            ("session_best", session_parent_candidates.get("session_best")),
             ("nearest_candidate", session_parent_candidates.get("nearest_candidate")),
         ]
         best_match = {"score": 0.0, "type": "none", "item": None, "reasons": []}
@@ -3535,7 +3726,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 similarity_report["decision"] = "auto_reject"
                 write_json(version_dir / "similarity_report.json", similarity_report)
                 invalid_reason = "自动拒绝：与失败黑名单高度相似"
-                write_iteration_summary({"similarity_report": similarity_report})
+                summary_path = write_iteration_summary({"similarity_report": similarity_report})
+                update_session_state_after_round(summary_path=summary_path)
                 leaderboard.append({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": "自动拒绝：与失败黑名单高度相似"})
                 continue
             if not args.auto_approve:
@@ -3548,7 +3740,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                     similarity_report["decision"] = "user_reject"
                     write_json(version_dir / "similarity_report.json", similarity_report)
                     invalid_reason = "用户拒绝回测相似失败策略。"
-                    write_iteration_summary({"similarity_report": similarity_report})
+                    summary_path = write_iteration_summary({"similarity_report": similarity_report})
+                    update_session_state_after_round(summary_path=summary_path)
                     leaderboard.append({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": "用户拒绝回测相似失败策略。"})
                     continue
                 similarity_report["decision"] = "user_override_continue"
@@ -3583,6 +3776,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             if pyc.returncode != 0:
                 print(pyc.stderr)
                 print(f"第 {i} 轮语法检查失败，跳过。")
+                invalid_reason = "Python 语法检查失败"
+                previous_failure_reason = invalid_reason
+                summary_path = write_iteration_summary()
+                update_session_state_after_round(summary_path=summary_path)
                 continue
         status["syntax_check_status"] = "成功"
         validate_strategy_class_name(strategy_file, class_name)
@@ -3629,6 +3826,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             print(f"  --timerange {train.timerange} \\")
             print("  --export trades \\")
             print("  --cache none")
+            summary_path = write_iteration_summary({"features": features})
+            update_session_state_after_round(summary_path=summary_path, strategy_record=card)
             continue
         status["static_check_status"] = "成功"
 
@@ -3658,7 +3857,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 expected_strategy=class_name,
                 error="backtest_failed",
             )
-            write_iteration_summary({"backtest_errors": backtest_errors})
+            summary_path = write_iteration_summary({"backtest_errors": backtest_errors})
+            update_session_state_after_round(summary_path=summary_path)
             iteration_stats["invalid_strategy_count"] += 1
             status["is_valid"] = False
             status["invalid_reason"] = invalid_reason
@@ -3677,7 +3877,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             _print_backtest_mismatch_summary(backtest_errors)
             status["train_backtest_status"] = "解析失败"
             invalid_reason = "训练区间回测结果 zip 不匹配或缺失"
-            write_iteration_summary({"backtest_errors": backtest_errors})
+            summary_path = write_iteration_summary({"backtest_errors": backtest_errors})
+            update_session_state_after_round(summary_path=summary_path)
             iteration_stats["invalid_strategy_count"] += 1
             status["is_valid"] = False
             status["invalid_reason"] = invalid_reason
@@ -3690,7 +3891,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             _print_backtest_mismatch_summary(backtest_errors)
             status["train_backtest_status"] = "解析失败"
             invalid_reason = "训练区间回测结果解析失败"
-            write_iteration_summary({"backtest_errors": backtest_errors})
+            summary_path = write_iteration_summary({"backtest_errors": backtest_errors})
+            update_session_state_after_round(summary_path=summary_path)
             iteration_stats["invalid_strategy_count"] += 1
             status["is_valid"] = False
             status["invalid_reason"] = invalid_reason
@@ -4138,23 +4340,44 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             status["is_valid"] = False
             status["is_best"] = False
             status["invalid_reason"] = invalid_reason
+            update_session_state_after_round(summary_path=summary_path)
             flush_iteration_stats()
             continue
+        leaderboard_entry["is_best"] = bool(is_best)
+        leaderboard_entry["is_valid"] = bool(is_valid)
+        leaderboard_entry["invalid_reason"] = invalid_reason
+        leaderboard_entry["reason_detail"] = reason_detail
+        round_strategy_record = _strategy_record_from_round(
+            version=ver,
+            class_name=class_name,
+            strategy_file=strategy_file,
+            train_metrics=train_metrics,
+            validation_metrics=validation_metrics,
+            final_score=final_score,
+            is_valid=is_valid,
+            invalid_reason=invalid_reason,
+            features=features,
+        )
+        round_strategy_record.update({
+            "source_run_id": run_id,
+            "avg_validation_metrics": {
+                "profit_total_pct": avg_validation_profit_pct,
+                "profit_factor": avg_validation_profit_factor,
+                "max_drawdown_pct": max_validation_drawdown_pct,
+            },
+            "score_breakdown": score_breakdown,
+            "mutation_type": mutation_type,
+            "failure_reason": failure_reason,
+        })
         if is_best:
             best = round_data
             iteration_stats["new_best_update_count"] += 1
             best_summary_path = summary_path
             write_json(run_dir / "best_strategy.json", best)
             shutil.copy2(strategy_file, GENERATED_DIR / f"BEST_{strategy_family}.py")
-            champion = {"meta": {"strategy_class": class_name, "strategy_file": str(strategy_file), "train_metrics": train_metrics}, "code": code}
-            historical_best_mem = {
-                "strategy_class": class_name,
-                "strategy_file": str(strategy_file),
-                "train_metrics": train_metrics,
-                "validation_metrics": validation_metrics,
-                "final_score": final_score,
-            }
-            print(f"本轮 {ver} 成为新 best，下一轮将以 {ver} 作为 session_parent 候选。")
+            champion = {"meta": round_strategy_record, "code": code}
+            historical_best_mem = round_strategy_record
+        update_session_state_after_round(summary_path=summary_path, strategy_record=round_strategy_record, became_best=is_best)
         print(f"8. 第 {i} 轮完成：{'有效' if is_valid else '无效'}，原因：{invalid_reason or '通过'}")
         print(f"是否成为新最佳：{'是' if is_best else '否'}")
         if not is_best:
@@ -4266,6 +4489,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         if oversized_fallback and _safe_int(closest_failed.get("total_trades")) > max_trades_target:
             nearest_candidate["trade_over_limit"] = True
             nearest_candidate.setdefault("why_nearest", []).append("本轮无目标交易数范围候选，使用轻度超标候选仅作参考")
+    session_nearest_final = session_state.get("session_nearest_candidate")
+    if _is_better_session_nearest(session_nearest_final, nearest_candidate, target_cfg, baseline_cfg):
+        nearest_candidate = session_nearest_final
+    if nearest_candidate:
         write_json(NEAREST_CANDIDATE_FILE, nearest_candidate)
 
     historical_best = read_json(BEST_STRATEGY_FILE) if BEST_STRATEGY_FILE.exists() else None
@@ -4296,22 +4523,32 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             continue
     _print_backtest_mismatch_summary(all_backtest_errors)
     common_failure_patterns = _build_common_failure_patterns(invalid_rows, target_cfg)
+    if session_state.get("common_failure_patterns_this_run"):
+        common_failure_patterns = sorted(set(common_failure_patterns).union(session_state["common_failure_patterns_this_run"]))[:10]
     nearest_advisor_notes = _build_nearest_advisor_notes(nearest_candidate)
+    session_best = session_state.get("session_best") or session_best
     last_run_summary = {
         "run_id": run_id,
         "created_at": datetime.utcnow().isoformat(),
         "target": target_cfg,
         "official_best": current_best_saved if 'current_best_saved' in locals() else None,
         "historical_best": historical_best_mem,
+        "final_official_champion": session_state.get("official_champion"),
+        "final_in_memory_champion": session_state.get("in_memory_champion"),
         "nearest_candidate": nearest_candidate,
         "session_best": session_best,
+        "session_nearest_candidate": session_state.get("session_nearest_candidate"),
+        "round_history": session_state.get("round_history", []),
+        "failed_mutation_types_this_run": session_state.get("failed_mutation_types_this_run", []),
+        "successful_mutation_types_this_run": session_state.get("successful_mutation_types_this_run", []),
+        "attempted_mutation_types_this_run": session_state.get("attempted_mutation_types_this_run", []),
         "trade_count_warning": trade_count_warning,
         "failed_versions": [r.get("version") for r in invalid_rows],
         "common_failure_patterns": common_failure_patterns,
         "backtest_errors": all_backtest_errors,
         "nearest_advisor_notes": nearest_advisor_notes,
         "recommended_next_mutation_types": ["add_entry_filter", "tighten_entry_trigger", "remove_bad_entry_condition", "pair_specific_filter", "tag_specific_filter"],
-        "forbidden_next_mutation_types": sorted(used_failed_mutations),
+        "forbidden_next_mutation_types": sorted(set(used_failed_mutations).union(session_state.get("failed_mutation_types_this_run", []))),
         "worst_pairs": sorted(best_pair_metrics, key=lambda x: _safe_float(x.get("profit_total_abs")))[:5],
         "best_pairs": sorted(best_pair_metrics, key=lambda x: _safe_float(x.get("profit_total_abs")), reverse=True)[:5],
         "worst_entry_tags": sorted(best_entry_tag_metrics, key=lambda x: _safe_float(x.get("profit_total_abs")))[:5],
@@ -4360,6 +4597,16 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         cb_avg_profit, cb_avg_pf, cb_max_dd = _aggregate_validation_metrics(best_validation_metrics)
         current_best_saved = {"strategy_class": best["class_name"], "strategy_file": str(best_strategy_file), "source_run_id": run_id, "version": best_version, "train_metrics": best["train_metrics"], "validation_metrics": best_validation_metrics, "avg_validation_metrics": {"profit_total_pct": cb_avg_profit, "profit_factor": cb_avg_pf, "max_drawdown_pct": cb_max_dd}, "score_breakdown": {}, "final_score": best["final_score"], "created_at": datetime.utcnow().isoformat(), "why_best": "本轮 final_score 最高。", "is_overfit": bool(best.get("is_overfit"))}
         write_json(BEST_STRATEGY_FILE, current_best_saved)
+        session_state["official_champion"] = current_best_saved
+        session_state["in_memory_champion"] = current_best_saved
+        if session_state.get("session_best"):
+            session_state["session_best"] = current_best_saved
+            session_best = current_best_saved
+        last_run_summary["official_best"] = current_best_saved
+        last_run_summary["final_official_champion"] = session_state.get("official_champion")
+        last_run_summary["final_in_memory_champion"] = session_state.get("in_memory_champion")
+        last_run_summary["session_best"] = session_best
+        write_json(LAST_RUN_SUMMARY_FILE, last_run_summary)
     else:
         if args.force_session_best and session_best:
             write_json(run_dir / "session_best.json", session_best)
@@ -4386,7 +4633,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         print("当前正式 best：来源=无")
     if session_best:
         reason = session_best.get("invalid_reason") or ("通过" if session_best.get("is_valid") else "未通过有效性约束")
-        print(f"本轮 session best：策略名={session_best.get('class_name')}；final_score={_safe_float(session_best.get('final_score')):.4f}；未成为正式 best 原因：{reason}")
+        print(f"本轮 session best：策略名={_strategy_label(session_best)}；final_score={_safe_float(session_best.get('final_score')):.4f}；未成为正式 best 原因：{reason}")
     if closest_failed:
         print("========== 本轮最接近目标的失败策略 ==========")
         print(f"版本：{closest_failed.get('version')}")
