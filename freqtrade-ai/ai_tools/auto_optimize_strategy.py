@@ -1700,6 +1700,246 @@ def print_prompt_guidance_summary(runtime_goal: dict[str, Any]) -> None:
     print(f"代码生成规则数量：{len(codegen_rules)}")
 
 
+
+
+PRE_RUN_AI_REVIEW_MEMORY_FILE = ROOT_DIR / "user_data" / "ai_memory" / "pre_run_ai_review.json"
+
+
+def _pre_run_ai_review_cfg(runtime_goal: dict[str, Any]) -> dict[str, Any]:
+    raw = runtime_goal.get("pre_run_ai_review", {}) or {}
+    if not isinstance(raw, dict):
+        raw = {}
+    return {
+        "enabled": bool(raw.get("enabled", False)),
+        "provider_role": str(raw.get("provider_role") or "strategy_advisor"),
+        "save_file": str(raw.get("save_file") or "pre_run_ai_review.json"),
+    }
+
+
+def _latest_previous_run_dir(current_run_dir: Path) -> Path | None:
+    run_dirs = [p for p in RESULT_ROOT.glob("run_*") if p.is_dir() and p.resolve() != current_run_dir.resolve()]
+    run_dirs.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+    return run_dirs[0] if run_dirs else None
+
+
+def _load_pre_run_review_sources(current_run_dir: Path) -> tuple[dict[str, Any], list[str]]:
+    previous_run_dir = _latest_previous_run_dir(current_run_dir)
+    source_paths: list[tuple[str, Path | None]] = [
+        ("user_data/ai_memory/last_run_summary.json", LAST_RUN_SUMMARY_FILE),
+        ("user_data/ai_memory/best_strategy.json", BEST_STRATEGY_FILE),
+        ("user_data/ai_memory/nearest_candidate.json", NEAREST_CANDIDATE_FILE),
+        ("user_data/ai_memory/strategy_lessons.json", LESSONS_FILE),
+        ("user_data/ai_memory/strategy_blacklist.json", BLACKLIST_FILE),
+        ("上一次 run 的 iteration_stats.json", (previous_run_dir / ITERATION_STATS_FILE_NAME) if previous_run_dir else None),
+        ("上一次 run 的 leaderboard.json", (previous_run_dir / "leaderboard.json") if previous_run_dir else None),
+    ]
+    loaded: dict[str, Any] = {
+        "previous_run_dir": str(previous_run_dir) if previous_run_dir else "",
+        "files": {},
+    }
+    missing: list[str] = []
+    for label, path in source_paths:
+        if path is None or not path.exists():
+            missing.append(label)
+            loaded["files"][label] = {"status": "missing", "path": str(path) if path else ""}
+            continue
+        try:
+            data = read_json(path)
+            if path.name == ITERATION_STATS_FILE_NAME:
+                data = _strip_random_samples_for_ai_prompt(data)
+            loaded["files"][label] = {"status": "loaded", "path": str(path), "data": data}
+        except Exception as exc:  # noqa: BLE001 - review must never block optimization.
+            missing.append(f"{label}（读取失败：{exc}）")
+            loaded["files"][label] = {"status": "error", "path": str(path), "error": str(exc)}
+    return loaded, missing
+
+
+def _build_pre_run_ai_review_prompt(runtime_goal: dict[str, Any], sources: dict[str, Any], missing: list[str]) -> str:
+    return (
+        "你是 Freqtrade 策略优化的 strategy_advisor。现在不是生成 mutation_spec，也不要输出 Python 代码。\n"
+        "任务：在本次 run 第 1 轮生成 mutation_spec 之前，复盘上一次 run 和长期记忆，总结可复用经验。\n"
+        "重要限制：本复盘只能作为后续 advisor/codegen prompt 的参考，不得覆盖 official_best、historical_best、best_strategy.json、nearest_candidate.json；所有 best 判断仍必须基于真实回测指标。\n"
+        "如果输入文件缺失，请在分析中体现缺失导致的不确定性，不要编造不存在的数据。\n"
+        "交易数建议必须使用：保持目标交易数 20~30，避免低于 20，也避免高于 40。\n"
+        "只输出一个 JSON object，不要 Markdown，不要解释，结构必须为：\n"
+        "{\n"
+        "  \"last_run_diagnosis\": {\n"
+        "    \"overall_result\": \"上一轮是否有实质突破\",\n"
+        "    \"best_candidate\": \"上一轮最值得参考的失败或成功版本\",\n"
+        "    \"main_failure_patterns\": [],\n"
+        "    \"dangerous_directions_to_avoid\": [],\n"
+        "    \"promising_directions_to_continue\": []\n"
+        "  },\n"
+        "  \"next_run_guidance\": {\n"
+        "    \"preferred_parent\": \"official_best 或 nearest_candidate 或 last near miss\",\n"
+        "    \"preferred_mutation_types\": [],\n"
+        "    \"forbidden_mutation_types\": [],\n"
+        "    \"trade_count_target\": \"20~30\",\n"
+        "    \"must_fix\": [],\n"
+        "    \"do_not_do\": []\n"
+        "  },\n"
+        "  \"codegen_guidance\": {\n"
+        "    \"must_implement\": [],\n"
+        "    \"avoid_equivalent_code\": [],\n"
+        "    \"required_detectable_changes\": []\n"
+        "  }\n"
+        "}\n\n"
+        "========== 当前 optimization_goal 摘要 ==========\n"
+        + _compact_prompt_json({
+            "target": runtime_goal.get("target", {}),
+            "train_period": runtime_goal.get("train_period", {}),
+            "validation_periods": runtime_goal.get("validation_periods", []),
+            "prompt_guidance": runtime_goal.get("prompt_guidance", {}),
+        }, 5000)
+        + "\n\n========== 已读取的复盘输入数据 ==========\n"
+        + _compact_prompt_json(sources, 24000)
+        + "\n\n========== 缺失或不可用文件 ==========\n"
+        + ("\n".join(f"- {item}" for item in missing) if missing else "无")
+        + "\n"
+    )
+
+
+def _normalize_pre_run_ai_review(data: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("last_run_diagnosis", {})
+    data.setdefault("next_run_guidance", {})
+    data.setdefault("codegen_guidance", {})
+    diagnosis = data["last_run_diagnosis"] if isinstance(data.get("last_run_diagnosis"), dict) else {}
+    next_guidance = data["next_run_guidance"] if isinstance(data.get("next_run_guidance"), dict) else {}
+    codegen_guidance = data["codegen_guidance"] if isinstance(data.get("codegen_guidance"), dict) else {}
+    for key in ["main_failure_patterns", "dangerous_directions_to_avoid", "promising_directions_to_continue"]:
+        diagnosis.setdefault(key, [])
+    for key in ["preferred_mutation_types", "forbidden_mutation_types", "must_fix", "do_not_do"]:
+        next_guidance.setdefault(key, [])
+    next_guidance.setdefault("trade_count_target", "20~30")
+    for key in ["must_implement", "avoid_equivalent_code", "required_detectable_changes"]:
+        codegen_guidance.setdefault(key, [])
+    data["last_run_diagnosis"] = diagnosis
+    data["next_run_guidance"] = next_guidance
+    data["codegen_guidance"] = codegen_guidance
+    return data
+
+
+def _pre_run_review_bullets(review: dict[str, Any], section: str, keys: list[str], limit: int = 5) -> list[str]:
+    root = review.get(section, {}) if isinstance(review, dict) else {}
+    if not isinstance(root, dict):
+        return []
+    bullets: list[str] = []
+    for key in keys:
+        value = root.get(key)
+        if isinstance(value, list):
+            bullets.extend(str(item) for item in value if str(item).strip())
+        elif value:
+            bullets.append(f"{key}: {value}")
+    return bullets[:limit]
+
+
+def _format_pre_run_review_for_advisor(review: dict[str, Any] | None) -> str:
+    if not review:
+        return ""
+    return (
+        "\n========== 本次运行开始前 AI 复盘总结 ==========\n"
+        "内容来自 pre_run_ai_review.json。该复盘只作为经验参考，不得覆盖 official_best/historical_best/best_strategy/nearest_candidate；best 判断必须基于真实回测指标。\n"
+        + _compact_prompt_json(review, 8000)
+        + "\n"
+    )
+
+
+def _format_pre_run_review_for_codegen(review: dict[str, Any] | None) -> str:
+    if not review:
+        return ""
+    return (
+        "\n========== 本次运行开始前 AI 复盘总结：codegen_guidance ==========\n"
+        "内容来自 pre_run_ai_review.json。只作为代码生成参考，必须仍以 mutation_spec 为准，并且必须产生可检测的真实策略结构变化。\n"
+        + _compact_prompt_json(review.get("codegen_guidance", {}) if isinstance(review, dict) else {}, 4000)
+        + "\n"
+    )
+
+
+def run_pre_run_ai_review(
+    runtime_goal: dict[str, Any],
+    run_dir: Path,
+    advisor_runtime: AIRoleRuntime,
+    code_runtime: AIRoleRuntime,
+    ai_runtime_state: dict[str, Any],
+) -> dict[str, Any] | None:
+    cfg = _pre_run_ai_review_cfg(runtime_goal)
+    save_file = cfg["save_file"] or "pre_run_ai_review.json"
+    review_path = run_dir / save_file
+    prompt_path = run_dir / "pre_run_ai_review_prompt.txt"
+    raw_path = run_dir / "pre_run_ai_review.raw.txt"
+    enabled = bool(cfg.get("enabled"))
+    provider_role = str(cfg.get("provider_role") or "strategy_advisor")
+    runtime = advisor_runtime if provider_role == "strategy_advisor" else code_runtime if provider_role == "code_generator" else advisor_runtime
+
+    print("\n========== 运行前 AI 复盘 ==========")
+    print(f"是否启用：{'是' if enabled else '否'}")
+    print(f"使用 provider：{runtime.used_provider or '待调用'}")
+    print(f"使用模型：{runtime.used_model or '待调用'}")
+    print(f"复盘文件：{review_path}")
+    if not enabled:
+        print("主要结论：")
+        print("- 未启用 pre_run_ai_review。")
+        print("下一轮建议：")
+        print("- 正常按现有记忆、prompt_guidance 和真实回测指标优化。")
+        return None
+
+    sources, missing = _load_pre_run_review_sources(run_dir)
+    prompt = _build_pre_run_ai_review_prompt(runtime_goal, sources, missing)
+    prompt_path.write_text(prompt, encoding="utf-8")
+    try:
+        raw_text = safe_ask_ai(runtime, [{"role": "user", "content": prompt}], state=ai_runtime_state)
+        raw_path.write_text(raw_text or "", encoding="utf-8")
+        review = _normalize_pre_run_ai_review(extract_json_object(raw_text))
+        write_json(review_path, review)
+        write_json(PRE_RUN_AI_REVIEW_MEMORY_FILE, review)
+        print(f"使用 provider：{runtime.used_provider or '未知'}")
+        print(f"使用模型：{runtime.used_model or '未知'}")
+        print("主要结论：")
+        bullets = _pre_run_review_bullets(review, "last_run_diagnosis", ["overall_result", "best_candidate", "main_failure_patterns"])
+        for item in bullets or ["AI 复盘未给出明确主要结论。"]:
+            print(f"- {item}")
+        print("下一轮建议：")
+        bullets = _pre_run_review_bullets(review, "next_run_guidance", ["preferred_parent", "preferred_mutation_types", "must_fix", "do_not_do"])
+        for item in bullets or ["继续按真实回测指标小步优化。"]:
+            print(f"- {item}")
+        return review
+    except Exception as exc:  # noqa: BLE001 - pre-run review is advisory only.
+        error_review = {
+            "last_run_diagnosis": {
+                "overall_result": "pre_run_ai_review 调用失败，无法生成复盘。",
+                "best_candidate": "",
+                "main_failure_patterns": [],
+                "dangerous_directions_to_avoid": [],
+                "promising_directions_to_continue": [],
+            },
+            "next_run_guidance": {
+                "preferred_parent": "",
+                "preferred_mutation_types": [],
+                "forbidden_mutation_types": [],
+                "trade_count_target": "20~30",
+                "must_fix": ["pre_run_ai_review 失败，继续使用 last_run_summary、best_strategy、nearest_candidate 和 prompt_guidance。"],
+                "do_not_do": [],
+            },
+            "codegen_guidance": {
+                "must_implement": [],
+                "avoid_equivalent_code": [],
+                "required_detectable_changes": [],
+            },
+        }
+        raw_path.write_text(str(exc), encoding="utf-8")
+        write_json(review_path, error_review)
+        write_json(PRE_RUN_AI_REVIEW_MEMORY_FILE, error_review)
+        print(f"使用 provider：{runtime.used_provider or '未知'}")
+        print(f"使用模型：{runtime.used_model or '未知'}")
+        print("主要结论：")
+        print(f"- pre_run_ai_review 调用失败：{exc}")
+        print("下一轮建议：")
+        print("- 已记录失败原因，本次 run 继续正常优化，不中断。")
+        return error_review
+
+
 def _round_validation_key(item: dict[str, Any], index: int) -> str:
     return str(item.get("timerange") or item.get("period") or item.get("period_name") or item.get("label") or index)
 
@@ -3915,6 +4155,13 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     early_stop_reason = ""
     random_sample_plan = build_random_sample_plan(args, runtime_goal, run_dir)
     print_random_sample_config(random_sample_plan)
+    pre_run_ai_review = run_pre_run_ai_review(
+        runtime_goal,
+        run_dir,
+        advisor_runtime,
+        code_runtime,
+        ai_runtime_state,
+    )
 
     iteration_stats: dict[str, Any] = {
         "planned_iterations": int(runtime_goal.get("max_iterations", args.iterations)),
@@ -4270,6 +4517,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             spec_prompt += "\n跨 run last_run_summary=" + _compact_prompt_json(_strip_random_samples_for_ai_prompt(last_run_summary_mem), 4000) + "\n"
         spec_prompt += "\n跨 run strategy_lessons=" + _compact_prompt_json(lessons_items[-memory_max_items:], 4000) + "\n"
         spec_prompt += "\n跨 run strategy_blacklist=" + _compact_prompt_json(blacklist_items[-memory_max_items:], 4000) + "\n"
+        spec_prompt += _format_pre_run_review_for_advisor(pre_run_ai_review)
         spec_prompt += f"\nchampion_strategy_class={_strategy_label(in_memory_champion, 'baseline')}\n"
         spec_prompt += _v045_small_step_prompt_section({"meta": official_champion})
         spec_prompt += _format_prompt_guidance_section(
@@ -4354,7 +4602,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "4) 不允许多个 OR 条件堆叠造成高频；不允许为了增加交易数而放宽入场。\n"
             f"3) {zero_trade_hint}\n"
             "4) 如果上一轮 total_trades=0，本轮必须大幅放宽入场条件，并确保训练区间产生交易。\n"
-            "5) 目标训练区间交易数至少 25 笔，理想目标 25~80 笔。\n"
+            "5) 保持目标交易数 20~30，避免低于 20，也避免高于 40。\n"
             "6) use_exit_signal 必须为 False，不允许改为 True。\n"
             "7) 仅现货 long only：不做空、不杠杆、不马丁格尔、不无限补仓，不允许 conditions_short。\n"
             "8) 不调用外部 API，不读取手动交易记录。\n"
@@ -4380,6 +4628,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "- 如果 mutation_spec 要求新增指标（ema20、ema50、adx、atr_pct、bollinger_middleband、volume_mean_20 等），必须在 populate_indicators 中实际计算这些 dataframe 列，并在入场条件中引用相关列。\n"
             "- 避免把入场条件写成几乎永远不触发的苛刻组合。\n"
         )
+        prompt += _format_pre_run_review_for_codegen(pre_run_ai_review)
         prompt += _format_prompt_guidance_section(
             "========== 用户额外代码生成规则 ==========",
             _prompt_guidance_rules(runtime_goal, "codegen_rules"),
@@ -5497,8 +5746,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         "lessons_for_next_run": [
             "不要重新生成完全不同策略",
             "优先围绕 nearest_candidate 和 historical_best 做单点小步调整",
-            "目标总交易数是 25~80，不是单币种 25~80",
-            "如果 nearest_candidate 交易数略超标，例如 98 笔，下一轮目标是压到 60~80 笔",
+            "保持目标交易数 20~30，避免低于 20，也避免高于 40。",
+            "如果 nearest_candidate 交易数超标，下一轮目标是压回 20~30，且避免高于 40。",
             "不要放宽入场",
             "不要启用 exit_signal",
             "不要启用或扩大 trailing",
@@ -5559,7 +5808,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         else:
             print("- 暂无可归纳的共同失败模式")
         print("下一轮建议：")
-        print("- 降低目标交易数到 25~80")
+        print("- 保持目标交易数 20~30，避免低于 20，也避免高于 40。")
         print("- 不要继续宽松高频入场")
         print("- 优先控制止损损失")
         if reset_best_used:
