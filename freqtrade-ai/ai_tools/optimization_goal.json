@@ -98,5 +98,10 @@
     "如果 mutation_spec 预计交易数 20~24，代码实现不得因为过度过滤把交易数压到 20 以下。"
   ]
   },
+  "pre_run_ai_review": {
+  "enabled": true,
+  "provider_role": "strategy_advisor",
+  "save_file": "pre_run_ai_review.json"
+  },
   "language": "zh-CN"
 }
