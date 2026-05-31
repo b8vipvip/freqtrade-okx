@@ -445,3 +445,90 @@ def test_pair_metric_row_combines_train_validation_and_exit_reason_profit() -> N
     assert row["train_roi_profit_abs"] == 3.0
     assert row["train_stoploss_profit_abs"] == -1.5
     assert row["stoploss_to_roi_ratio"] == 0.5
+
+
+def test_apply_recommended_pairs_override_uses_default_file_and_writes_active_config(tmp_path, monkeypatch, capsys) -> None:
+    base_config = tmp_path / "config.json"
+    base_config.write_text(
+        '{"exchange": {"pair_whitelist": ["OLD/USDT"]}, "stake_currency": "USDT"}',
+        encoding="utf-8",
+    )
+    recommended = tmp_path / "recommended_pairs.json"
+    recommended.write_text(
+        '{"active_pairs": [{"pair": "BTC/USDT"}, {"pair": "ETH/USDT"}, {"pair": "BTC/USDT"}]}',
+        encoding="utf-8",
+    )
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setattr(optimizer, "RECOMMENDED_PAIRS_FILE", recommended)
+    args = optimizer.argparse.Namespace(
+        config=str(base_config),
+        pairs_file=None,
+        ignore_recommended_pairs=False,
+        refresh_pairs=False,
+    )
+    runtime_goal = {"config": str(base_config)}
+
+    active_pairs = optimizer.apply_recommended_pairs_override(runtime_goal, args, run_dir)
+
+    assert active_pairs == ["BTC/USDT", "ETH/USDT"]
+    assert runtime_goal["config"] == str(run_dir / "config.active_pairs.json")
+    assert args.config == str(run_dir / "config.active_pairs.json")
+    written = optimizer.read_json(run_dir / "config.active_pairs.json")
+    assert written["exchange"]["pair_whitelist"] == ["BTC/USDT", "ETH/USDT"]
+    assert optimizer.read_json(base_config)["exchange"]["pair_whitelist"] == ["OLD/USDT"]
+    output = capsys.readouterr().out
+    assert "使用来源：默认自动读取" in output
+    assert "本次是否使用 recommended_pairs：是" in output
+
+
+def test_apply_recommended_pairs_override_can_ignore_default_file(tmp_path, monkeypatch, capsys) -> None:
+    base_config = tmp_path / "config.json"
+    base_config.write_text('{"exchange": {"pair_whitelist": ["OLD/USDT"]}}', encoding="utf-8")
+    recommended = tmp_path / "recommended_pairs.json"
+    recommended.write_text('{"active_pairs": [{"pair": "BTC/USDT"}]}', encoding="utf-8")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setattr(optimizer, "RECOMMENDED_PAIRS_FILE", recommended)
+    args = optimizer.argparse.Namespace(
+        config=str(base_config),
+        pairs_file=None,
+        ignore_recommended_pairs=True,
+        refresh_pairs=False,
+    )
+    runtime_goal = {"config": str(base_config)}
+
+    active_pairs = optimizer.apply_recommended_pairs_override(runtime_goal, args, run_dir)
+
+    assert active_pairs == []
+    assert runtime_goal["config"] == str(base_config)
+    assert not (run_dir / "config.active_pairs.json").exists()
+    output = capsys.readouterr().out
+    assert "使用来源：忽略" in output
+    assert "本次是否使用 recommended_pairs：否" in output
+
+
+def test_apply_recommended_pairs_override_falls_back_when_active_pairs_empty(tmp_path, monkeypatch, capsys) -> None:
+    base_config = tmp_path / "config.json"
+    base_config.write_text('{"exchange": {"pair_whitelist": ["OLD/USDT"]}}', encoding="utf-8")
+    recommended = tmp_path / "recommended_pairs.json"
+    recommended.write_text('{"active_pairs": []}', encoding="utf-8")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setattr(optimizer, "RECOMMENDED_PAIRS_FILE", recommended)
+    args = optimizer.argparse.Namespace(
+        config=str(base_config),
+        pairs_file=None,
+        ignore_recommended_pairs=False,
+        refresh_pairs=False,
+    )
+    runtime_goal = {"config": str(base_config)}
+
+    active_pairs = optimizer.apply_recommended_pairs_override(runtime_goal, args, run_dir)
+
+    assert active_pairs == []
+    assert runtime_goal["config"] == str(base_config)
+    assert not (run_dir / "config.active_pairs.json").exists()
+    output = capsys.readouterr().out
+    assert "警告：recommended_pairs.active_pairs 为空" in output
+    assert "使用来源：默认自动读取" in output

@@ -545,10 +545,10 @@ def write_json(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _load_pairs_from_recommended_file(pairs_file: str | None) -> list[str]:
+def _load_pairs_from_recommended_file(pairs_file: str | Path | None) -> list[str]:
     if not pairs_file:
         return []
-    path = _resolve_repo_path(pairs_file)
+    path = _resolve_repo_path(str(pairs_file))
     if not path.exists():
         raise FileNotFoundError(f"推荐币种文件不存在：{path}")
     data = read_json(path)
@@ -558,8 +558,6 @@ def _load_pairs_from_recommended_file(pairs_file: str | None) -> list[str]:
         pair = str(item.get("pair") if isinstance(item, dict) else item).strip()
         if pair and pair not in pairs:
             pairs.append(pair)
-    if not pairs:
-        raise RuntimeError(f"推荐币种文件中 active_pairs 为空：{path}")
     return pairs
 
 
@@ -583,22 +581,93 @@ def _write_temp_config_with_pairs(base_config: str, pairs: list[str], run_dir: P
         return str(dest)
 
 
-def apply_pairs_file_override(runtime_goal: dict[str, Any], args: argparse.Namespace, run_dir: Path) -> list[str]:
-    pairs_file = getattr(args, "pairs_file", None)
-    if not pairs_file:
-        return []
-    active_pairs = _load_pairs_from_recommended_file(pairs_file)
+def _format_pair_source_label(source: str) -> str:
+    labels = {
+        "pairs_file": "--pairs-file",
+        "refresh_pairs": "--refresh-pairs",
+        "default_auto": "默认自动读取",
+        "ignored": "忽略",
+        "missing": "不存在",
+    }
+    return labels.get(source, source)
+
+
+def print_pair_selection_status(
+    *,
+    default_file: Path,
+    default_exists: bool,
+    used_recommended: bool,
+    source: str,
+    active_pairs: list[str],
+    temp_config: str | None,
+) -> None:
+    print("\n========== 交易对选择状态 ==========")
+    print(f"recommended_pairs 默认文件：{default_file}")
+    print(f"是否存在：{'是' if default_exists else '否'}")
+    print(f"本次是否使用 recommended_pairs：{'是' if used_recommended else '否'}")
+    print(f"使用来源：{_format_pair_source_label(source)}")
+    print(f"active_pairs 数量：{len(active_pairs)}")
+    print("active_pairs：" + (", ".join(active_pairs) if active_pairs else "无"))
+    print(f"临时 config 路径：{temp_config or '未生成（使用原始 config）'}")
+
+
+def apply_recommended_pairs_override(runtime_goal: dict[str, Any], args: argparse.Namespace, run_dir: Path) -> list[str]:
     base_config = str(runtime_goal.get("config", args.config))
-    temp_config = _write_temp_config_with_pairs(base_config, active_pairs, run_dir, "recommended_pairs")
-    runtime_goal["config"] = temp_config
-    runtime_goal["pairs"] = active_pairs
-    runtime_goal["runtime_active_pairs"] = active_pairs
-    args.config = temp_config
-    print("已启用 --pairs-file，本次 optimize 使用 recommended_pairs.active_pairs 覆盖 pair_whitelist：")
-    print(f"推荐币种文件：{_resolve_repo_path(pairs_file)}")
-    print(f"临时配置文件：{temp_config}")
-    print("active_pairs：" + ", ".join(active_pairs))
+    default_file = RECOMMENDED_PAIRS_FILE
+    default_exists = default_file.exists()
+    pairs_path: str | Path | None = None
+    source = "missing"
+    active_pairs: list[str] = []
+    temp_config: str | None = None
+
+    if getattr(args, "pairs_file", None):
+        pairs_path = getattr(args, "pairs_file")
+        source = "pairs_file"
+        active_pairs = _load_pairs_from_recommended_file(pairs_path)
+    elif getattr(args, "ignore_recommended_pairs", False):
+        source = "ignored"
+    elif getattr(args, "refresh_pairs", False):
+        source = "refresh_pairs"
+        print("\n========== 刷新 recommended_pairs ==========")
+        print("已启用 --refresh-pairs：optimize 开始前先执行一次 pair-scan。")
+        scan_goal = dict(runtime_goal)
+        scan_goal["config"] = base_config
+        run_pair_scan(scan_goal, args, run_dir)
+        default_exists = default_file.exists()
+        pairs_path = default_file
+        active_pairs = _load_pairs_from_recommended_file(pairs_path) if default_exists else []
+    elif default_exists:
+        pairs_path = default_file
+        source = "default_auto"
+        active_pairs = _load_pairs_from_recommended_file(pairs_path)
+
+    if pairs_path and not active_pairs:
+        print("警告：recommended_pairs.active_pairs 为空，本次 fallback 使用原始 config 的 pair_whitelist。")
+
+    if active_pairs:
+        temp_config = _write_temp_config_with_pairs(base_config, active_pairs, run_dir, "active_pairs")
+        runtime_goal["config"] = temp_config
+        runtime_goal["pairs"] = active_pairs
+        runtime_goal["runtime_active_pairs"] = active_pairs
+        args.config = temp_config
+    else:
+        runtime_goal["config"] = base_config
+        runtime_goal.pop("runtime_active_pairs", None)
+        args.config = base_config
+
+    print_pair_selection_status(
+        default_file=default_file,
+        default_exists=default_exists,
+        used_recommended=bool(active_pairs),
+        source=source,
+        active_pairs=active_pairs,
+        temp_config=temp_config,
+    )
     return active_pairs
+
+
+def apply_pairs_file_override(runtime_goal: dict[str, Any], args: argparse.Namespace, run_dir: Path) -> list[str]:
+    return apply_recommended_pairs_override(runtime_goal, args, run_dir)
 
 
 def _auto_trade_count_target_cfg(runtime_goal: dict[str, Any]) -> dict[str, Any]:
@@ -6687,7 +6756,9 @@ def main() -> None:
     parser.add_argument("--no-wizard", action="store_true")
     parser.add_argument("--save-goal", action="store_true")
     parser.add_argument("--config", default="user_data/config.5coins.json")
-    parser.add_argument("--pairs-file", default=None, help="optimize 模式下读取 recommended_pairs.json，并使用 active_pairs 覆盖本次 pair_whitelist")
+    parser.add_argument("--pairs-file", default=None, help="optimize 模式下读取指定 recommended_pairs.json，并使用 active_pairs 覆盖本次 pair_whitelist")
+    parser.add_argument("--ignore-recommended-pairs", action="store_true", default=False, help="optimize 模式下忽略 user_data/ai_memory/recommended_pairs.json，使用原始 config 的 pair_whitelist")
+    parser.add_argument("--refresh-pairs", action="store_true", default=False, help="optimize 模式开始前先执行一次 pair-scan，生成最新 recommended_pairs.json 并用于本次优化")
     parser.add_argument("--base-strategy", default="MultiCoin_AI_Strategy")
     parser.add_argument("--timeframe", default="5m")
     parser.add_argument("--timerange", default=None, help="训练回测区间，例如 20260501-20260525")
@@ -6730,6 +6801,10 @@ def main() -> None:
         parser.error("--mode pair-scan 不能与 --manual-ai-prepare/--manual-ai-run 同时使用")
     if args.mode == "pair-scan" and args.pairs_file:
         parser.error("--pairs-file 仅用于 optimize 模式，pair-scan 请使用 pair_selection.candidate_pairs")
+    if args.mode == "pair-scan" and args.ignore_recommended_pairs:
+        parser.error("--ignore-recommended-pairs 仅用于 optimize 模式")
+    if args.mode == "pair-scan" and args.refresh_pairs:
+        parser.error("--refresh-pairs 仅用于 optimize 模式；pair-scan 模式本身已执行交易对筛选")
     if args.random_sample_windows < 0:
         parser.error("--random-sample-windows 不能小于 0")
     if args.random_sample_windows > 0:
