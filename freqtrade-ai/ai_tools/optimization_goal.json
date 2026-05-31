@@ -56,8 +56,8 @@
     "min_profit_total_pct": 0,
     "max_drawdown_pct": 3,
     "min_profit_factor": 0.56,
-    "min_trades": 20,
-    "max_trades": 40,
+    "min_trades": 38,
+    "max_trades": 110,
     "prefer_exit_signal": false,
     "max_stoploss_loss_usdt": 15
   },
