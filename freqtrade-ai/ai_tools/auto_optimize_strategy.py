@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import random
+import queue
 import re
 import shutil
 import subprocess
@@ -255,12 +256,10 @@ def configure_log_repo_args(args: argparse.Namespace) -> None:
 
 
 def check_log_repo_startup(args: argparse.Namespace) -> None:
-    if not getattr(args, "push_logs_to_git", False):
-        return
     print("\n========== 日志仓库启动检查 ==========")
     repo_path_raw = getattr(args, "log_repo_path", "")
     if not repo_path_raw:
-        print("警告：AUTO_PUSH_LOGS_TO_GIT=true，但 LOG_REPO_PATH 未配置。")
+        print("LOG_REPO_PATH 未配置，跳过日志仓库启动拉取。")
         return
     repo_path = Path(repo_path_raw).expanduser()
     if not repo_path.exists():
@@ -278,10 +277,32 @@ def check_log_repo_startup(args: argparse.Namespace) -> None:
     current_branch = branch_cp.stdout.strip() if branch_cp.returncode == 0 else ""
     if current_branch != branch:
         print(f"警告：日志仓库当前分支为 {current_branch or '未知'}，目标分支为 {branch}。结束推送时会尝试 git checkout {branch}。")
+    pull_cp = _run_git_for_logs(["git", "pull", "--ff-only", remote, branch], repo_path)
+    if pull_cp.stdout:
+        print(pull_cp.stdout.rstrip())
+    if pull_cp.stderr:
+        print(pull_cp.stderr.rstrip())
+    if pull_cp.returncode != 0:
+        print(f"警告：日志仓库启动拉取失败（不阻断运行）：git -C {repo_path} pull --ff-only {remote} {branch}")
+    else:
+        print(f"日志仓库启动拉取完成：git -C {repo_path} pull --ff-only {remote} {branch}")
 
 
 def _copy_log_repo_summary_files(run_dir: Path, dest_dir: Path) -> None:
-    for name in [ITERATION_STATS_FILE_NAME, "leaderboard.json", "goal.runtime.json"]:
+    run_log = run_dir / "run.log"
+    if run_log.exists() and run_log.is_file():
+        (dest_dir / "run.log").write_text(_sanitize_log_text(run_log.read_text(encoding="utf-8", errors="ignore")), encoding="utf-8")
+    for name in [
+        "pre_run_ai_review.json",
+        "pre_run_ai_review_prompt.txt",
+        "pre_run_ai_review.raw.txt",
+        ITERATION_STATS_FILE_NAME,
+        "leaderboard.json",
+        "last_run_summary.json",
+        "nearest_candidate_snapshot.json",
+        "best_strategy_snapshot.json",
+        "goal.runtime.json",
+    ]:
         _copy_if_exists(run_dir / name, dest_dir / name)
     snapshots = [
         (BEST_STRATEGY_FILE, "best_strategy_snapshot.json"),
@@ -363,8 +384,7 @@ def push_run_logs_to_log_repo(run_dir: Path, args: argparse.Namespace) -> LogRep
         dest_dir.mkdir(parents=True, exist_ok=True)
         sanitized = _sanitize_log_text(run_log.read_text(encoding="utf-8", errors="ignore"))
         (dest_dir / "run.log").write_text(sanitized, encoding="utf-8")
-        if getattr(args, "log_repo_include_summary", True):
-            _copy_log_repo_summary_files(run_dir, dest_dir)
+        _copy_log_repo_summary_files(run_dir, dest_dir)
         if getattr(args, "log_repo_include_prompts", False):
             _copy_log_repo_optional_prompts(run_dir, dest_dir)
         if getattr(args, "log_repo_include_strategy", False):
@@ -1753,7 +1773,110 @@ def _latest_previous_run_dir(current_run_dir: Path) -> Path | None:
     return run_dirs[0] if run_dirs else None
 
 
+def _log_repo_path_from_env() -> Path | None:
+    raw = (os.getenv("LOG_REPO_PATH") or "/opt/freqtrade-ai-logs").strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    return path if path.exists() and path.is_dir() else None
+
+
+def _latest_previous_log_repo_run_dir(current_run_dir: Path) -> Path | None:
+    repo_path = _log_repo_path_from_env()
+    if repo_path is None:
+        return None
+    logs_root = repo_path / "logs"
+    if not logs_root.exists():
+        return None
+    current_name = current_run_dir.name
+    run_dirs = [p for p in logs_root.glob("*/*") if p.is_dir() and p.name != current_name]
+    run_dirs.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+    return run_dirs[0] if run_dirs else None
+
+
+def _summarize_pre_run_source_file(label: str, data: Any) -> Any:
+    if label.endswith("iteration_stats.json") and isinstance(data, dict):
+        return _strip_random_samples_for_ai_prompt({
+            "planned_iterations": data.get("planned_iterations"),
+            "generated_versions_count": data.get("generated_versions_count"),
+            "valid_strategy_count": data.get("valid_strategy_count"),
+            "invalid_strategy_count": data.get("invalid_strategy_count"),
+            "new_best_update_count": data.get("new_best_update_count"),
+            "early_stop_triggered": data.get("early_stop_triggered"),
+            "early_stop_reason": data.get("early_stop_reason"),
+            "early_stop_checked_counters": data.get("early_stop_checked_counters"),
+            "version_statuses": data.get("version_statuses", [])[-8:] if isinstance(data.get("version_statuses"), list) else [],
+            "global_stats": data.get("global_stats"),
+        })
+    if label.endswith("leaderboard.json"):
+        rows = data.get("items", []) if isinstance(data, dict) else data if isinstance(data, list) else []
+        compact_rows = []
+        for row in rows[:8]:
+            if not isinstance(row, dict):
+                continue
+            compact_rows.append({
+                "version": row.get("version"),
+                "strategy_class": row.get("strategy_class"),
+                "is_valid": row.get("is_valid"),
+                "is_best": row.get("is_best"),
+                "invalid_reason": row.get("invalid_reason"),
+                "not_best_reason": row.get("not_best_reason"),
+                "final_score": row.get("final_score"),
+                "train_profit_pct": row.get("train_profit_pct"),
+                "profit_factor": row.get("profit_factor"),
+                "avg_validation_profit_pct": row.get("avg_validation_profit_pct"),
+                "avg_validation_profit_factor": row.get("avg_validation_profit_factor"),
+                "max_validation_drawdown_pct": row.get("max_validation_drawdown_pct"),
+                "total_trades": row.get("total_trades"),
+                "failure_reason": row.get("failure_reason"),
+                "official_best_hard_gate_reasons": row.get("official_best_hard_gate_reasons"),
+            })
+        return {"items": compact_rows}
+    if label.endswith("last_run_summary.json") and isinstance(data, dict):
+        return _strip_random_samples_for_ai_prompt({
+            "run_id": data.get("run_id"),
+            "best_updated": data.get("best_updated"),
+            "official_best": data.get("official_best"),
+            "nearest_candidate": data.get("nearest_candidate"),
+            "session_best": data.get("session_best"),
+            "common_failure_patterns": data.get("common_failure_patterns"),
+            "recommended_next_mutation_types": data.get("recommended_next_mutation_types"),
+            "forbidden_next_mutation_types": data.get("forbidden_next_mutation_types"),
+            "round_history": data.get("round_history", [])[-5:] if isinstance(data.get("round_history"), list) else [],
+        })
+    return _strip_random_samples_for_ai_prompt(data)
+
+
 def _load_pre_run_review_sources(current_run_dir: Path) -> tuple[dict[str, Any], list[str]]:
+    log_repo_run_dir = _latest_previous_log_repo_run_dir(current_run_dir)
+    if log_repo_run_dir:
+        source_paths: list[tuple[str, Path | None]] = [
+            ("日志仓库上一轮 iteration_stats.json", log_repo_run_dir / ITERATION_STATS_FILE_NAME),
+            ("日志仓库上一轮 leaderboard.json", log_repo_run_dir / "leaderboard.json"),
+            ("日志仓库上一轮 last_run_summary.json", log_repo_run_dir / "last_run_summary.json"),
+            ("日志仓库上一轮 best_strategy_snapshot.json", log_repo_run_dir / "best_strategy_snapshot.json"),
+            ("日志仓库上一轮 nearest_candidate_snapshot.json", log_repo_run_dir / "nearest_candidate_snapshot.json"),
+            ("日志仓库上一轮 pre_run_ai_review.json", log_repo_run_dir / "pre_run_ai_review.json"),
+        ]
+        loaded: dict[str, Any] = {
+            "source_priority": "log_repo",
+            "previous_log_repo_run_dir": str(log_repo_run_dir),
+            "files": {},
+        }
+        missing: list[str] = []
+        for label, path in source_paths:
+            if path is None or not path.exists():
+                missing.append(label)
+                loaded["files"][label] = {"status": "missing", "path": str(path) if path else ""}
+                continue
+            try:
+                data = _summarize_pre_run_source_file(path.name, read_json(path))
+                loaded["files"][label] = {"status": "loaded", "path": str(path), "data": data}
+            except Exception as exc:  # noqa: BLE001 - review must never block optimization.
+                missing.append(f"{label}（读取失败：{exc}）")
+                loaded["files"][label] = {"status": "error", "path": str(path), "error": str(exc)}
+        return loaded, missing
+
     previous_run_dir = _latest_previous_run_dir(current_run_dir)
     source_paths: list[tuple[str, Path | None]] = [
         ("user_data/ai_memory/last_run_summary.json", LAST_RUN_SUMMARY_FILE),
@@ -2198,6 +2321,60 @@ def _aggregate_validation_metrics(validation_metrics: list[dict[str, Any]]) -> t
         for x in rows
     )
     return avg_profit, avg_pf, max_dd
+
+
+def _worst_validation_profit_factor(validation_metrics: list[dict[str, Any]]) -> float:
+    if not validation_metrics:
+        return 0.0
+    values = [_safe_float((item.get("metrics", {}) or {}).get("profit_factor")) for item in validation_metrics]
+    return min(values) if values else 0.0
+
+
+def _official_best_hard_gate_reasons(
+    *,
+    train_metrics: dict[str, Any],
+    validation_metrics: list[dict[str, Any]],
+    avg_validation_profit_pct: float,
+    avg_validation_profit_factor: float,
+    max_validation_drawdown_pct: float,
+    current_official_best: dict[str, Any] | None,
+) -> list[str]:
+    """Return reasons that forbid replacing best_strategy.json."""
+    reasons: list[str] = []
+    train_profit_total_pct = _safe_float(train_metrics.get("profit_total_pct"))
+    train_profit_factor = _safe_float(train_metrics.get("profit_factor"))
+    worst_validation_profit_factor = _worst_validation_profit_factor(validation_metrics)
+    official_avg = dict((current_official_best or {}).get("avg_validation_metrics", {}) or {})
+    official_validations = (current_official_best or {}).get("validation_metrics", []) or []
+    official_is_real = bool(current_official_best and _strategy_label(current_official_best, "") != "baseline")
+    if official_validations:
+        off_avg_profit, _off_avg_pf, off_max_dd = _aggregate_validation_metrics(official_validations)
+        official_avg.setdefault("profit_total_pct", off_avg_profit)
+        official_avg.setdefault("max_drawdown_pct", off_max_dd)
+    official_avg_validation_profit_pct = _safe_float(official_avg.get("profit_total_pct"))
+    official_max_validation_drawdown_pct = _safe_float(official_avg.get("max_drawdown_pct"))
+
+    checks = [
+        (train_profit_total_pct >= 0.0, f"official best 硬门槛未通过：train_profit_total_pct={train_profit_total_pct:.4f} < 0"),
+        (train_profit_factor >= 1.0, f"official best 硬门槛未通过：train_profit_factor={train_profit_factor:.4f} < 1.0"),
+        (avg_validation_profit_pct >= 0.0, f"official best 硬门槛未通过：avg_validation_profit_pct={avg_validation_profit_pct:.4f} < 0"),
+        (avg_validation_profit_factor >= 1.0, f"official best 硬门槛未通过：avg_validation_profit_factor={avg_validation_profit_factor:.4f} < 1.0"),
+        (worst_validation_profit_factor >= 0.7, f"official best 硬门槛未通过：worst_validation_profit_factor={worst_validation_profit_factor:.4f} < 0.7"),
+    ]
+    reasons.extend(reason for ok, reason in checks if not ok)
+    if official_is_real:
+        allowed_dd = official_max_validation_drawdown_pct + 0.2
+        if max_validation_drawdown_pct > allowed_dd:
+            reasons.append(
+                f"official best 硬门槛未通过：max_validation_drawdown_pct={max_validation_drawdown_pct:.4f} > 当前 official_best.max_validation_drawdown_pct+0.2={allowed_dd:.4f}"
+            )
+    if official_is_real and avg_validation_profit_pct < official_avg_validation_profit_pct:
+        reasons.append(
+            f"official best 硬门槛未通过：avg_validation_profit_pct={avg_validation_profit_pct:.4f} 低于当前 official_best={official_avg_validation_profit_pct:.4f}"
+        )
+    if official_is_real and official_avg_validation_profit_pct >= 0.0 and avg_validation_profit_pct < 0.0:
+        reasons.append("official best 硬门槛未通过：当前 official_best 验证平均收益非负，新策略验证平均收益为负")
+    return reasons
 
 
 
@@ -2660,9 +2837,54 @@ def _ai_backoff_seconds(failure_index: int, tos_block: bool = False) -> int:
 def _role_pool_failed_message(role_name: str, attempts: list[dict[str, Any]], fallback_error: str) -> str:
     display = ROLE_DISPLAY_NAMES.get(role_name, role_name)
     failed_attempts = [a for a in attempts if a.get("status") == "failed"]
+    timeout_attempts = [a for a in attempts if a.get("status") == "timeout"]
+    if timeout_attempts and len(timeout_attempts) == len(attempts):
+        return f"{display}模型池全部超时：{fallback_error}"
     if failed_attempts and all(int(a.get("status_code") or 0) == 403 and a.get("tos_blocked") for a in failed_attempts):
         return f"{display}模型池全部失败：403 provider TOS blocked"
     return f"{display}模型池全部失败：{fallback_error}"
+
+
+def _recreate_provider_client(provider: dict[str, Any], timeout_sec: int) -> None:
+    api_key = str(provider.get("api_key") or "")
+    if not api_key:
+        return
+    base_url = str(provider.get("base_url") or "") or None
+    provider["client"] = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout_sec)
+
+
+def _close_provider_client(provider: dict[str, Any]) -> None:
+    client = provider.get("client")
+    close = getattr(client, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
+
+
+def _create_chat_completion_with_hard_timeout(client: OpenAI, *, model: str, messages: list[dict[str, str]], timeout_sec: int) -> Any:
+    """Run the blocking OpenAI-compatible call in a daemon thread and stop waiting at timeout_sec."""
+    result_queue: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
+
+    def _target() -> None:
+        try:
+            result_queue.put(("ok", client.chat.completions.create(model=model, messages=messages, temperature=0.2)), block=False)
+        except Exception as exc:  # noqa: BLE001 - propagated to the caller below.
+            try:
+                result_queue.put(("error", exc), block=False)
+            except queue.Full:
+                pass
+
+    worker = threading.Thread(target=_target, daemon=True)
+    worker.start()
+    try:
+        status, payload = result_queue.get(timeout=timeout_sec)
+    except queue.Empty as exc:
+        raise TimeoutError(f"AI provider call exceeded {timeout_sec} seconds") from exc
+    if status == "error":
+        raise payload
+    return payload
 
 
 def safe_ask_ai(
@@ -2728,7 +2950,38 @@ def safe_ask_ai(
         heartbeat_thread.start()
         try:
             try:
-                res = client.chat.completions.create(model=model, messages=messages, temperature=0.2)
+                res = _create_chat_completion_with_hard_timeout(client, model=model, messages=messages, timeout_sec=timeout_sec)
+            except TimeoutError as exc:
+                elapsed = int(time.time() - start_ts)
+                last_error_message = f"provider timeout after {timeout_sec} seconds"
+                last_status_code = None
+                role_runtime.attempts.append({
+                    "provider": provider_name,
+                    "model": model,
+                    "status": "timeout",
+                    "error": last_error_message,
+                    "elapsed_seconds": elapsed,
+                })
+                _close_provider_client(provider)
+                _recreate_provider_client(provider, timeout_sec)
+                if provider.get("name") == "legacy_env":
+                    for peer in provider_pool:
+                        if peer.get("name") == "legacy_env":
+                            _recreate_provider_client(peer, timeout_sec)
+                    role_runtime.client = provider.get("client") or role_runtime.client
+                print("AI provider 超时，已切换：")
+                print(f"角色：{role_runtime.role}")
+                print(f"provider：{provider_name}")
+                print(f"模型：{model}")
+                print(f"超时阈值：{timeout_sec} 秒；实际等待：{elapsed} 秒")
+                if attempt_idx + 1 < max_attempts:
+                    print(f"provider 超时，已切换到下一个 provider/模型：{next_provider_name}/{next_model}")
+                    continue
+                raise AIModelPoolExhaustedError(
+                    _role_pool_failed_message(role_runtime.role, role_runtime.attempts, last_error_message),
+                    status_code=None,
+                    attempts=role_runtime.attempts,
+                ) from exc
             except (InternalServerError, RateLimitError, APITimeoutError, APIConnectionError, APIStatusError, TimeoutError, Exception) as exc:
                 error_message, status_code = _format_ai_error(exc)
                 last_error_message = error_message or exc.__class__.__name__
@@ -2827,6 +3080,7 @@ def _build_provider_pool_from_env(provider_pool_env: str, timeout_sec: int) -> t
             "name": provider_name,
             "type": provider_type,
             "base_url": base_url or "",
+            "api_key": api_key,
             "model": model,
             "client": OpenAI(api_key=api_key, base_url=base_url, timeout=timeout_sec),
         })
@@ -2881,6 +3135,7 @@ def _build_ai_role_runtime(
         "name": "legacy_env",
         "type": "openai_compatible",
         "base_url": base_url or "",
+        "api_key": api_key,
         "model": model,
         "client": client,
     } for model in model_pool]
@@ -4517,6 +4772,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         official_champion_name = _strategy_label(official_champion, "baseline")
         in_memory_champion_name = _strategy_label(in_memory_champion, "baseline")
         prompt_has_last_round = bool(last_round_summary)
+        pre_run_advisor_injected = bool(pre_run_ai_review)
+        pre_run_codegen_injected = bool(pre_run_ai_review and isinstance(pre_run_ai_review.get("codegen_guidance"), dict))
         print("========== 本轮迭代上下文 ==========")
         print(f"当前轮：{ver}")
         print(f"上一轮结果：{_round_summary_label(last_round_summary)}")
@@ -4526,6 +4783,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         print(f"本次 run 已失败 mutation_type：{session_state['failed_mutation_types_this_run'] or '无'}")
         print(f"本次 run 已成功 mutation_type：{session_state['successful_mutation_types_this_run'] or '无'}")
         print(f"本轮 advisor prompt 已包含上一轮结果：{'是' if prompt_has_last_round else '否'}")
+        print(f"pre_run_ai_review 已注入 advisor prompt：{'是' if pre_run_advisor_injected else '否'}")
+        print(f"pre_run_ai_review.codegen_guidance 已注入 codegen prompt：{'是' if pre_run_codegen_injected else '否'}")
         print(f"当前正式 champion：{official_champion_name}")
         print(f"当前 in_memory_champion：{in_memory_champion_name}")
         print("当前 session_parent 候选：")
@@ -5214,8 +5473,23 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "is_valid": is_valid, "invalid_reason": invalid_reason,
         }
         write_json(run_dir / f"round_{i:03d}.json", round_data)
+        avg_validation_profit_pct, avg_validation_profit_factor, max_validation_drawdown_pct = _aggregate_validation_metrics(validation_metrics)
         is_best = is_valid and final_score > 0 and (best is None or final_score > float(best["final_score"]))
         not_best_reason = ""
+        official_gate_reasons = _official_best_hard_gate_reasons(
+            train_metrics=train_metrics,
+            validation_metrics=validation_metrics,
+            avg_validation_profit_pct=avg_validation_profit_pct,
+            avg_validation_profit_factor=avg_validation_profit_factor,
+            max_validation_drawdown_pct=max_validation_drawdown_pct,
+            current_official_best=session_state.get("official_champion"),
+        )
+        if is_best and official_gate_reasons:
+            is_best = False
+            not_best_reason = "；".join(official_gate_reasons)
+            print("official best 硬门槛未通过，本轮只能作为 nearest_candidate，不能覆盖 best_strategy.json。")
+            for reason in official_gate_reasons:
+                print(f"- {reason}")
         behavior_duplicate = _behavior_duplicate_report(
             train_metrics=train_metrics,
             validation_metrics=validation_metrics,
@@ -5319,6 +5593,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "improvement_vs_champion": improvement_vs_champion,
             "failure_reason": failure_reason,
             "not_best_reason": not_best_reason,
+            "official_best_hard_gate_reasons": official_gate_reasons,
             "reason_detail": reason_detail,
             "behavior_duplicate": behavior_duplicate,
             "is_behavior_duplicate": is_behavior_duplicate,
@@ -5337,7 +5612,6 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "backtest_errors": backtest_errors,
         }
         summary_path = write_iteration_summary(summary)
-        avg_validation_profit_pct, avg_validation_profit_factor, max_validation_drawdown_pct = _aggregate_validation_metrics(validation_metrics)
         leaderboard_entry = {
             "version": ver,
             "run_id": run_id,
@@ -5369,6 +5643,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "duplicate_report": duplicate_report,
             "behavior_duplicate": behavior_duplicate,
             "not_best_reason": not_best_reason,
+            "official_best_hard_gate_reasons": official_gate_reasons,
             "spec_hash": spec_hash,
             "failure_reason": failure_reason,
             "reason_detail": reason_detail,
@@ -5520,6 +5795,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "is_valid": is_valid,
             "invalid_reason": invalid_reason,
             "not_best_reason": not_best_reason,
+            "official_best_hard_gate_reasons": official_gate_reasons,
             "reason_detail": reason_detail,
             "behavior_duplicate": behavior_duplicate,
             "is_behavior_duplicate": is_behavior_duplicate,
@@ -5629,7 +5905,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             return False
         if total_trades > max_trades_target and not allow_oversized:
             return False
-        return not row.get("is_valid")
+        return (not row.get("is_valid")) or bool(row.get("official_best_hard_gate_reasons"))
 
     def _nearest_sort_key(row: dict[str, Any]) -> tuple[float, float, float, float]:
         profit_pct = _safe_float(row.get("train_profit_pct"))
@@ -5788,6 +6064,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         ],
     }
     write_json(LAST_RUN_SUMMARY_FILE, last_run_summary)
+    write_json(run_dir / "last_run_summary.json", last_run_summary)
 
     if best:
         best_strategy_file = run_dir / best_version / "strategy.py" if best_version else Path(best["strategy_file"])
@@ -5827,6 +6104,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         last_run_summary["final_in_memory_champion"] = session_state.get("in_memory_champion")
         last_run_summary["session_best"] = session_best
         write_json(LAST_RUN_SUMMARY_FILE, last_run_summary)
+        write_json(run_dir / "last_run_summary.json", last_run_summary)
     else:
         if args.force_session_best and session_best:
             write_json(run_dir / "session_best.json", session_best)
@@ -5852,8 +6130,13 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     else:
         print("当前正式 best：来源=无")
     if session_best:
-        reason = session_best.get("invalid_reason") or ("通过" if session_best.get("is_valid") else "未通过有效性约束")
-        print(f"本轮 session best：策略名={_strategy_label(session_best)}；final_score={_safe_float(session_best.get('final_score')):.4f}；未成为正式 best 原因：{reason}")
+        session_best_label = _strategy_label(session_best)
+        official_best_label = _strategy_label(current_best_saved) if current_best_saved else ""
+        if current_best_saved and session_best_label and session_best_label == official_best_label:
+            print(f"本轮 session best：策略名={session_best_label}；final_score={_safe_float(session_best.get('final_score')):.4f}；已成为正式 best")
+        else:
+            reason = session_best.get("not_best_reason") or session_best.get("invalid_reason") or ("通过但未超过 official_best 硬门槛/综合得分" if session_best.get("is_valid") else "未通过有效性约束")
+            print(f"本轮 session best：策略名={session_best_label}；final_score={_safe_float(session_best.get('final_score')):.4f}；未成为正式 best 原因：{reason}")
     if closest_failed:
         print("========== 本轮最接近目标的失败策略 ==========")
         print(f"版本：{closest_failed.get('version')}")
