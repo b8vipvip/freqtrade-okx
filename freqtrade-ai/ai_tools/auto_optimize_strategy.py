@@ -14,6 +14,7 @@ import random
 import queue
 import re
 import shutil
+import statistics
 import subprocess
 import sys
 import threading
@@ -50,6 +51,7 @@ NEAREST_CANDIDATE_FILE = ROOT_DIR / "user_data" / "ai_memory" / "nearest_candida
 LAST_RUN_SUMMARY_FILE = ROOT_DIR / "user_data" / "ai_memory" / "last_run_summary.json"
 RECOMMENDED_PAIRS_FILE = ROOT_DIR / "user_data" / "ai_memory" / "recommended_pairs.json"
 PAIR_LEADERBOARD_FILE = ROOT_DIR / "user_data" / "ai_memory" / "pair_leaderboard.json"
+PAIR_STRATEGY_VOTE_FILE = ROOT_DIR / "user_data" / "ai_memory" / "pair_strategy_vote.json"
 ITERATION_STATS_FILE_NAME = "iteration_stats.json"
 MEMORY_EXAMPLE_FILE = ROOT_DIR / "ai_tools" / "strategy_memory.example.json"
 BLACKLIST_EXAMPLE_FILE = ROOT_DIR / "ai_tools" / "strategy_blacklist.example.json"
@@ -300,6 +302,7 @@ def _copy_log_repo_summary_files(run_dir: Path, dest_dir: Path) -> None:
         "pre_run_ai_review.raw.txt",
         ITERATION_STATS_FILE_NAME,
         "leaderboard.json",
+        "pair_strategy_vote.json",
         "pair_leaderboard.json",
         "recommended_pairs.json",
         "last_run_summary.json",
@@ -312,11 +315,18 @@ def _copy_log_repo_summary_files(run_dir: Path, dest_dir: Path) -> None:
         (BEST_STRATEGY_FILE, "best_strategy_snapshot.json"),
         (NEAREST_CANDIDATE_FILE, "nearest_candidate_snapshot.json"),
         (LAST_RUN_SUMMARY_FILE, "last_run_summary.json"),
+        (PAIR_STRATEGY_VOTE_FILE, "pair_strategy_vote.json"),
         (PAIR_LEADERBOARD_FILE, "pair_leaderboard.json"),
         (RECOMMENDED_PAIRS_FILE, "recommended_pairs.json"),
     ]
     for src, dest_name in snapshots:
         _copy_if_exists(src, dest_dir / dest_name)
+    for src in sorted((run_dir / "pair_scan").glob("strategy_candidates.json")) + sorted((run_dir / "pair_scan").glob("*/pair_leaderboard.json")) + sorted((run_dir / "pair_scan").glob("*/recommended_pairs.json")):
+        try:
+            rel = src.relative_to(run_dir)
+        except ValueError:
+            continue
+        _copy_if_exists(src, dest_dir / rel)
 
 
 def _copy_log_repo_optional_prompts(run_dir: Path, dest_dir: Path) -> None:
@@ -705,6 +715,9 @@ def print_effective_pair_selection_log(runtime_goal: dict[str, Any]) -> None:
     fallback_reason = str(info.get("fallback_reason") or "")
     display_source = "fallback_original" if fallback_reason == "empty_active_pairs" else source
     source_label = _format_pair_source_label(display_source)
+    recommended_for_label = info.get("recommended_data", {}) if isinstance(info.get("recommended_data"), dict) else {}
+    if display_source in {"default_auto", "refresh_pairs"} and recommended_for_label.get("source_strategy") == "multi_strategy_vote":
+        source_label = f"{source_label} / multi_strategy_vote"
     effective_pairs = [str(pair) for pair in info.get("effective_pairs", []) if str(pair).strip()]
     recommended_data = info.get("recommended_data", {}) if isinstance(info.get("recommended_data"), dict) else {}
     recommended_path = str(info.get("recommended_file") or "")
@@ -3971,6 +3984,15 @@ def _pair_selection_cfg(runtime_goal: dict[str, Any]) -> dict[str, Any]:
         "min_active_score": float(raw.get("min_active_score", 1.0) if raw.get("min_active_score", None) is not None else 1.0),
         "allow_zero_score_active": bool(raw.get("allow_zero_score_active", False)),
         "reevaluate_every_runs": int(raw.get("reevaluate_every_runs", 5) or 5),
+        "use_multi_strategy_vote": bool(raw.get("use_multi_strategy_vote", False)),
+        "auto_strategy_candidates": bool(raw.get("auto_strategy_candidates", True)),
+        "max_strategy_candidates": int(raw.get("max_strategy_candidates", 5) or 5),
+        "strategy_lookback_runs": int(raw.get("strategy_lookback_runs", 80) or 80),
+        "min_strategy_train_trades": int(raw.get("min_strategy_train_trades", 15) or 15),
+        "min_strategy_validation_periods": int(raw.get("min_strategy_validation_periods", 2) or 2),
+        "prefer_positive_validation": bool(raw.get("prefer_positive_validation", True)),
+        "min_strategy_diversity": bool(raw.get("min_strategy_diversity", True)),
+        "min_pair_strategy_appearances": int(raw.get("min_pair_strategy_appearances", 2) or 2),
     }
 
 
@@ -4087,6 +4109,314 @@ def _first_nonempty_string(*values: Any) -> str:
     return ""
 
 
+
+def _resolve_existing_path(path_raw: Any) -> Path | None:
+    text = str(path_raw or "").strip()
+    if not text or text == "baseline":
+        return None
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        path = ROOT_DIR / path
+    return path if path.exists() else None
+
+
+def _strategy_class_from_file(strategy_file: Path) -> str:
+    try:
+        tree = ast.parse(strategy_file.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return ""
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for base in node.bases:
+            name = ""
+            if isinstance(base, ast.Name):
+                name = base.id
+            elif isinstance(base, ast.Attribute):
+                name = base.attr
+            if name == "IStrategy":
+                return node.name
+    return ""
+
+
+def _metrics_from_summary(summary: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    train = summary.get("train_metrics") or summary.get("train") or summary.get("train_backtest_metrics") or {}
+    if isinstance(train, dict) and isinstance(train.get("metrics"), dict):
+        train = train.get("metrics", {})
+    validations = summary.get("validation_metrics") or summary.get("validations") or summary.get("validation_periods") or []
+    out: list[dict[str, Any]] = []
+    if isinstance(validations, dict):
+        validations = list(validations.values())
+    if isinstance(validations, list):
+        for idx, item in enumerate(validations, start=1):
+            if not isinstance(item, dict):
+                continue
+            metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else item
+            out.append({"period": item.get("period") or item.get("name") or f"validation_{idx:02d}", "timerange": item.get("timerange", ""), "metrics": metrics})
+    return train if isinstance(train, dict) else {}, out
+
+
+def _candidate_validation_stats(validation_metrics: list[dict[str, Any]]) -> dict[str, float]:
+    profits = [_safe_float((v.get("metrics") or {}).get("profit_total_pct")) for v in validation_metrics]
+    pfs = [_safe_float((v.get("metrics") or {}).get("profit_factor")) for v in validation_metrics]
+    dds = [_safe_float((v.get("metrics") or {}).get("max_drawdown_pct")) for v in validation_metrics]
+    return {
+        "validation_avg_profit_pct": sum(profits) / len(profits) if profits else 0.0,
+        "validation_avg_profit_factor": sum(pfs) / len(pfs) if pfs else 0.0,
+        "validation_worst_profit_pct": min(profits) if profits else 0.0,
+        "validation_worst_profit_factor": min(pfs) if pfs else 0.0,
+        "validation_max_drawdown_pct": max(dds) if dds else 0.0,
+        "validation_positive_periods": float(sum(1 for x in profits if x > 0)),
+    }
+
+
+def _strategy_stoploss_to_roi_ratio(train_metrics: dict[str, Any]) -> float:
+    roi = _safe_float(train_metrics.get("roi_profit_abs"))
+    stop = _safe_float(train_metrics.get("stop_loss_profit_abs") or train_metrics.get("stoploss_profit_abs"))
+    return abs(stop) / max(roi, 1e-9) if roi > 0 else (999.0 if stop < 0 else 0.0)
+
+
+def _score_strategy_candidate(train_metrics: dict[str, Any], validation_metrics: list[dict[str, Any]], summary: dict[str, Any], *, official_best: bool = False, nearest_candidate: bool = False) -> tuple[float, dict[str, Any]]:
+    stats = _candidate_validation_stats(validation_metrics)
+    train_profit = _safe_float(train_metrics.get("profit_total_pct"))
+    train_pf = _safe_float(train_metrics.get("profit_factor"))
+    trades = _safe_int(train_metrics.get("total_trades"))
+    train_dd = _safe_float(train_metrics.get("max_drawdown_pct"))
+    sl_roi = _strategy_stoploss_to_roi_ratio(train_metrics)
+    stable_bonus = 8.0 if validation_metrics and stats["validation_positive_periods"] >= max(2, len(validation_metrics) - 1) else 0.0
+    score = 0.0
+    score += train_profit * 1.5 + min(train_pf, 4.0) * 8.0 + min(trades, 80) * 0.12
+    score += stats["validation_avg_profit_pct"] * 4.0 + stats["validation_worst_profit_pct"] * 3.0
+    score += min(stats["validation_avg_profit_factor"], 4.0) * 12.0 + min(stats["validation_worst_profit_factor"], 3.0) * 6.0
+    score -= max(train_dd, stats["validation_max_drawdown_pct"]) * 2.0
+    score -= min(25.0, max(0.0, sl_roi - 1.0) * 10.0)
+    score += stable_bonus + (12.0 if official_best else 0.0) + (6.0 if nearest_candidate else 0.0)
+    if bool(summary.get("is_best")):
+        score += 4.0
+    details = {
+        "train_profit_pct": train_profit,
+        "train_profit_factor": train_pf,
+        "train_total_trades": trades,
+        "train_max_drawdown_pct": train_dd,
+        **stats,
+        "final_score": _safe_float(summary.get("final_score")),
+        "official_best": official_best,
+        "nearest_candidate": nearest_candidate,
+        "new_best": bool(summary.get("is_best")),
+        "stoploss_to_roi_ratio": sl_roi,
+        "multi_validation_stable": stable_bonus > 0,
+    }
+    return round(score, 4), details
+
+
+def _candidate_identity_matches(candidate: dict[str, Any], memory: dict[str, Any]) -> bool:
+    mem_file = _resolve_existing_path(memory.get("strategy_file") or memory.get("strategy_path"))
+    cand_file = _resolve_existing_path(candidate.get("strategy_file"))
+    if mem_file and cand_file and mem_file.resolve() == cand_file.resolve():
+        return True
+    return bool(str(memory.get("strategy_class") or memory.get("class_name") or "") and str(memory.get("strategy_class") or memory.get("class_name")) == str(candidate.get("strategy_name")))
+
+
+def _candidate_from_memory(memory_file: Path, reason: str, cfg: dict[str, Any]) -> dict[str, Any] | None:
+    if not memory_file.exists():
+        return None
+    try:
+        data = read_json(memory_file)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    strategy_file = _resolve_existing_path(data.get("strategy_file") or data.get("strategy_path"))
+    if not strategy_file:
+        return None
+    class_name = str(data.get("strategy_class") or data.get("class_name") or "").strip() or _strategy_class_from_file(strategy_file)
+    train, validations = _metrics_from_summary(data)
+    if not train:
+        train = data.get("train_metrics", {}) if isinstance(data.get("train_metrics"), dict) else {}
+    if not validations and isinstance(data.get("validation_metrics"), list):
+        validations = data.get("validation_metrics", [])
+    score, details = _score_strategy_candidate(train, validations, data, official_best=(reason == "official_best"), nearest_candidate=(reason == "nearest_candidate"))
+    return {
+        "candidate_id": reason,
+        "strategy_name": class_name,
+        "strategy_file": str(strategy_file),
+        "strategy_path": str(strategy_file),
+        "version_dir": "",
+        "run_id": str(data.get("source_run_id") or "memory"),
+        "version": str(data.get("version") or reason),
+        "reason": reason,
+        "summary": data,
+        "train_metrics": train,
+        "validation_metrics": validations,
+        "strategy_candidate_score": score,
+        "score_details": details,
+        "fingerprint_hash": "",
+        "fingerprint": {},
+    } if class_name and train else None
+
+
+def _candidate_invalid_reason(summary: dict[str, Any], train: dict[str, Any], validations: list[dict[str, Any]], cfg: dict[str, Any], strategy_file: Path) -> str:
+    if not strategy_file.exists():
+        return "strategy.py 不存在"
+    if not train:
+        return "缺少训练回测指标"
+    if len(validations) < int(cfg.get("min_strategy_validation_periods", 2)):
+        return "验证区间数量不足"
+    if _safe_int(train.get("total_trades")) < int(cfg.get("min_strategy_train_trades", 15)):
+        return "训练交易数不足"
+    if _safe_int(train.get("total_trades")) <= 0:
+        return "空交易策略"
+    invalid_reason = str(summary.get("invalid_reason") or "").lower()
+    if "syntax" in invalid_reason or "语法" in invalid_reason:
+        return "语法失败策略"
+    if str(summary.get("syntax_check_status") or "").strip() in {"失败", "failed", "error"}:
+        return "语法失败策略"
+    duplicate_report = summary.get("duplicate_report", {}) if isinstance(summary.get("duplicate_report"), dict) else {}
+    behavior_duplicate = summary.get("behavior_duplicate", {}) if isinstance(summary.get("behavior_duplicate"), dict) else {}
+    if bool(summary.get("is_behavior_duplicate")) or bool(duplicate_report.get("is_duplicate")) or bool(behavior_duplicate.get("is_duplicate")):
+        return "duplicate 策略"
+    return ""
+
+
+def _load_auto_strategy_candidates(cfg: dict[str, Any], args: argparse.Namespace) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    lookback = int(getattr(args, "pair_scan_strategy_lookback_runs", None) or cfg.get("strategy_lookback_runs", 80))
+    official_best_mem = read_json(BEST_STRATEGY_FILE) if BEST_STRATEGY_FILE.exists() else {}
+    nearest_mem = read_json(NEAREST_CANDIDATE_FILE) if NEAREST_CANDIDATE_FILE.exists() else {}
+    run_dirs = sorted([p for p in RESULT_ROOT.glob("run_*") if p.is_dir()], key=lambda p: (p.stat().st_mtime, p.name), reverse=True)[:lookback]
+    candidates: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    for run_dir in run_dirs:
+        for version_dir in sorted([p for p in run_dir.glob("v*") if p.is_dir()], key=lambda p: p.name):
+            summary_file = version_dir / "summary.json"
+            strategy_file = version_dir / "strategy.py"
+            if not summary_file.exists() or not strategy_file.exists():
+                continue
+            try:
+                summary = read_json(summary_file)
+            except Exception as exc:
+                rejected.append({"version_dir": str(version_dir), "reason": f"summary 读取失败：{exc}"})
+                continue
+            train, validations = _metrics_from_summary(summary)
+            invalid = _candidate_invalid_reason(summary, train, validations, cfg, strategy_file)
+            if invalid:
+                rejected.append({"version_dir": str(version_dir), "reason": invalid})
+                continue
+            class_name = str(summary.get("strategy_class") or summary.get("class_name") or "").strip() or _strategy_class_from_file(strategy_file)
+            if not class_name:
+                rejected.append({"version_dir": str(version_dir), "reason": "无法识别策略类名"})
+                continue
+            fingerprint = read_json(version_dir / "strategy_fingerprint.json") if (version_dir / "strategy_fingerprint.json").exists() else {}
+            official = _candidate_identity_matches({"strategy_file": str(strategy_file), "strategy_name": class_name}, official_best_mem)
+            nearest = _candidate_identity_matches({"strategy_file": str(strategy_file), "strategy_name": class_name}, nearest_mem)
+            score, details = _score_strategy_candidate(train, validations, summary, official_best=official, nearest_candidate=nearest)
+            reason = "official_best" if official else ("nearest_candidate" if nearest else "history_candidate")
+            candidates.append({
+                "candidate_id": f"{run_dir.name}_{version_dir.name}",
+                "strategy_name": class_name,
+                "strategy_file": str(strategy_file),
+                "strategy_path": str(strategy_file),
+                "version_dir": str(version_dir),
+                "run_id": run_dir.name,
+                "version": version_dir.name,
+                "reason": reason,
+                "summary": summary,
+                "train_metrics": train,
+                "validation_metrics": validations,
+                "strategy_candidate_score": score,
+                "score_details": details,
+                "fingerprint_hash": str(fingerprint.get("hash") or ""),
+                "fingerprint": fingerprint,
+            })
+    for mem_file, reason in [(BEST_STRATEGY_FILE, "official_best"), (NEAREST_CANDIDATE_FILE, "nearest_candidate")]:
+        mem_candidate = _candidate_from_memory(mem_file, reason, cfg)
+        if mem_candidate and not any(_candidate_identity_matches(c, {"strategy_file": mem_candidate.get("strategy_file"), "strategy_class": mem_candidate.get("strategy_name")}) for c in candidates):
+            candidates.append(mem_candidate)
+    return candidates, rejected
+
+
+def _strategy_candidates_similar(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    if a.get("fingerprint_hash") and a.get("fingerprint_hash") == b.get("fingerprint_hash"):
+        return True
+    ad = a.get("score_details", {}) or {}
+    bd = b.get("score_details", {}) or {}
+    if _safe_int(ad.get("train_total_trades")) != _safe_int(bd.get("train_total_trades")):
+        return False
+    if abs(_safe_float(ad.get("train_profit_pct")) - _safe_float(bd.get("train_profit_pct"))) > 0.05:
+        return False
+    if abs(_safe_float(ad.get("validation_avg_profit_pct")) - _safe_float(bd.get("validation_avg_profit_pct"))) > 0.05:
+        return False
+    avals = [_safe_int((v.get("metrics") or {}).get("total_trades")) for v in a.get("validation_metrics", [])]
+    bvals = [_safe_int((v.get("metrics") or {}).get("total_trades")) for v in b.get("validation_metrics", [])]
+    return avals == bvals and bool(avals)
+
+
+def _select_strategy_candidates(candidates: list[dict[str, Any]], cfg: dict[str, Any], args: argparse.Namespace) -> list[dict[str, Any]]:
+    max_count = max(1, int(getattr(args, "pair_scan_strategy_count", None) or cfg.get("max_strategy_candidates", 5)))
+    selected: list[dict[str, Any]] = []
+    def add(candidate: dict[str, Any], reason: str) -> None:
+        nonlocal selected
+        candidate = dict(candidate)
+        candidate["reason"] = reason if candidate.get("reason") not in {"official_best", "nearest_candidate"} else candidate.get("reason")
+        if any(_candidate_identity_matches(x, {"strategy_file": candidate.get("strategy_file"), "strategy_class": candidate.get("strategy_name")}) for x in selected):
+            return
+        if bool(cfg.get("min_strategy_diversity", True)):
+            for idx, existing in enumerate(list(selected)):
+                if _strategy_candidates_similar(existing, candidate):
+                    if _safe_float(candidate.get("strategy_candidate_score")) > _safe_float(existing.get("strategy_candidate_score")):
+                        selected[idx] = candidate
+                    return
+        selected.append(candidate)
+    for candidate in sorted(candidates, key=lambda c: bool((c.get("score_details") or {}).get("official_best")), reverse=True):
+        if (candidate.get("score_details") or {}).get("official_best"):
+            add(candidate, "official_best")
+    ranking_specs = [
+        ("top_validation_pf", lambda c: _safe_float((c.get("score_details") or {}).get("validation_avg_profit_factor"))),
+        ("top_validation_profit", lambda c: _safe_float((c.get("score_details") or {}).get("validation_avg_profit_pct"))),
+        ("best_worst_validation", lambda c: _safe_float((c.get("score_details") or {}).get("validation_worst_profit_pct"))),
+        ("low_drawdown", lambda c: -_safe_float((c.get("score_details") or {}).get("validation_max_drawdown_pct"))),
+        ("nearest_candidate", lambda c: _safe_float(c.get("strategy_candidate_score")) if (c.get("score_details") or {}).get("nearest_candidate") else -999999.0),
+        ("composite_score", lambda c: _safe_float(c.get("strategy_candidate_score"))),
+    ]
+    for reason, keyfunc in ranking_specs:
+        for candidate in sorted(candidates, key=keyfunc, reverse=True):
+            if len(selected) >= max_count:
+                break
+            add(candidate, reason)
+        if len(selected) >= max_count:
+            break
+    return sorted(selected[:max_count], key=lambda c: _safe_float(c.get("strategy_candidate_score")), reverse=True)
+
+
+def print_multi_strategy_candidate_banner(enabled: bool, source: str, lookback: int, raw_count: int, selected: list[dict[str, Any]]) -> None:
+    print("\n========== 自动多策略筛币 ==========")
+    print(f"是否启用：{'是' if enabled else '否'}")
+    print(f"策略来源：{source}")
+    print(f"扫描最近 run 数：{lookback}")
+    print(f"候选策略数量：{raw_count}")
+    print(f"最终用于筛币策略数量：{len(selected)}")
+    for idx, candidate in enumerate(selected, start=1):
+        details = candidate.get("score_details", {}) or {}
+        print(f"\n{idx}. {candidate.get('strategy_name')}")
+        print(f"   {candidate.get('strategy_file')}")
+        print(f"   来源：{candidate.get('reason')}")
+        print(f"   train_profit_pct：{details.get('train_profit_pct')}")
+        print(f"   train_profit_factor：{details.get('train_profit_factor')}")
+        print(f"   validation_avg_profit_pct：{details.get('validation_avg_profit_pct')}")
+        print(f"   validation_avg_profit_factor：{details.get('validation_avg_profit_factor')}")
+        print(f"   validation_worst_profit_pct：{details.get('validation_worst_profit_pct')}")
+        print(f"   strategy_candidate_score：{candidate.get('strategy_candidate_score')}")
+
+
+def _candidate_public_payload(candidate: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "candidate_id": candidate.get("candidate_id"),
+        "strategy_name": candidate.get("strategy_name"),
+        "strategy_file": candidate.get("strategy_file"),
+        "reason": candidate.get("reason"),
+        "strategy_candidate_score": candidate.get("strategy_candidate_score"),
+        "metrics": candidate.get("score_details", {}),
+    }
+
 def _best_strategy_ref() -> tuple[str, str]:
     if not BEST_STRATEGY_FILE.exists():
         raise FileNotFoundError(f"best_strategy.json 不存在：{BEST_STRATEGY_FILE}")
@@ -4148,8 +4478,11 @@ def print_pair_scan_quality_check(recommended: dict[str, Any]) -> None:
         print("警告：优质币数量不足，本次只使用实际筛出的 active_pairs。")
 
 
-def _run_pair_scan_backtest(config: str, class_name: str, timeframe: str, period: PeriodDef, run_dir: Path, label: str) -> tuple[dict[str, Any], dict[str, Any]]:
+def _run_pair_scan_backtest(config: str, class_name: str, timeframe: str, period: PeriodDef, run_dir: Path, label: str, strategy_file: str | Path | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
     cmd = ["docker", "compose", "run", "--rm", "freqtrade", "backtesting", "--config", config, "--strategy", class_name, "--timeframe", timeframe, "--timerange", period.timerange, "--export", "trades", "--cache", "none"]
+    strategy_path = _resolve_existing_path(strategy_file)
+    if strategy_path is not None:
+        cmd.extend(["--strategy-path", str(strategy_path.parent)])
     results_dir = ROOT_DIR / "user_data" / "backtest_results"
     before = set(_list_backtest_zips(results_dir))
     started_at = time.time()
@@ -4183,65 +4516,78 @@ def print_pair_scan_summary(recommended: dict[str, Any], candidate_count: int) -
         print(f"- {item.get('pair')}: score={item.get('score')}，{item.get('reason')}")
 
 
-def run_pair_scan(runtime_goal: dict[str, Any], args: argparse.Namespace, run_dir: Path) -> None:
-    cfg = _pair_selection_cfg(runtime_goal)
-    if not cfg.get("enabled", True):
-        raise RuntimeError("pair_selection.enabled=false，无法执行 pair-scan。")
-    candidate_pairs = cfg.get("candidate_pairs", []) or []
-    if not candidate_pairs:
-        raise RuntimeError("optimization_goal.json 中 pair_selection.candidate_pairs 为空。")
-    class_name, strategy_file = _best_strategy_ref()
-    print("当前模式：交易对筛选 pair-scan")
-    print("AI 调用：关闭")
-    print(f"source_strategy：{class_name}")
-    if strategy_file:
-        print(f"策略文件：{strategy_file}")
-    train, validations = _build_periods(runtime_goal)
-    if not train.timerange:
-        raise RuntimeError("缺少训练区间 train_period.timerange，无法继续。")
+def _run_single_strategy_pair_scan(
+    runtime_goal: dict[str, Any],
+    args: argparse.Namespace,
+    run_dir: Path,
+    cfg: dict[str, Any],
+    candidate_pairs: list[str],
+    train: PeriodDef,
+    validations: list[PeriodDef],
+    candidate: dict[str, Any],
+    *,
+    output_dir: Path | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    class_name = str(candidate.get("strategy_name") or "").strip()
+    strategy_file = str(candidate.get("strategy_file") or "").strip()
+    if not class_name:
+        raise RuntimeError("pair-scan 策略候选缺少 strategy_name")
     base_config = str(runtime_goal.get("config", args.config))
-    scan_config = _write_temp_config_with_pairs(base_config, list(candidate_pairs), run_dir, "pair_scan_candidates")
-    runtime_goal["config"] = scan_config
-    runtime_goal["pairs"] = list(candidate_pairs)
-    maybe_download_data(runtime_goal, args, train.timerange)
+    target_dir = output_dir or run_dir
+    target_dir.mkdir(parents=True, exist_ok=True)
+    scan_config = _write_temp_config_with_pairs(base_config, list(candidate_pairs), target_dir, "pair_scan_candidates")
     timeframe = str(runtime_goal.get("timeframe", args.timeframe))
-    train_metrics, train_result = _run_pair_scan_backtest(scan_config, class_name, timeframe, train, run_dir, "train")
+    train_metrics, train_result = _run_pair_scan_backtest(scan_config, class_name, timeframe, train, target_dir, "train", strategy_file)
     validation_metrics: list[dict[str, Any]] = []
     for period in validations:
-        vm, _ = _run_pair_scan_backtest(scan_config, class_name, timeframe, period, run_dir, period.name)
+        vm, _ = _run_pair_scan_backtest(scan_config, class_name, timeframe, period, target_dir, period.name, strategy_file)
         validation_metrics.append({"period": period.name, "timerange": period.timerange, "metrics": vm})
-    rows = []
-    for pair in candidate_pairs:
-        row = _pair_metric_row(pair, train_metrics, validation_metrics, train_result)
-        score, penalty_reasons, reason = _score_pair(row, cfg)
-        row.update({"score": score, "penalty_reasons": penalty_reasons, "reason": reason})
-        rows.append(row)
+
+    parsed_pairs = {str(item.get("pair")) for item in _normalize_pair_metrics(train_metrics.get("pairs", []) or [])}
+    for item in validation_metrics:
+        parsed_pairs.update(str(row.get("pair")) for row in _normalize_pair_metrics((item.get("metrics") or {}).get("pairs", []) or []))
+    if not any(pair in parsed_pairs for pair in candidate_pairs):
+        print("当前无法解析 pair 级指标，已退回单 pair 回测，耗时会明显增加。")
+        rows = []
+        for pair in candidate_pairs:
+            single_config = _write_temp_config_with_pairs(base_config, [pair], target_dir, f"pair_scan_{pair.replace('/', '_')}")
+            single_train_metrics, single_train_result = _run_pair_scan_backtest(single_config, class_name, timeframe, train, target_dir, f"train_{pair.replace('/', '_')}", strategy_file)
+            single_validations = []
+            for period in validations:
+                vm, _ = _run_pair_scan_backtest(single_config, class_name, timeframe, period, target_dir, f"{period.name}_{pair.replace('/', '_')}", strategy_file)
+                single_validations.append({"period": period.name, "timerange": period.timerange, "metrics": vm})
+            row = _pair_metric_row(pair, single_train_metrics, single_validations, single_train_result)
+            score, penalty_reasons, reason = _score_pair(row, cfg)
+            row.update({"score": score, "penalty_reasons": penalty_reasons, "reason": reason})
+            rows.append(row)
+    else:
+        rows = []
+        for pair in candidate_pairs:
+            row = _pair_metric_row(pair, train_metrics, validation_metrics, train_result)
+            score, penalty_reasons, reason = _score_pair(row, cfg)
+            row.update({"score": score, "penalty_reasons": penalty_reasons, "reason": reason})
+            rows.append(row)
     rows.sort(key=lambda item: _safe_float(item.get("score")), reverse=True)
     active_count = max(0, int(cfg.get("active_pair_count", 5)))
     watch_count = max(0, int(cfg.get("watch_pair_count", 5)))
     min_active_score = float(cfg.get("min_active_score", 1.0))
     allow_zero_score_active = bool(cfg.get("allow_zero_score_active", False))
-    active_candidates = [
-        row for row in rows
-        if _safe_float(row.get("score")) >= min_active_score
-        or (allow_zero_score_active and _safe_float(row.get("score")) <= 0)
-    ]
+    active_candidates = [row for row in rows if _safe_float(row.get("score")) >= min_active_score or (allow_zero_score_active and _safe_float(row.get("score")) <= 0)]
     active_rows = active_candidates[:active_count]
     active_pairs_set = {str(r.get("pair")) for r in active_rows}
     remaining_rows = [r for r in rows if str(r.get("pair")) not in active_pairs_set]
-    watch_candidates = [r for r in remaining_rows if _safe_float(r.get("score")) > 0]
-    watch_rows = watch_candidates[:watch_count]
+    watch_rows = [r for r in remaining_rows if _safe_float(r.get("score")) > 0][:watch_count]
     watch_pairs_set = {str(r.get("pair")) for r in watch_rows}
     cooldown_rows = [r for r in remaining_rows if str(r.get("pair")) not in watch_pairs_set]
-    source_strategy_path = _pair_scan_source_strategy_path(runtime_goal, strategy_file)
     scan_periods = _pair_scan_period_payload(runtime_goal, train, validations)
     scan_windows = _pair_scan_windows_payload(runtime_goal)
-    not_enough_active_pairs_warning = len(active_rows) < active_count
+    source_strategy_path = strategy_file or _pair_scan_source_strategy_path(runtime_goal, strategy_file)
     leaderboard = {
         "created_at": datetime.utcnow().isoformat(),
         "source_strategy": class_name,
         "source_strategy_file": strategy_file,
         "source_strategy_path": source_strategy_path,
+        "strategy_candidate": _candidate_public_payload(candidate),
         "scan_periods": scan_periods,
         "scan_windows": scan_windows,
         "train_period": train.timerange,
@@ -4251,9 +4597,11 @@ def run_pair_scan(runtime_goal: dict[str, Any], args: argparse.Namespace, run_di
     }
     recommended = {
         "created_at": datetime.utcnow().isoformat(),
+        "source": "single_strategy_pair_scan",
         "source_strategy": class_name,
         "source_strategy_file": strategy_file,
         "source_strategy_path": source_strategy_path,
+        "strategy_candidates": [_candidate_public_payload(candidate)],
         "scan_periods": scan_periods,
         "scan_windows": scan_windows,
         "train_period": train.timerange,
@@ -4262,21 +4610,244 @@ def run_pair_scan(runtime_goal: dict[str, Any], args: argparse.Namespace, run_di
         "active_pair_count_actual": len(active_rows),
         "min_active_score": min_active_score,
         "allow_zero_score_active": allow_zero_score_active,
-        "not_enough_active_pairs_warning": not_enough_active_pairs_warning,
+        "not_enough_active_pairs_warning": len(active_rows) < active_count,
         "active_pairs": [{"pair": r["pair"], "score": r["score"], "reason": r["reason"]} for r in active_rows],
         "watch_pairs": [{"pair": r["pair"], "score": r["score"], "reason": r["reason"]} for r in watch_rows],
         "cooldown_pairs": [{"pair": r["pair"], "score": r["score"], "reason": r["reason"]} for r in cooldown_rows],
         "pair_metrics": {r["pair"]: r for r in rows},
     }
+    write_json(target_dir / "pair_leaderboard.json", leaderboard)
+    write_json(target_dir / "recommended_pairs.json", recommended)
+    return leaderboard, recommended
+
+
+def _median(values: list[float]) -> float:
+    return float(statistics.median(values)) if values else 0.0
+
+
+def _std(values: list[float]) -> float:
+    return float(statistics.pstdev(values)) if len(values) > 1 else 0.0
+
+
+def _aggregate_pair_strategy_votes(
+    candidate_pairs: list[str],
+    candidates: list[dict[str, Any]],
+    recommended_by_candidate: dict[str, dict[str, Any]],
+    cfg: dict[str, Any],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for pair in candidate_pairs:
+        score_values: list[float] = []
+        val_profit_values: list[float] = []
+        val_pf_values: list[float] = []
+        worst_profit_values: list[float] = []
+        worst_pf_values: list[float] = []
+        sl_roi_values: list[float] = []
+        active_appearances = watch_appearances = cooldown_appearances = 0
+        appeared: list[str] = []
+        for candidate in candidates:
+            cid = str(candidate.get("candidate_id"))
+            rec = recommended_by_candidate.get(cid, {})
+            metrics = rec.get("pair_metrics", {}) if isinstance(rec.get("pair_metrics"), dict) else {}
+            row = metrics.get(pair)
+            if not isinstance(row, dict):
+                continue
+            appeared.append(cid)
+            score_values.append(_safe_float(row.get("score")))
+            val_profit_values.append(_safe_float(row.get("validation_avg_profit_pct")))
+            val_pf_values.append(_safe_float(row.get("validation_avg_profit_factor")))
+            worst_profit_values.append(_safe_float(row.get("validation_worst_profit_pct")))
+            worst_pf_values.append(_safe_float(row.get("validation_worst_profit_factor")))
+            sl_roi_values.append(_safe_float(row.get("stoploss_to_roi_ratio")))
+            if any(_pair_name_from_recommended_item(x) == pair for x in rec.get("active_pairs", []) if isinstance(rec.get("active_pairs", []), list)):
+                active_appearances += 1
+            elif any(_pair_name_from_recommended_item(x) == pair for x in rec.get("watch_pairs", []) if isinstance(rec.get("watch_pairs", []), list)):
+                watch_appearances += 1
+            elif any(_pair_name_from_recommended_item(x) == pair for x in rec.get("cooldown_pairs", []) if isinstance(rec.get("cooldown_pairs", []), list)):
+                cooldown_appearances += 1
+        strategy_count = len(appeared)
+        score_mean = sum(score_values) / len(score_values) if score_values else 0.0
+        score_median = _median(score_values)
+        stability_score = max(0.0, 20.0 - _std(score_values)) + active_appearances * 8.0 + watch_appearances * 2.0 - cooldown_appearances * 5.0
+        final_score = score_median * 0.65 + score_mean * 0.25 + stability_score
+        if _median(val_pf_values) < 0.8:
+            final_score -= 10.0
+        if (min(worst_profit_values) if worst_profit_values else 0.0) < -3.0:
+            final_score -= 12.0
+        if _median(sl_roi_values) > 1.5:
+            final_score -= 10.0
+        min_apps = int(cfg.get("min_pair_strategy_appearances", 2))
+        min_active_score = float(cfg.get("min_active_score", 1.0))
+        if active_appearances >= min_apps and final_score >= min_active_score:
+            classification = "active"
+            reason = "多个历史策略下表现稳定，验证PF中位数较好，止损/ROI比可控"
+        elif final_score <= 0 or cooldown_appearances > max(active_appearances, watch_appearances):
+            classification = "cooldown"
+            reason = "多数策略下表现偏弱或最差验证/止损风险较高"
+        else:
+            classification = "watch"
+            reason = "分数接近 active，但策略出现次数或稳定性仍需观察"
+        rows.append({
+            "pair": pair,
+            "strategy_count": strategy_count,
+            "active_appearances": active_appearances,
+            "watch_appearances": watch_appearances,
+            "cooldown_appearances": cooldown_appearances,
+            "appeared_in_strategies": appeared,
+            "score_mean": round(score_mean, 4),
+            "score_median": round(score_median, 4),
+            "score_max": round(max(score_values), 4) if score_values else 0.0,
+            "score_min": round(min(score_values), 4) if score_values else 0.0,
+            "score_std": round(_std(score_values), 4),
+            "validation_avg_profit_pct_median": round(_median(val_profit_values), 4),
+            "validation_avg_profit_factor_median": round(_median(val_pf_values), 4),
+            "validation_worst_profit_pct_min": round(min(worst_profit_values), 4) if worst_profit_values else 0.0,
+            "worst_validation_profit_factor_min": round(min(worst_pf_values), 4) if worst_pf_values else 0.0,
+            "stoploss_to_roi_ratio_median": round(_median(sl_roi_values), 4),
+            "stability_score": round(stability_score, 4),
+            "final_pair_score": round(final_score, 4),
+            "final_classification": classification,
+            "reason": reason,
+        })
+    rows.sort(key=lambda item: _safe_float(item.get("final_pair_score")), reverse=True)
+    return rows
+
+
+def print_multi_strategy_vote_summary(recommended: dict[str, Any], candidate_count: int, cfg: dict[str, Any]) -> None:
+    print("\n========== 多策略筛币投票结果 ==========")
+    print(f"候选币种数量：{candidate_count}")
+    print(f"请求 active 数量：{recommended.get('active_pair_count_requested')}")
+    print(f"实际 active 数量：{recommended.get('active_pair_count_actual')}")
+    print(f"min_pair_strategy_appearances：{cfg.get('min_pair_strategy_appearances')}")
+    print(f"min_active_score：{cfg.get('min_active_score')}")
+    for title, key in [("active_pairs", "active_pairs"), ("watch_pairs", "watch_pairs"), ("cooldown_pairs", "cooldown_pairs")]:
+        print(f"\n========== {title} ==========")
+        items = recommended.get(key, []) if isinstance(recommended.get(key, []), list) else []
+        if not items:
+            print("无")
+        for item in items:
+            print(f"{item.get('pair')} / {item.get('score')} / {item.get('active_appearances', 0)} / {item.get('strategy_appearances', 0)} / {item.get('reason')}")
+
+
+def _run_multi_strategy_pair_scan(runtime_goal: dict[str, Any], args: argparse.Namespace, run_dir: Path, cfg: dict[str, Any], candidate_pairs: list[str], train: PeriodDef, validations: list[PeriodDef], candidates: list[dict[str, Any]]) -> None:
+    pair_scan_dir = run_dir / "pair_scan"
+    pair_scan_dir.mkdir(parents=True, exist_ok=True)
+    write_json(pair_scan_dir / "strategy_candidates.json", {"created_at": datetime.utcnow().isoformat(), "items": [_candidate_public_payload(c) for c in candidates]})
+    recommended_by_candidate: dict[str, dict[str, Any]] = {}
+    for candidate in candidates:
+        cid = str(candidate.get("candidate_id"))
+        print(f"\n===== 执行候选策略 pair-scan：{cid} / {candidate.get('strategy_name')} =====")
+        _, rec = _run_single_strategy_pair_scan(runtime_goal, args, run_dir, cfg, candidate_pairs, train, validations, candidate, output_dir=pair_scan_dir / cid)
+        recommended_by_candidate[cid] = rec
+    vote_rows = _aggregate_pair_strategy_votes(candidate_pairs, candidates, recommended_by_candidate, cfg)
+    active_count = max(0, int(cfg.get("active_pair_count", 5)))
+    watch_count = max(0, int(cfg.get("watch_pair_count", 5)))
+    min_apps = int(cfg.get("min_pair_strategy_appearances", 2))
+    min_active_score = float(cfg.get("min_active_score", 1.0))
+    active_rows = [r for r in vote_rows if r["final_classification"] == "active" and _safe_int(r.get("active_appearances")) >= min_apps and _safe_float(r.get("final_pair_score")) >= min_active_score][:active_count]
+    if len(active_rows) < active_count:
+        print("警告：优质币数量不足，本次只使用实际筛出的 active_pairs。")
+    active_set = {r["pair"] for r in active_rows}
+    watch_rows = [r for r in vote_rows if r["pair"] not in active_set and r["final_classification"] == "watch"][:watch_count]
+    watch_set = {r["pair"] for r in watch_rows}
+    cooldown_rows = [r for r in vote_rows if r["pair"] not in active_set and r["pair"] not in watch_set]
+    scan_periods = _pair_scan_period_payload(runtime_goal, train, validations)
+    vote = {
+        "created_at": datetime.utcnow().isoformat(),
+        "source": "multi_strategy_auto_pair_scan",
+        "source_strategy": "multi_strategy_vote",
+        "strategy_candidates": [_candidate_public_payload(c) for c in candidates],
+        "candidate_pairs": list(candidate_pairs),
+        "scan_periods": scan_periods,
+        "items": vote_rows,
+    }
+    recommended = {
+        "created_at": datetime.utcnow().isoformat(),
+        "source": "multi_strategy_auto_pair_scan",
+        "source_strategy": "multi_strategy_vote",
+        "source_strategy_path": None,
+        "strategy_candidates": [_candidate_public_payload(c) for c in candidates],
+        "scan_periods": scan_periods,
+        "active_pair_count_requested": active_count,
+        "active_pair_count_actual": len(active_rows),
+        "min_active_score": min_active_score,
+        "min_pair_strategy_appearances": min_apps,
+        "not_enough_active_pairs_warning": len(active_rows) < active_count,
+        "active_pairs": [{"pair": r["pair"], "score": r["final_pair_score"], "strategy_appearances": r["strategy_count"], "active_appearances": r["active_appearances"], "appeared_in_strategies": r["appeared_in_strategies"], "reason": r["reason"]} for r in active_rows],
+        "watch_pairs": [{"pair": r["pair"], "score": r["final_pair_score"], "strategy_appearances": r["strategy_count"], "active_appearances": r["active_appearances"], "appeared_in_strategies": r["appeared_in_strategies"], "reason": r["reason"]} for r in watch_rows],
+        "cooldown_pairs": [{"pair": r["pair"], "score": r["final_pair_score"], "strategy_appearances": r["strategy_count"], "active_appearances": r["active_appearances"], "appeared_in_strategies": r["appeared_in_strategies"], "reason": r["reason"]} for r in cooldown_rows],
+        "pair_metrics": {r["pair"]: r for r in vote_rows},
+    }
+    leaderboard = {**vote, "items": vote_rows}
+    write_json(run_dir / "pair_strategy_vote.json", vote)
     write_json(run_dir / "pair_leaderboard.json", leaderboard)
     write_json(run_dir / "recommended_pairs.json", recommended)
+    write_json(PAIR_STRATEGY_VOTE_FILE, vote)
+    write_json(PAIR_LEADERBOARD_FILE, leaderboard)
+    write_json(RECOMMENDED_PAIRS_FILE, recommended)
+    print_multi_strategy_vote_summary(recommended, len(candidate_pairs), cfg)
+    print_pair_scan_quality_check(recommended)
+    print(f"pair_strategy_vote.json：{run_dir / 'pair_strategy_vote.json'}")
+    print(f"pair_leaderboard.json：{run_dir / 'pair_leaderboard.json'}")
+    print(f"recommended_pairs.json：{run_dir / 'recommended_pairs.json'}")
+
+
+def _manual_strategy_candidate(args: argparse.Namespace) -> dict[str, Any]:
+    strategy_file = _resolve_existing_path(getattr(args, "pair_scan_strategy_file", None))
+    if not strategy_file:
+        raise FileNotFoundError("--pair-scan-strategy-source manual 需要有效的 --pair-scan-strategy-file")
+    class_name = str(getattr(args, "pair_scan_strategy_name", "") or "").strip() or _strategy_class_from_file(strategy_file)
+    if not class_name:
+        raise RuntimeError("--pair-scan-strategy-source manual 需要 --pair-scan-strategy-name，或策略文件中存在 IStrategy 类")
+    return {"candidate_id": "manual", "strategy_name": class_name, "strategy_file": str(strategy_file), "reason": "manual", "strategy_candidate_score": 0.0, "score_details": {}}
+
+
+def _best_strategy_candidate() -> dict[str, Any]:
+    class_name, strategy_file = _best_strategy_ref()
+    return {"candidate_id": "official_best", "strategy_name": class_name, "strategy_file": strategy_file, "reason": "official_best", "strategy_candidate_score": 0.0, "score_details": {"official_best": True}}
+
+
+def run_pair_scan(runtime_goal: dict[str, Any], args: argparse.Namespace, run_dir: Path) -> None:
+    cfg = _pair_selection_cfg(runtime_goal)
+    if not cfg.get("enabled", True):
+        raise RuntimeError("pair_selection.enabled=false，无法执行 pair-scan。")
+    candidate_pairs = cfg.get("candidate_pairs", []) or []
+    if not candidate_pairs:
+        raise RuntimeError("optimization_goal.json 中 pair_selection.candidate_pairs 为空。")
+    source = str(getattr(args, "pair_scan_strategy_source", "auto") or "auto")
+    train, validations = _build_periods(runtime_goal)
+    if not train.timerange:
+        raise RuntimeError("缺少训练区间 train_period.timerange，无法继续。")
+    base_config = str(runtime_goal.get("config", args.config))
+    runtime_goal["config"] = base_config
+    runtime_goal["pairs"] = list(candidate_pairs)
+    maybe_download_data(runtime_goal, args, train.timerange)
+    use_multi = bool(cfg.get("use_multi_strategy_vote", False)) and bool(cfg.get("auto_strategy_candidates", True)) and source == "auto"
+    raw_candidates: list[dict[str, Any]] = []
+    if source == "manual":
+        selected = [_manual_strategy_candidate(args)]
+    elif source == "best":
+        selected = [_best_strategy_candidate()]
+    else:
+        raw_candidates, rejected = _load_auto_strategy_candidates(cfg, args)
+        selected = _select_strategy_candidates(raw_candidates, cfg, args)
+        if not selected:
+            selected = [_best_strategy_candidate()]
+        if len(selected) < int(getattr(args, "pair_scan_strategy_count", None) or cfg.get("max_strategy_candidates", 5)):
+            print("警告：有效候选策略数量不足，将使用当前可用候选继续。")
+    print("当前模式：交易对筛选 pair-scan")
+    print("AI 调用：关闭")
+    print_multi_strategy_candidate_banner(use_multi, source, int(getattr(args, "pair_scan_strategy_lookback_runs", None) or cfg.get("strategy_lookback_runs", 80)), len(raw_candidates) if raw_candidates else len(selected), selected)
+    if use_multi and len(selected) > 1:
+        _run_multi_strategy_pair_scan(runtime_goal, args, run_dir, cfg, list(candidate_pairs), train, validations, selected)
+        return
+    leaderboard, recommended = _run_single_strategy_pair_scan(runtime_goal, args, run_dir, cfg, list(candidate_pairs), train, validations, selected[0], output_dir=run_dir)
     write_json(PAIR_LEADERBOARD_FILE, leaderboard)
     write_json(RECOMMENDED_PAIRS_FILE, recommended)
     print_pair_scan_summary(recommended, len(candidate_pairs))
     print_pair_scan_quality_check(recommended)
     print(f"pair_leaderboard.json：{run_dir / 'pair_leaderboard.json'}")
     print(f"recommended_pairs.json：{run_dir / 'recommended_pairs.json'}")
-
 
 def _compute_final_score(train_score: float, validation_score: float, train_metrics: dict[str, Any], validation_metrics: list[dict[str, Any]], target_cfg: dict[str, Any]) -> tuple[float, dict[str, Any]]:
     max_dd_target = _safe_float(target_cfg.get("max_drawdown_pct", 3.0))
@@ -7143,6 +7714,11 @@ def main() -> None:
     parser.add_argument("--pairs-file", default=None, help="optimize 模式下读取指定 recommended_pairs.json，并使用 active_pairs 覆盖本次 pair_whitelist")
     parser.add_argument("--ignore-recommended-pairs", action="store_true", default=False, help="optimize 模式下忽略 user_data/ai_memory/recommended_pairs.json，使用原始 config 的 pair_whitelist")
     parser.add_argument("--refresh-pairs", action="store_true", default=False, help="optimize 模式开始前先执行一次 pair-scan，生成最新 recommended_pairs.json 并用于本次优化")
+    parser.add_argument("--pair-scan-strategy-source", choices=["auto", "best", "manual"], default="auto", help="pair-scan 策略来源：auto=自动多历史策略，best=当前 best_strategy.json，manual=手动指定策略文件/类名")
+    parser.add_argument("--pair-scan-strategy-count", type=int, default=None, help="覆盖 pair_selection.max_strategy_candidates")
+    parser.add_argument("--pair-scan-strategy-lookback-runs", type=int, default=None, help="覆盖 pair_selection.strategy_lookback_runs")
+    parser.add_argument("--pair-scan-strategy-file", default=None, help="manual 策略来源使用的策略文件路径")
+    parser.add_argument("--pair-scan-strategy-name", default=None, help="manual 策略来源使用的策略类名")
     parser.add_argument("--base-strategy", default="MultiCoin_AI_Strategy")
     parser.add_argument("--timeframe", default="5m")
     parser.add_argument("--timerange", default=None, help="训练回测区间，例如 20260501-20260525")
@@ -7189,6 +7765,12 @@ def main() -> None:
         parser.error("--ignore-recommended-pairs 仅用于 optimize 模式")
     if args.mode == "pair-scan" and args.refresh_pairs:
         parser.error("--refresh-pairs 仅用于 optimize 模式；pair-scan 模式本身已执行交易对筛选")
+    if args.pair_scan_strategy_count is not None and args.pair_scan_strategy_count <= 0:
+        parser.error("--pair-scan-strategy-count 必须大于 0")
+    if args.pair_scan_strategy_lookback_runs is not None and args.pair_scan_strategy_lookback_runs <= 0:
+        parser.error("--pair-scan-strategy-lookback-runs 必须大于 0")
+    if args.pair_scan_strategy_source != "manual" and (args.pair_scan_strategy_file or args.pair_scan_strategy_name):
+        print("警告：--pair-scan-strategy-file/--pair-scan-strategy-name 仅在 --pair-scan-strategy-source manual 时使用，本次将忽略。")
     if args.random_sample_windows < 0:
         parser.error("--random-sample-windows 不能小于 0")
     if args.random_sample_windows > 0:
