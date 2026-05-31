@@ -108,20 +108,10 @@
     "enabled": true,
     "candidate_pairs": [
       "BTC/USDT",
-      "ETH/USDT",
-      "SOL/USDT",
-      "XRP/USDT",
-      "DOGE/USDT",
-      "ADA/USDT",
-      "BNB/USDT",
-      "AVAX/USDT",
-      "LINK/USDT",
-      "LTC/USDT",
       "OP/USDT",
-      "ARB/USDT",
-      "APT/USDT",
-      "SUI/USDT",
-      "NEAR/USDT"
+      "SOL/USDT",
+      "BNB/USDT",
+      "DOGE/USDT"
     ],
     "min_pair_trades": 8,
     "max_pair_drawdown_pct": 3,
