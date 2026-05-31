@@ -79,29 +79,40 @@
     "total_trades": 47
   },
   "prompt_guidance": {
-  "advisor_rules": [
-  "当前不要继续单纯收紧 ETH/USDT。",
-  "上一轮 v002 是近似成功候选：训练收益为正、PF 高、回撤低，但交易数只有 16，验证强度不足。",
-  "本轮目标是在保持低回撤的前提下，把训练交易数提升到 20~24。",
-  "禁止生成训练交易数低于 20 的策略；如果预计低于 20，不要选择该 mutation。",
-  "优先改善 202603 亏损，但不能以大幅降低交易数为代价。",
-  "不要继续生成与 v001/v004 行为几乎一致的策略。",
-  "固定止损吞噬 ROI 是核心问题，但不要扩大 stoploss，应通过保留优质盈利交易并减少 202603 坏交易解决。"
-  ],
-  "codegen_rules": [
-    "必须真实落地 mutation_spec。",
-    "禁止只改 class name、注释、变量名。",
-    "如果新增过滤条件，populate_entry_trend 必须实际出现对应条件。",
-    "如果新增指标，populate_indicators 必须实际计算。",
-    "如果生成的策略与父策略行为等价，应主动报错，不要输出等价代码。",
-    "上一轮如果因为策略重复失败，本轮禁止继续使用同一个 codegen provider，且必须改变 entry_conditions 或 indicators，不允许只改变类名、注释、变量名。",
-    "如果 mutation_spec 预计交易数 20~24，代码实现不得因为过度过滤把交易数压到 20 以下。"
-  ]
+    "advisor_rules": [
+      "当前不要继续单纯收紧 ETH/USDT。",
+      "上一轮 v002 是近似成功候选：训练收益为正、PF 高、回撤低，但交易数只有 16，验证强度不足。",
+      "本轮目标是在保持低回撤的前提下，把训练交易数提升到 20~24。",
+      "禁止生成训练交易数低于 20 的策略；如果预计低于 20，不要选择该 mutation。",
+      "优先改善 202603 亏损，但不能以大幅降低交易数为代价。",
+      "不要继续生成与 v001/v004 行为几乎一致的策略。",
+      "固定止损吞噬 ROI 是核心问题，但不要扩大 stoploss，应通过保留优质盈利交易并减少 202603 坏交易解决。"
+    ],
+    "codegen_rules": [
+      "必须真实落地 mutation_spec。",
+      "禁止只改 class name、注释、变量名。",
+      "如果新增过滤条件，populate_entry_trend 必须实际出现对应条件。",
+      "如果新增指标，populate_indicators 必须实际计算。",
+      "如果生成的策略与父策略行为等价，应主动报错，不要输出等价代码。",
+      "上一轮如果因为策略重复失败，本轮禁止继续使用同一个 codegen provider，且必须改变 entry_conditions 或 indicators，不允许只改变类名、注释、变量名。",
+      "如果 mutation_spec 预计交易数 20~24，代码实现不得因为过度过滤把交易数压到 20 以下。"
+    ]
   },
   "pre_run_ai_review": {
-  "enabled": true,
-  "provider_role": "strategy_advisor",
-  "save_file": "pre_run_ai_review.json"
+    "enabled": true,
+    "provider_role": "strategy_advisor",
+    "save_file": "pre_run_ai_review.json"
   },
-  "language": "zh-CN"
+  "language": "zh-CN",
+  "pair_selection": {
+    "enabled": true,
+    "candidate_pairs": [],
+    "min_pair_trades": 8,
+    "max_pair_drawdown_pct": 3,
+    "min_pair_profit_factor": 0.9,
+    "prefer_validation_profit_positive": true,
+    "active_pair_count": 5,
+    "watch_pair_count": 5,
+    "reevaluate_every_runs": 5
+  }
 }

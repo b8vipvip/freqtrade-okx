@@ -90,5 +90,16 @@
       "禁止只改 class name、注释、变量名。",
       "生成代码后必须与父策略在 entry_conditions 或 indicators 上有可检测差异。"
     ]
+  },
+  "pair_selection": {
+    "enabled": true,
+    "candidate_pairs": [],
+    "min_pair_trades": 8,
+    "max_pair_drawdown_pct": 3,
+    "min_pair_profit_factor": 0.9,
+    "prefer_validation_profit_positive": true,
+    "active_pair_count": 5,
+    "watch_pair_count": 5,
+    "reevaluate_every_runs": 5
   }
 }

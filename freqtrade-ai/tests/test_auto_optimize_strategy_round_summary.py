@@ -384,3 +384,64 @@ def test_provider_pool_env_errors_when_only_placeholders(monkeypatch) -> None:
         assert "没有可用 provider" in str(exc)
     else:
         raise AssertionError("placeholder provider pool should fail fast")
+
+
+def test_pair_score_penalizes_negative_validation_stoploss_and_low_trades() -> None:
+    cfg = {
+        "min_pair_trades": 8,
+        "max_pair_drawdown_pct": 3,
+        "min_pair_profit_factor": 0.9,
+        "prefer_validation_profit_positive": True,
+    }
+    row = {
+        "pair": "BAD/USDT",
+        "train_total_trades": 3,
+        "train_profit_pct": -0.5,
+        "train_profit_factor": 0.5,
+        "train_max_drawdown_pct": 4.0,
+        "validation_avg_profit_pct": -1.2,
+        "validation_avg_profit_factor": 0.4,
+        "validation_worst_profit_pct": -3.0,
+        "validation_worst_profit_factor": 0.2,
+        "validation_max_drawdown_pct": 5.0,
+        "stoploss_to_roi_ratio": 2.0,
+    }
+
+    score, penalties, reason = optimizer._score_pair(row, cfg)
+
+    assert score < 20
+    assert "验证平均收益为负" in penalties
+    assert "最差验证区间严重亏损" in penalties
+    assert "固定止损亏损大于 ROI 收益" in penalties
+    assert "交易数太少" in penalties
+    assert "回撤过高" in penalties
+    assert reason
+
+
+def test_pair_metric_row_combines_train_validation_and_exit_reason_profit() -> None:
+    train_metrics = {
+        "pairs": [
+            {"key": "SOL/USDT", "trades": 10, "profit_total_abs": 5, "profit_total": 0.01, "profit_factor": 1.4, "max_drawdown_pct": 1.2},
+        ]
+    }
+    validations = [
+        {"period": "v1", "timerange": "20240101-20240131", "metrics": {"pairs": [{"key": "SOL/USDT", "trades": 6, "profit_total": 0.02, "profit_factor": 1.2, "max_drawdown_pct": 0.8}]}},
+        {"period": "v2", "timerange": "20240201-20240229", "metrics": {"pairs": [{"key": "SOL/USDT", "trades": 4, "profit_total": -0.01, "profit_factor": 0.8, "max_drawdown_pct": 1.5}]}},
+    ]
+    result = {
+        "trades": [
+            {"pair": "SOL/USDT", "exit_reason": "roi", "profit_abs": 3.0},
+            {"pair": "SOL/USDT", "exit_reason": "stop_loss", "profit_abs": -1.5},
+            {"pair": "ETH/USDT", "exit_reason": "roi", "profit_abs": 99.0},
+        ]
+    }
+
+    row = optimizer._pair_metric_row("SOL/USDT", train_metrics, validations, result)
+
+    assert row["train_total_trades"] == 10
+    assert row["train_profit_pct"] == 1.0
+    assert row["validation_avg_profit_pct"] == 0.5
+    assert row["validation_worst_profit_pct"] == -1.0
+    assert row["train_roi_profit_abs"] == 3.0
+    assert row["train_stoploss_profit_abs"] == -1.5
+    assert row["stoploss_to_roi_ratio"] == 0.5

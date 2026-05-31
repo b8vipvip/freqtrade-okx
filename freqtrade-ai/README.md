@@ -245,3 +245,30 @@ python3 ai_tools/auto_optimize_strategy.py \
   --iterations 5 \
   --save-goal
 ```
+
+### 18.11 交易对筛选（pair-scan）
+当固定交易对长期接近盈亏平衡、个别币种拖累明显时，可以先扩大候选池，让当前 `best_strategy.json` 指向的 best 策略在候选交易对上回测筛选：
+
+```bash
+python3 ai_tools/auto_optimize_strategy.py \
+  --goal ai_tools/optimization_goal.json \
+  --mode pair-scan
+```
+
+配置入口为 `optimization_goal.json` 的 `pair_selection.candidate_pairs`。`pair-scan` 不调用 AI、不生成新策略、不覆盖 `best_strategy.json`，会输出：
+
+- `user_data/ai_memory/pair_leaderboard.json`
+- `user_data/ai_memory/recommended_pairs.json`
+- 本次 run 目录下的同名快照文件
+
+之后可让优化模式使用推荐的 `active_pairs`：
+
+```bash
+python3 ai_tools/auto_optimize_strategy.py \
+  --goal ai_tools/optimization_goal.json \
+  --mode optimize \
+  --pairs-file user_data/ai_memory/recommended_pairs.json \
+  --iterations 5
+```
+
+`cooldown_pairs` 只表示当前时间窗口表现较差，后续重新执行 `pair-scan` 时仍可重新进入 `active_pairs`。
