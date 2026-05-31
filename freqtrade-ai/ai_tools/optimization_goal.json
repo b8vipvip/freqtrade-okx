@@ -5,9 +5,9 @@
   "timerange": "20260501-20260525",
   "pairs": [
     "BTC/USDT",
-    "ETH/USDT",
+    "OP/USDT",
     "SOL/USDT",
-    "XRP/USDT",
+    "BNB/USDT",
     "DOGE/USDT"
   ],
   "max_iterations": 5,
