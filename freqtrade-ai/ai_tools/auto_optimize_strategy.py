@@ -643,6 +643,7 @@ def print_pair_selection_status(
     source: str,
     active_pairs: list[str],
     temp_config: str | None,
+    active_pair_count_actual: Any = None,
 ) -> None:
     print("\n========== 交易对选择状态 ==========")
     print(f"recommended_pairs 默认文件：{default_file}")
@@ -650,6 +651,8 @@ def print_pair_selection_status(
     print(f"本次是否使用 recommended_pairs：{'是' if used_recommended else '否'}")
     print(f"使用来源：{_format_legacy_pair_source_label(source)}")
     print(f"active_pairs 数量：{len(active_pairs)}")
+    if active_pair_count_actual not in (None, ""):
+        print(f"active_pair_count_actual：{active_pair_count_actual}")
     print("active_pairs：" + (", ".join(active_pairs) if active_pairs else "无"))
     print(f"临时 config 路径：{temp_config or '未生成（使用原始 config）'}")
 
@@ -738,7 +741,11 @@ def print_effective_pair_selection_log(runtime_goal: dict[str, Any]) -> None:
     print(f"source_strategy：{recommended_data.get('source_strategy', '')}")
     print(f"created_at：{recommended_data.get('created_at', '')}")
     print(f"scan_periods：{scan_periods}")
+    actual_count = recommended_data.get("active_pair_count_actual")
+    if actual_count in (None, ""):
+        actual_count = len(active_items) if isinstance(active_items, list) else 0
     print(f"active_pairs 数量：{len(active_items) if isinstance(active_items, list) else 0}")
+    print(f"active_pair_count_actual：{actual_count}")
     print(f"watch_pairs 数量：{len(watch_items) if isinstance(watch_items, list) else 0}")
     print(f"cooldown_pairs 数量：{len(cooldown_items) if isinstance(cooldown_items, list) else 0}")
 
@@ -815,6 +822,7 @@ def apply_recommended_pairs_override(runtime_goal: dict[str, Any], args: argpars
         source=source,
         active_pairs=active_pairs,
         temp_config=temp_config,
+        active_pair_count_actual=recommended_data.get("active_pair_count_actual") if isinstance(recommended_data, dict) else None,
     )
 
     _store_pair_selection_log(
@@ -2313,8 +2321,13 @@ def _summarize_pre_run_source_file(label: str, data: Any) -> Any:
         return {
             "created_at": data.get("created_at"),
             "source_strategy": data.get("source_strategy"),
+            "source_strategy_path": data.get("source_strategy_path"),
+            "scan_periods": data.get("scan_periods"),
             "train_period": data.get("train_period"),
             "validation_periods": data.get("validation_periods"),
+            "active_pair_count_requested": data.get("active_pair_count_requested"),
+            "active_pair_count_actual": data.get("active_pair_count_actual"),
+            "min_active_score": data.get("min_active_score"),
             "active_pairs": data.get("active_pairs", []),
             "watch_pairs": data.get("watch_pairs", []),
             "cooldown_pairs": data.get("cooldown_pairs", []),
@@ -2395,6 +2408,23 @@ def _load_pre_run_review_sources(current_run_dir: Path) -> tuple[dict[str, Any],
             loaded["files"][label] = {"status": "error", "path": str(path), "error": str(exc)}
     return loaded, missing
 
+
+
+def _print_pre_run_recommended_pairs_count(sources: dict[str, Any]) -> None:
+    files = sources.get("files", {}) if isinstance(sources, dict) else {}
+    if not isinstance(files, dict):
+        return
+    for label, item in files.items():
+        if not str(label).endswith("recommended_pairs.json") or not isinstance(item, dict):
+            continue
+        data = item.get("data", {}) if isinstance(item.get("data"), dict) else {}
+        if item.get("status") == "loaded":
+            actual = data.get("active_pair_count_actual")
+            if actual in (None, ""):
+                active_items = data.get("active_pairs", [])
+                actual = len(active_items) if isinstance(active_items, list) else 0
+            print(f"recommended_pairs active_pair_count_actual：{actual}")
+        return
 
 def _build_pre_run_ai_review_prompt(runtime_goal: dict[str, Any], sources: dict[str, Any], missing: list[str]) -> str:
     trade_target_text = _runtime_trade_target_text(runtime_goal)
@@ -2535,6 +2565,7 @@ def run_pre_run_ai_review(
         return None
 
     sources, missing = _load_pre_run_review_sources(run_dir)
+    _print_pre_run_recommended_pairs_count(sources)
     prompt = _build_pre_run_ai_review_prompt(runtime_goal, sources, missing)
     prompt_path.write_text(prompt, encoding="utf-8")
     try:
@@ -3937,6 +3968,8 @@ def _pair_selection_cfg(runtime_goal: dict[str, Any]) -> dict[str, Any]:
         "prefer_validation_profit_positive": bool(raw.get("prefer_validation_profit_positive", True)),
         "active_pair_count": int(raw.get("active_pair_count", 5) or 5),
         "watch_pair_count": int(raw.get("watch_pair_count", 5) or 5),
+        "min_active_score": float(raw.get("min_active_score", 1.0) if raw.get("min_active_score", None) is not None else 1.0),
+        "allow_zero_score_active": bool(raw.get("allow_zero_score_active", False)),
         "reevaluate_every_runs": int(raw.get("reevaluate_every_runs", 5) or 5),
     }
 
@@ -4046,15 +4079,73 @@ def _score_pair(row: dict[str, Any], cfg: dict[str, Any]) -> tuple[float, list[s
     return round(max(0.0, min(100.0, score)), 4), reasons, reason
 
 
+def _first_nonempty_string(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
 def _best_strategy_ref() -> tuple[str, str]:
     if not BEST_STRATEGY_FILE.exists():
         raise FileNotFoundError(f"best_strategy.json 不存在：{BEST_STRATEGY_FILE}")
     best = read_json(BEST_STRATEGY_FILE)
     class_name = str(best.get("class_name") or best.get("strategy_class") or "").strip()
-    strategy_file = str(best.get("strategy_file") or "").strip()
+    strategy_file = _first_nonempty_string(best.get("strategy_file"), best.get("strategy_path"))
     if not class_name:
         raise RuntimeError("best_strategy.json 缺少 class_name/strategy_class")
     return class_name, strategy_file
+
+
+def _pair_scan_source_strategy_path(runtime_goal: dict[str, Any], actual_strategy_file: str) -> str:
+    best: dict[str, Any] = {}
+    if BEST_STRATEGY_FILE.exists():
+        try:
+            loaded = read_json(BEST_STRATEGY_FILE)
+            best = loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            best = {}
+    return _first_nonempty_string(
+        best.get("strategy_file"),
+        best.get("strategy_path"),
+        runtime_goal.get("champion_strategy_path"),
+        runtime_goal.get("champion", {}).get("strategy_file") if isinstance(runtime_goal.get("champion"), dict) else "",
+        runtime_goal.get("champion", {}).get("strategy_path") if isinstance(runtime_goal.get("champion"), dict) else "",
+        actual_strategy_file,
+    )
+
+
+def _pair_scan_period_payload(runtime_goal: dict[str, Any], train: PeriodDef, validations: list[PeriodDef]) -> dict[str, Any]:
+    return {
+        "train_period": train.timerange,
+        "validation_periods": [p.timerange for p in validations],
+        "holdout_periods": [
+            str(item.get("timerange") if isinstance(item, dict) else item).strip()
+            for item in runtime_goal.get("holdout_periods", [])
+            if str(item.get("timerange") if isinstance(item, dict) else item).strip()
+        ] if isinstance(runtime_goal.get("holdout_periods", []), list) else [],
+    }
+
+
+def _pair_scan_windows_payload(runtime_goal: dict[str, Any]) -> list[Any]:
+    pair_selection = runtime_goal.get("pair_selection", {}) if isinstance(runtime_goal.get("pair_selection", {}), dict) else {}
+    windows = pair_selection.get("pair_scan_windows") or runtime_goal.get("pair_scan_windows") or pair_selection.get("scan_windows") or runtime_goal.get("scan_windows") or []
+    return windows if isinstance(windows, list) else []
+
+
+def print_pair_scan_quality_check(recommended: dict[str, Any]) -> None:
+    active_items = recommended.get("active_pairs", []) if isinstance(recommended.get("active_pairs", []), list) else []
+    has_nonpositive_active = any(_safe_float(item.get("score") if isinstance(item, dict) else 0) <= 0 for item in active_items)
+    print("\n========== 交易对筛选质量检查 ==========")
+    print(f"请求 active 数量：{recommended.get('active_pair_count_requested')}")
+    print(f"实际 active 数量：{recommended.get('active_pair_count_actual')}")
+    print(f"min_active_score：{recommended.get('min_active_score')}")
+    print(f"score<=0 的币是否进入 active：{'是' if has_nonpositive_active else '否'}")
+    print(f"source_strategy_path：{recommended.get('source_strategy_path') or ''}")
+    print(f"scan_periods：{recommended.get('scan_periods')}")
+    if recommended.get("not_enough_active_pairs_warning"):
+        print("警告：优质币数量不足，本次只使用实际筛出的 active_pairs。")
 
 
 def _run_pair_scan_backtest(config: str, class_name: str, timeframe: str, period: PeriodDef, run_dir: Path, label: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -4128,13 +4219,31 @@ def run_pair_scan(runtime_goal: dict[str, Any], args: argparse.Namespace, run_di
     rows.sort(key=lambda item: _safe_float(item.get("score")), reverse=True)
     active_count = max(0, int(cfg.get("active_pair_count", 5)))
     watch_count = max(0, int(cfg.get("watch_pair_count", 5)))
-    active_rows = rows[:active_count]
-    watch_rows = rows[active_count:active_count + watch_count]
-    cooldown_rows = rows[active_count + watch_count:]
+    min_active_score = float(cfg.get("min_active_score", 1.0))
+    allow_zero_score_active = bool(cfg.get("allow_zero_score_active", False))
+    active_candidates = [
+        row for row in rows
+        if _safe_float(row.get("score")) >= min_active_score
+        or (allow_zero_score_active and _safe_float(row.get("score")) <= 0)
+    ]
+    active_rows = active_candidates[:active_count]
+    active_pairs_set = {str(r.get("pair")) for r in active_rows}
+    remaining_rows = [r for r in rows if str(r.get("pair")) not in active_pairs_set]
+    watch_candidates = [r for r in remaining_rows if _safe_float(r.get("score")) > 0]
+    watch_rows = watch_candidates[:watch_count]
+    watch_pairs_set = {str(r.get("pair")) for r in watch_rows}
+    cooldown_rows = [r for r in remaining_rows if str(r.get("pair")) not in watch_pairs_set]
+    source_strategy_path = _pair_scan_source_strategy_path(runtime_goal, strategy_file)
+    scan_periods = _pair_scan_period_payload(runtime_goal, train, validations)
+    scan_windows = _pair_scan_windows_payload(runtime_goal)
+    not_enough_active_pairs_warning = len(active_rows) < active_count
     leaderboard = {
         "created_at": datetime.utcnow().isoformat(),
         "source_strategy": class_name,
         "source_strategy_file": strategy_file,
+        "source_strategy_path": source_strategy_path,
+        "scan_periods": scan_periods,
+        "scan_windows": scan_windows,
         "train_period": train.timerange,
         "validation_periods": [{"name": p.name, "timerange": p.timerange, "weight": p.weight} for p in validations],
         "candidate_pairs": list(candidate_pairs),
@@ -4143,8 +4252,17 @@ def run_pair_scan(runtime_goal: dict[str, Any], args: argparse.Namespace, run_di
     recommended = {
         "created_at": datetime.utcnow().isoformat(),
         "source_strategy": class_name,
+        "source_strategy_file": strategy_file,
+        "source_strategy_path": source_strategy_path,
+        "scan_periods": scan_periods,
+        "scan_windows": scan_windows,
         "train_period": train.timerange,
         "validation_periods": [p.timerange for p in validations],
+        "active_pair_count_requested": active_count,
+        "active_pair_count_actual": len(active_rows),
+        "min_active_score": min_active_score,
+        "allow_zero_score_active": allow_zero_score_active,
+        "not_enough_active_pairs_warning": not_enough_active_pairs_warning,
         "active_pairs": [{"pair": r["pair"], "score": r["score"], "reason": r["reason"]} for r in active_rows],
         "watch_pairs": [{"pair": r["pair"], "score": r["score"], "reason": r["reason"]} for r in watch_rows],
         "cooldown_pairs": [{"pair": r["pair"], "score": r["score"], "reason": r["reason"]} for r in cooldown_rows],
@@ -4155,6 +4273,7 @@ def run_pair_scan(runtime_goal: dict[str, Any], args: argparse.Namespace, run_di
     write_json(PAIR_LEADERBOARD_FILE, leaderboard)
     write_json(RECOMMENDED_PAIRS_FILE, recommended)
     print_pair_scan_summary(recommended, len(candidate_pairs))
+    print_pair_scan_quality_check(recommended)
     print(f"pair_leaderboard.json：{run_dir / 'pair_leaderboard.json'}")
     print(f"recommended_pairs.json：{run_dir / 'recommended_pairs.json'}")
 
