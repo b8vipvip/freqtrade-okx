@@ -105,30 +105,38 @@
   },
   "language": "zh-CN",
   "pair_selection": {
-  "enabled": true,
-  "candidate_pairs": [
-    "BTC/USDT",
-    "ETH/USDT",
-    "SOL/USDT",
-    "XRP/USDT",
-    "DOGE/USDT",
-    "ADA/USDT",
-    "BNB/USDT",
-    "AVAX/USDT",
-    "LINK/USDT",
-    "LTC/USDT",
-    "OP/USDT",
-    "ARB/USDT",
-    "APT/USDT",
-    "SUI/USDT",
-    "NEAR/USDT"
-  ],
-  "min_pair_trades": 8,
-  "max_pair_drawdown_pct": 3,
-  "min_pair_profit_factor": 0.9,
-  "prefer_validation_profit_positive": true,
-  "active_pair_count": 5,
-  "watch_pair_count": 5,
-  "reevaluate_every_runs": 5
+    "enabled": true,
+    "candidate_pairs": [
+      "BTC/USDT",
+      "ETH/USDT",
+      "SOL/USDT",
+      "XRP/USDT",
+      "DOGE/USDT",
+      "ADA/USDT",
+      "BNB/USDT",
+      "AVAX/USDT",
+      "LINK/USDT",
+      "LTC/USDT",
+      "OP/USDT",
+      "ARB/USDT",
+      "APT/USDT",
+      "SUI/USDT",
+      "NEAR/USDT"
+    ],
+    "min_pair_trades": 8,
+    "max_pair_drawdown_pct": 3,
+    "min_pair_profit_factor": 0.9,
+    "prefer_validation_profit_positive": true,
+    "active_pair_count": 5,
+    "watch_pair_count": 5,
+    "reevaluate_every_runs": 5
+  },
+  "auto_trade_count_target": {
+    "enabled": true,
+    "min_trades_per_pair": 4,
+    "ideal_min_trades_per_pair": 5,
+    "ideal_max_trades_per_pair": 9,
+    "max_trades_per_pair": 12,
+    "hard_max_trades": 120
   }
 }
