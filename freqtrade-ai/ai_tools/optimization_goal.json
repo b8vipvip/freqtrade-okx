@@ -129,7 +129,17 @@
     "prefer_validation_profit_positive": true,
     "active_pair_count": 5,
     "watch_pair_count": 5,
-    "reevaluate_every_runs": 5
+    "reevaluate_every_runs": 5,
+    "min_active_score": 1.0,
+    "use_multi_strategy_vote": true,
+    "auto_strategy_candidates": true,
+    "max_strategy_candidates": 5,
+    "strategy_lookback_runs": 80,
+    "min_strategy_train_trades": 15,
+    "min_strategy_validation_periods": 2,
+    "prefer_positive_validation": true,
+    "min_strategy_diversity": true,
+    "min_pair_strategy_appearances": 2
   },
   "auto_trade_count_target": {
     "enabled": true,
