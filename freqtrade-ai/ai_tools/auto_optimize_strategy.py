@@ -48,6 +48,8 @@ BEST_STRATEGY_FILE = ROOT_DIR / "user_data" / "ai_memory" / "best_strategy.json"
 RESET_HISTORY_FILE = ROOT_DIR / "user_data" / "ai_memory" / "reset_history.json"
 NEAREST_CANDIDATE_FILE = ROOT_DIR / "user_data" / "ai_memory" / "nearest_candidate.json"
 LAST_RUN_SUMMARY_FILE = ROOT_DIR / "user_data" / "ai_memory" / "last_run_summary.json"
+RECOMMENDED_PAIRS_FILE = ROOT_DIR / "user_data" / "ai_memory" / "recommended_pairs.json"
+PAIR_LEADERBOARD_FILE = ROOT_DIR / "user_data" / "ai_memory" / "pair_leaderboard.json"
 ITERATION_STATS_FILE_NAME = "iteration_stats.json"
 MEMORY_EXAMPLE_FILE = ROOT_DIR / "ai_tools" / "strategy_memory.example.json"
 BLACKLIST_EXAMPLE_FILE = ROOT_DIR / "ai_tools" / "strategy_blacklist.example.json"
@@ -298,6 +300,8 @@ def _copy_log_repo_summary_files(run_dir: Path, dest_dir: Path) -> None:
         "pre_run_ai_review.raw.txt",
         ITERATION_STATS_FILE_NAME,
         "leaderboard.json",
+        "pair_leaderboard.json",
+        "recommended_pairs.json",
         "last_run_summary.json",
         "nearest_candidate_snapshot.json",
         "best_strategy_snapshot.json",
@@ -308,6 +312,8 @@ def _copy_log_repo_summary_files(run_dir: Path, dest_dir: Path) -> None:
         (BEST_STRATEGY_FILE, "best_strategy_snapshot.json"),
         (NEAREST_CANDIDATE_FILE, "nearest_candidate_snapshot.json"),
         (LAST_RUN_SUMMARY_FILE, "last_run_summary.json"),
+        (PAIR_LEADERBOARD_FILE, "pair_leaderboard.json"),
+        (RECOMMENDED_PAIRS_FILE, "recommended_pairs.json"),
     ]
     for src, dest_name in snapshots:
         _copy_if_exists(src, dest_dir / dest_name)
@@ -537,6 +543,60 @@ def read_json(path: Path) -> dict[str, Any]:
 def write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_pairs_from_recommended_file(pairs_file: str | None) -> list[str]:
+    if not pairs_file:
+        return []
+    path = _resolve_repo_path(pairs_file)
+    if not path.exists():
+        raise FileNotFoundError(f"推荐币种文件不存在：{path}")
+    data = read_json(path)
+    active = data.get("active_pairs", []) if isinstance(data, dict) else []
+    pairs: list[str] = []
+    for item in active:
+        pair = str(item.get("pair") if isinstance(item, dict) else item).strip()
+        if pair and pair not in pairs:
+            pairs.append(pair)
+    if not pairs:
+        raise RuntimeError(f"推荐币种文件中 active_pairs 为空：{path}")
+    return pairs
+
+
+def _write_temp_config_with_pairs(base_config: str, pairs: list[str], run_dir: Path, label: str) -> str:
+    if not pairs:
+        return base_config
+    base_path = _resolve_repo_path(base_config)
+    if not base_path.exists():
+        raise FileNotFoundError(f"配置文件不存在：{base_path}")
+    config_data = read_json(base_path)
+    exchange = config_data.setdefault("exchange", {})
+    if not isinstance(exchange, dict):
+        raise RuntimeError(f"配置文件 exchange 字段不是 object：{base_path}")
+    exchange["pair_whitelist"] = list(pairs)
+    safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", label).strip("_") or "pairs"
+    dest = run_dir / f"config.{safe_label}.json"
+    write_json(dest, config_data)
+    try:
+        return str(dest.relative_to(ROOT_DIR))
+    except ValueError:
+        return str(dest)
+
+
+def apply_pairs_file_override(runtime_goal: dict[str, Any], args: argparse.Namespace, run_dir: Path) -> None:
+    pairs_file = getattr(args, "pairs_file", None)
+    if not pairs_file:
+        return
+    active_pairs = _load_pairs_from_recommended_file(pairs_file)
+    base_config = str(runtime_goal.get("config", args.config))
+    temp_config = _write_temp_config_with_pairs(base_config, active_pairs, run_dir, "recommended_pairs")
+    runtime_goal["config"] = temp_config
+    runtime_goal["pairs"] = active_pairs
+    args.config = temp_config
+    print("已启用 --pairs-file，本次 optimize 使用 recommended_pairs.active_pairs 覆盖 pair_whitelist：")
+    print(f"推荐币种文件：{_resolve_repo_path(pairs_file)}")
+    print(f"临时配置文件：{temp_config}")
+    print("active_pairs：" + ", ".join(active_pairs))
 
 
 def compute_global_strategy_stats() -> dict[str, int]:
@@ -1844,6 +1904,26 @@ def _summarize_pre_run_source_file(label: str, data: Any) -> Any:
             "forbidden_next_mutation_types": data.get("forbidden_next_mutation_types"),
             "round_history": data.get("round_history", [])[-5:] if isinstance(data.get("round_history"), list) else [],
         })
+    if label.endswith("recommended_pairs.json") and isinstance(data, dict):
+        return {
+            "created_at": data.get("created_at"),
+            "source_strategy": data.get("source_strategy"),
+            "train_period": data.get("train_period"),
+            "validation_periods": data.get("validation_periods"),
+            "active_pairs": data.get("active_pairs", []),
+            "watch_pairs": data.get("watch_pairs", []),
+            "cooldown_pairs": data.get("cooldown_pairs", []),
+        }
+    if label.endswith("pair_leaderboard.json") and isinstance(data, dict):
+        rows = data.get("items", []) if isinstance(data.get("items"), list) else []
+        return {
+            "created_at": data.get("created_at"),
+            "source_strategy": data.get("source_strategy"),
+            "train_period": data.get("train_period"),
+            "validation_periods": data.get("validation_periods"),
+            "top_pairs": rows[:10],
+            "bottom_pairs": rows[-5:] if len(rows) > 5 else [],
+        }
     return _strip_random_samples_for_ai_prompt(data)
 
 
@@ -1853,6 +1933,8 @@ def _load_pre_run_review_sources(current_run_dir: Path) -> tuple[dict[str, Any],
         source_paths: list[tuple[str, Path | None]] = [
             ("日志仓库上一轮 iteration_stats.json", log_repo_run_dir / ITERATION_STATS_FILE_NAME),
             ("日志仓库上一轮 leaderboard.json", log_repo_run_dir / "leaderboard.json"),
+            ("日志仓库上一轮 pair_leaderboard.json", log_repo_run_dir / "pair_leaderboard.json"),
+            ("日志仓库上一轮 recommended_pairs.json", log_repo_run_dir / "recommended_pairs.json"),
             ("日志仓库上一轮 last_run_summary.json", log_repo_run_dir / "last_run_summary.json"),
             ("日志仓库上一轮 best_strategy_snapshot.json", log_repo_run_dir / "best_strategy_snapshot.json"),
             ("日志仓库上一轮 nearest_candidate_snapshot.json", log_repo_run_dir / "nearest_candidate_snapshot.json"),
@@ -1882,6 +1964,8 @@ def _load_pre_run_review_sources(current_run_dir: Path) -> tuple[dict[str, Any],
         ("user_data/ai_memory/last_run_summary.json", LAST_RUN_SUMMARY_FILE),
         ("user_data/ai_memory/best_strategy.json", BEST_STRATEGY_FILE),
         ("user_data/ai_memory/nearest_candidate.json", NEAREST_CANDIDATE_FILE),
+        ("user_data/ai_memory/recommended_pairs.json", RECOMMENDED_PAIRS_FILE),
+        ("user_data/ai_memory/pair_leaderboard.json", PAIR_LEADERBOARD_FILE),
         ("user_data/ai_memory/strategy_lessons.json", LESSONS_FILE),
         ("user_data/ai_memory/strategy_blacklist.json", BLACKLIST_FILE),
         ("上一次 run 的 iteration_stats.json", (previous_run_dir / ITERATION_STATS_FILE_NAME) if previous_run_dir else None),
@@ -1899,8 +1983,7 @@ def _load_pre_run_review_sources(current_run_dir: Path) -> tuple[dict[str, Any],
             continue
         try:
             data = read_json(path)
-            if path.name == ITERATION_STATS_FILE_NAME:
-                data = _strip_random_samples_for_ai_prompt(data)
+            data = _summarize_pre_run_source_file(path.name, data)
             loaded["files"][label] = {"status": "loaded", "path": str(path), "data": data}
         except Exception as exc:  # noqa: BLE001 - review must never block optimization.
             missing.append(f"{label}（读取失败：{exc}）")
@@ -1944,6 +2027,7 @@ def _build_pre_run_ai_review_prompt(runtime_goal: dict[str, Any], sources: dict[
             "train_period": runtime_goal.get("train_period", {}),
             "validation_periods": runtime_goal.get("validation_periods", []),
             "prompt_guidance": runtime_goal.get("prompt_guidance", {}),
+            "pair_selection": runtime_goal.get("pair_selection", {}),
         }, 5000)
         + "\n\n========== 已读取的复盘输入数据 ==========\n"
         + _compact_prompt_json(sources, 24000)
@@ -3425,6 +3509,241 @@ def _normalize_entry_tag_metrics(raw_tags: list[dict[str, Any]]) -> list[dict[st
             continue
         out.append({"enter_tag": tag, "trades": _safe_int(item.get("trades") or item.get("total_trades")), "profit_total_abs": _safe_float(item.get("profit_total_abs")), "profit_total_pct": (_safe_float(item.get("profit_total")) * 100.0 if item.get("profit_total") is not None else _safe_float(item.get("profit_total_pct"))), "profit_factor": _safe_float(item.get("profit_factor")), "winrate": _safe_float(item.get("winrate"))})
     return out
+
+
+def _pair_selection_cfg(runtime_goal: dict[str, Any]) -> dict[str, Any]:
+    raw = runtime_goal.get("pair_selection", {}) or {}
+    if not isinstance(raw, dict):
+        raw = {}
+    return {
+        "enabled": bool(raw.get("enabled", True)),
+        "candidate_pairs": [str(p).strip() for p in raw.get("candidate_pairs", []) if str(p).strip()] if isinstance(raw.get("candidate_pairs", []), list) else [],
+        "min_pair_trades": int(raw.get("min_pair_trades", 8) or 8),
+        "max_pair_drawdown_pct": float(raw.get("max_pair_drawdown_pct", 3) or 3),
+        "min_pair_profit_factor": float(raw.get("min_pair_profit_factor", 0.9) or 0.9),
+        "prefer_validation_profit_positive": bool(raw.get("prefer_validation_profit_positive", True)),
+        "active_pair_count": int(raw.get("active_pair_count", 5) or 5),
+        "watch_pair_count": int(raw.get("watch_pair_count", 5) or 5),
+        "reevaluate_every_runs": int(raw.get("reevaluate_every_runs", 5) or 5),
+    }
+
+
+def _metric_for_pair(metrics: dict[str, Any], pair: str) -> dict[str, Any]:
+    for item in _normalize_pair_metrics(metrics.get("pairs", []) or []):
+        if item.get("pair") == pair:
+            return item
+    return {"pair": pair, "trades": 0, "profit_total_abs": 0.0, "profit_total_pct": 0.0, "profit_factor": 0.0, "winrate": 0.0, "max_drawdown_pct": 0.0}
+
+
+def _pair_exit_profit_abs(result: dict[str, Any], pair: str, tokens: tuple[str, ...]) -> float:
+    total = 0.0
+    trades = result.get("trades", []) or result.get("results_per_trade", []) or []
+    if not isinstance(trades, list):
+        return 0.0
+    lowered = tuple(t.lower() for t in tokens)
+    for trade in trades:
+        if not isinstance(trade, dict) or str(trade.get("pair") or "") != pair:
+            continue
+        reason = str(trade.get("exit_reason") or trade.get("sell_reason") or "").lower()
+        if any(token in reason for token in lowered):
+            total += _safe_float(trade.get("profit_abs"))
+    return total
+
+
+def _pair_metric_row(pair: str, train_metrics: dict[str, Any], validation_metrics: list[dict[str, Any]], train_result: dict[str, Any] | None = None) -> dict[str, Any]:
+    train_pair = _metric_for_pair(train_metrics, pair)
+    validation_pair_rows = []
+    for item in validation_metrics:
+        m = item.get("metrics", {}) if isinstance(item, dict) else {}
+        validation_pair_rows.append(_metric_for_pair(m, pair))
+    validation_profit_pcts = [_safe_float(v.get("profit_total_pct")) for v in validation_pair_rows]
+    validation_pfs = [_safe_float(v.get("profit_factor")) for v in validation_pair_rows]
+    roi_abs = _pair_exit_profit_abs(train_result or {}, pair, ("roi",))
+    stoploss_abs = _pair_exit_profit_abs(train_result or {}, pair, ("stop", "stoploss", "stop_loss"))
+    stoploss_to_roi_ratio = abs(stoploss_abs) / max(roi_abs, 1e-9) if roi_abs > 0 else (999.0 if stoploss_abs < 0 else 0.0)
+    return {
+        "pair": pair,
+        "train_total_trades": _safe_int(train_pair.get("trades")),
+        "train_profit_pct": _safe_float(train_pair.get("profit_total_pct")),
+        "train_profit_abs": _safe_float(train_pair.get("profit_total_abs")),
+        "train_profit_factor": _safe_float(train_pair.get("profit_factor")),
+        "train_max_drawdown_pct": _safe_float(train_pair.get("max_drawdown_pct")),
+        "train_roi_profit_abs": roi_abs,
+        "train_stoploss_profit_abs": stoploss_abs,
+        "validation_avg_profit_pct": sum(validation_profit_pcts) / len(validation_profit_pcts) if validation_profit_pcts else 0.0,
+        "validation_avg_profit_factor": sum(validation_pfs) / len(validation_pfs) if validation_pfs else 0.0,
+        "validation_worst_profit_pct": min(validation_profit_pcts) if validation_profit_pcts else 0.0,
+        "validation_worst_profit_factor": min(validation_pfs) if validation_pfs else 0.0,
+        "validation_max_drawdown_pct": max((_safe_float(v.get("max_drawdown_pct")) for v in validation_pair_rows), default=0.0),
+        "stoploss_to_roi_ratio": stoploss_to_roi_ratio,
+        "validation_periods": validation_pair_rows,
+    }
+
+
+def _score_pair(row: dict[str, Any], cfg: dict[str, Any]) -> tuple[float, list[str], str]:
+    score = 50.0
+    reasons: list[str] = []
+    train_profit = _safe_float(row.get("train_profit_pct"))
+    avg_val = _safe_float(row.get("validation_avg_profit_pct"))
+    worst_val = _safe_float(row.get("validation_worst_profit_pct"))
+    train_pf = _safe_float(row.get("train_profit_factor"))
+    avg_pf = _safe_float(row.get("validation_avg_profit_factor"))
+    worst_pf = _safe_float(row.get("validation_worst_profit_factor"))
+    trades = _safe_int(row.get("train_total_trades"))
+    train_dd = _safe_float(row.get("train_max_drawdown_pct"))
+    val_dd = _safe_float(row.get("validation_max_drawdown_pct"))
+    sl_roi = _safe_float(row.get("stoploss_to_roi_ratio"))
+    score += train_profit * 3.0 + avg_val * 6.0 + worst_val * 4.0
+    score += min(train_pf, 3.0) * 8.0 + min(avg_pf, 3.0) * 10.0 + min(worst_pf, 3.0) * 6.0
+    if avg_val < 0:
+        score -= 35.0
+        reasons.append("验证平均收益为负")
+    if worst_val < -2.0:
+        score -= 30.0
+        reasons.append("最差验证区间严重亏损")
+    elif worst_val < 0:
+        score -= 12.0
+        reasons.append("存在亏损验证区间")
+    if sl_roi > 1.0:
+        score -= min(30.0, 12.0 + (sl_roi - 1.0) * 8.0)
+        reasons.append("固定止损亏损大于 ROI 收益")
+    min_trades = int(cfg.get("min_pair_trades", 8))
+    if trades < min_trades:
+        score -= 30.0 + (min_trades - trades) * 2.0
+        reasons.append("交易数太少")
+    max_dd = float(cfg.get("max_pair_drawdown_pct", 3))
+    if max(train_dd, val_dd) > max_dd:
+        score -= 25.0 + (max(train_dd, val_dd) - max_dd) * 4.0
+        reasons.append("回撤过高")
+    if train_pf < float(cfg.get("min_pair_profit_factor", 0.9)):
+        score -= 10.0
+        reasons.append("训练 PF 偏低")
+    if bool(cfg.get("prefer_validation_profit_positive", True)) and avg_val <= 0:
+        score -= 12.0
+    positives = []
+    if avg_val > 0 and worst_val > -0.5:
+        positives.append("验证表现稳定")
+    if train_pf >= 1.0 and avg_pf >= 1.0:
+        positives.append("PF 较好")
+    if max(train_dd, val_dd) <= max_dd:
+        positives.append("止损/回撤可控")
+    if trades >= min_trades:
+        positives.append("交易数达标")
+    reason = "，".join(positives or reasons or ["综合表现中性"])
+    return round(max(0.0, min(100.0, score)), 4), reasons, reason
+
+
+def _best_strategy_ref() -> tuple[str, str]:
+    if not BEST_STRATEGY_FILE.exists():
+        raise FileNotFoundError(f"best_strategy.json 不存在：{BEST_STRATEGY_FILE}")
+    best = read_json(BEST_STRATEGY_FILE)
+    class_name = str(best.get("class_name") or best.get("strategy_class") or "").strip()
+    strategy_file = str(best.get("strategy_file") or "").strip()
+    if not class_name:
+        raise RuntimeError("best_strategy.json 缺少 class_name/strategy_class")
+    return class_name, strategy_file
+
+
+def _run_pair_scan_backtest(config: str, class_name: str, timeframe: str, period: PeriodDef, run_dir: Path, label: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    cmd = ["docker", "compose", "run", "--rm", "freqtrade", "backtesting", "--config", config, "--strategy", class_name, "--timeframe", timeframe, "--timerange", period.timerange, "--export", "trades", "--cache", "none"]
+    results_dir = ROOT_DIR / "user_data" / "backtest_results"
+    before = set(_list_backtest_zips(results_dir))
+    started_at = time.time()
+    print(f"正在回测 {label}：{period.timerange}")
+    cp = run_cmd(cmd, ROOT_DIR)
+    _write_backtest_process_log(run_dir, f"pair_scan_{label}", period.timerange, cp)
+    if cp.returncode != 0:
+        print(cp.stdout)
+        print(cp.stderr)
+        raise RuntimeError(f"pair-scan 回测失败：{label} {period.timerange}")
+    result_zip, candidates = find_backtest_zip_for_strategy(results_dir, class_name, started_at, before)
+    if result_zip is None:
+        _log_backtest_zip_filter_failure(class_name, candidates)
+        raise RuntimeError(f"pair-scan 未找到当前策略回测 zip：{label}")
+    local_zip = _copy_backtest_zip_to_version(result_zip, run_dir, f"pair_scan_{label}", period.timerange)
+    result, actual_keys = parse_backtest_from_zip(local_zip, class_name, strict=False)
+    if result is None:
+        raise RuntimeError(f"pair-scan 回测结果解析失败：{label}，实际策略：{actual_keys}")
+    metrics = _extract_metrics(result)
+    return metrics, result
+
+
+def print_pair_scan_summary(recommended: dict[str, Any], candidate_count: int) -> None:
+    print("\n========== 交易对筛选结果 ==========")
+    print(f"候选币种数量：{candidate_count}")
+    print("active_pairs：" + (", ".join(item.get("pair", "") for item in recommended.get("active_pairs", [])) or "无"))
+    print("watch_pairs：" + (", ".join(item.get("pair", "") for item in recommended.get("watch_pairs", [])) or "无"))
+    print("cooldown_pairs：" + (", ".join(item.get("pair", "") for item in recommended.get("cooldown_pairs", [])) or "无"))
+    print("推荐原因：")
+    for item in recommended.get("active_pairs", []):
+        print(f"- {item.get('pair')}: score={item.get('score')}，{item.get('reason')}")
+
+
+def run_pair_scan(runtime_goal: dict[str, Any], args: argparse.Namespace, run_dir: Path) -> None:
+    cfg = _pair_selection_cfg(runtime_goal)
+    if not cfg.get("enabled", True):
+        raise RuntimeError("pair_selection.enabled=false，无法执行 pair-scan。")
+    candidate_pairs = cfg.get("candidate_pairs", []) or []
+    if not candidate_pairs:
+        raise RuntimeError("optimization_goal.json 中 pair_selection.candidate_pairs 为空。")
+    class_name, strategy_file = _best_strategy_ref()
+    print("当前模式：交易对筛选 pair-scan")
+    print("AI 调用：关闭")
+    print(f"source_strategy：{class_name}")
+    if strategy_file:
+        print(f"策略文件：{strategy_file}")
+    train, validations = _build_periods(runtime_goal)
+    if not train.timerange:
+        raise RuntimeError("缺少训练区间 train_period.timerange，无法继续。")
+    base_config = str(runtime_goal.get("config", args.config))
+    scan_config = _write_temp_config_with_pairs(base_config, list(candidate_pairs), run_dir, "pair_scan_candidates")
+    runtime_goal["config"] = scan_config
+    runtime_goal["pairs"] = list(candidate_pairs)
+    maybe_download_data(runtime_goal, args, train.timerange)
+    timeframe = str(runtime_goal.get("timeframe", args.timeframe))
+    train_metrics, train_result = _run_pair_scan_backtest(scan_config, class_name, timeframe, train, run_dir, "train")
+    validation_metrics: list[dict[str, Any]] = []
+    for period in validations:
+        vm, _ = _run_pair_scan_backtest(scan_config, class_name, timeframe, period, run_dir, period.name)
+        validation_metrics.append({"period": period.name, "timerange": period.timerange, "metrics": vm})
+    rows = []
+    for pair in candidate_pairs:
+        row = _pair_metric_row(pair, train_metrics, validation_metrics, train_result)
+        score, penalty_reasons, reason = _score_pair(row, cfg)
+        row.update({"score": score, "penalty_reasons": penalty_reasons, "reason": reason})
+        rows.append(row)
+    rows.sort(key=lambda item: _safe_float(item.get("score")), reverse=True)
+    active_count = max(0, int(cfg.get("active_pair_count", 5)))
+    watch_count = max(0, int(cfg.get("watch_pair_count", 5)))
+    active_rows = rows[:active_count]
+    watch_rows = rows[active_count:active_count + watch_count]
+    cooldown_rows = rows[active_count + watch_count:]
+    leaderboard = {
+        "created_at": datetime.utcnow().isoformat(),
+        "source_strategy": class_name,
+        "source_strategy_file": strategy_file,
+        "train_period": train.timerange,
+        "validation_periods": [{"name": p.name, "timerange": p.timerange, "weight": p.weight} for p in validations],
+        "candidate_pairs": list(candidate_pairs),
+        "items": rows,
+    }
+    recommended = {
+        "created_at": datetime.utcnow().isoformat(),
+        "source_strategy": class_name,
+        "train_period": train.timerange,
+        "validation_periods": [p.timerange for p in validations],
+        "active_pairs": [{"pair": r["pair"], "score": r["score"], "reason": r["reason"]} for r in active_rows],
+        "watch_pairs": [{"pair": r["pair"], "score": r["score"], "reason": r["reason"]} for r in watch_rows],
+        "cooldown_pairs": [{"pair": r["pair"], "score": r["score"], "reason": r["reason"]} for r in cooldown_rows],
+        "pair_metrics": {r["pair"]: r for r in rows},
+    }
+    write_json(run_dir / "pair_leaderboard.json", leaderboard)
+    write_json(run_dir / "recommended_pairs.json", recommended)
+    write_json(PAIR_LEADERBOARD_FILE, leaderboard)
+    write_json(RECOMMENDED_PAIRS_FILE, recommended)
+    print_pair_scan_summary(recommended, len(candidate_pairs))
+    print(f"pair_leaderboard.json：{run_dir / 'pair_leaderboard.json'}")
+    print(f"recommended_pairs.json：{run_dir / 'recommended_pairs.json'}")
 
 
 def _compute_final_score(train_score: float, validation_score: float, train_metrics: dict[str, Any], validation_metrics: list[dict[str, Any]], target_cfg: dict[str, Any]) -> tuple[float, dict[str, Any]]:
@@ -6270,6 +6589,7 @@ def main() -> None:
     load_project_env()
     parser = argparse.ArgumentParser()
     parser.add_argument("--goal", default="ai_tools/optimization_goal.json")
+    parser.add_argument("--mode", choices=["optimize", "pair-scan"], default="optimize", help="运行模式：optimize=AI 策略优化，pair-scan=用当前 best 策略筛选交易对")
     parser.add_argument("--iterations", type=int, default=None)
     parser.add_argument("--auto-approve", action="store_true")
     parser.add_argument("--skip-download", action="store_true")
@@ -6286,6 +6606,7 @@ def main() -> None:
     parser.add_argument("--no-wizard", action="store_true")
     parser.add_argument("--save-goal", action="store_true")
     parser.add_argument("--config", default="user_data/config.5coins.json")
+    parser.add_argument("--pairs-file", default=None, help="optimize 模式下读取 recommended_pairs.json，并使用 active_pairs 覆盖本次 pair_whitelist")
     parser.add_argument("--base-strategy", default="MultiCoin_AI_Strategy")
     parser.add_argument("--timeframe", default="5m")
     parser.add_argument("--timerange", default=None, help="训练回测区间，例如 20260501-20260525")
@@ -6324,6 +6645,10 @@ def main() -> None:
     args = parser.parse_args()
     if args.manual_ai_prepare and args.manual_ai_run:
         parser.error("--manual-ai-prepare 和 --manual-ai-run 不能同时使用")
+    if args.mode == "pair-scan" and (args.manual_ai_prepare or args.manual_ai_run):
+        parser.error("--mode pair-scan 不能与 --manual-ai-prepare/--manual-ai-run 同时使用")
+    if args.mode == "pair-scan" and args.pairs_file:
+        parser.error("--pairs-file 仅用于 optimize 模式，pair-scan 请使用 pair_selection.candidate_pairs")
     if args.random_sample_windows < 0:
         parser.error("--random-sample-windows 不能小于 0")
     if args.random_sample_windows > 0:
@@ -6365,12 +6690,18 @@ def main() -> None:
         if runtime_goal.get("runtime_reset_best", False):
             args.reset_best = True
 
-        maybe_reset_best_strategy(args.reset_best)
+        if args.mode == "optimize":
+            apply_pairs_file_override(runtime_goal, args, run_dir)
+            maybe_reset_best_strategy(args.reset_best)
+        elif args.reset_best:
+            print("当前为 pair-scan 模式：忽略 --reset-best，不覆盖 best_strategy.json。")
 
         if args.manual_ai_prepare:
             effective_iterations = 0
         elif args.manual_ai_run:
             effective_iterations = 1
+        elif args.mode == "pair-scan":
+            effective_iterations = 0
         else:
             effective_iterations = args.iterations if args.iterations is not None else int(runtime_goal.get("max_iterations", 5))
         runtime_goal["max_iterations"] = int(effective_iterations)
@@ -6385,7 +6716,9 @@ def main() -> None:
         write_json(run_dir / "goal.json", goal)
         print(f"运行时配置已保存：{run_dir / 'goal.runtime.json'}")
 
-        if args.manual_ai_prepare:
+        if args.mode == "pair-scan":
+            run_pair_scan(runtime_goal, args, run_dir)
+        elif args.manual_ai_prepare:
             prepare_manual_ai_task(runtime_goal, args)
             print_log_saved_summary(args)
         elif args.manual_ai_run:
