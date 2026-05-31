@@ -545,17 +545,48 @@ def write_json(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _load_pairs_from_recommended_file(pairs_file: str | Path | None) -> list[str]:
+def _load_recommended_pairs_data(pairs_file: str | Path | None) -> dict[str, Any]:
     if not pairs_file:
-        return []
+        return {}
     path = _resolve_repo_path(str(pairs_file))
     if not path.exists():
         raise FileNotFoundError(f"推荐币种文件不存在：{path}")
     data = read_json(path)
-    active = data.get("active_pairs", []) if isinstance(data, dict) else []
+    return data if isinstance(data, dict) else {}
+
+
+def _pair_name_from_recommended_item(item: Any) -> str:
+    return str(item.get("pair") if isinstance(item, dict) else item).strip()
+
+
+def _extract_active_pair_names(recommended_data: dict[str, Any]) -> list[str]:
+    active = recommended_data.get("active_pairs", []) if isinstance(recommended_data, dict) else []
     pairs: list[str] = []
+    if not isinstance(active, list):
+        return pairs
     for item in active:
-        pair = str(item.get("pair") if isinstance(item, dict) else item).strip()
+        pair = _pair_name_from_recommended_item(item)
+        if pair and pair not in pairs:
+            pairs.append(pair)
+    return pairs
+
+
+def _load_pairs_from_recommended_file(pairs_file: str | Path | None) -> list[str]:
+    return _extract_active_pair_names(_load_recommended_pairs_data(pairs_file))
+
+
+def _read_config_pair_whitelist(config_path: str | Path) -> list[str]:
+    path = _resolve_repo_path(str(config_path))
+    if not path.exists():
+        raise FileNotFoundError(f"配置文件不存在：{path}")
+    data = read_json(path)
+    exchange = data.get("exchange", {}) if isinstance(data, dict) else {}
+    pair_whitelist = exchange.get("pair_whitelist", []) if isinstance(exchange, dict) else []
+    if not isinstance(pair_whitelist, list):
+        return []
+    pairs: list[str] = []
+    for item in pair_whitelist:
+        pair = str(item).strip()
         if pair and pair not in pairs:
             pairs.append(pair)
     return pairs
@@ -584,6 +615,18 @@ def _write_temp_config_with_pairs(base_config: str, pairs: list[str], run_dir: P
 def _format_pair_source_label(source: str) -> str:
     labels = {
         "pairs_file": "--pairs-file",
+        "refresh_pairs": "refresh-pairs",
+        "default_auto": "recommended_pairs.json",
+        "ignored": "原始 config",
+        "missing": "原始 config",
+        "fallback_original": "原始 config",
+    }
+    return labels.get(source, source)
+
+
+def _format_legacy_pair_source_label(source: str) -> str:
+    labels = {
+        "pairs_file": "--pairs-file",
         "refresh_pairs": "--refresh-pairs",
         "default_auto": "默认自动读取",
         "ignored": "忽略",
@@ -605,10 +648,109 @@ def print_pair_selection_status(
     print(f"recommended_pairs 默认文件：{default_file}")
     print(f"是否存在：{'是' if default_exists else '否'}")
     print(f"本次是否使用 recommended_pairs：{'是' if used_recommended else '否'}")
-    print(f"使用来源：{_format_pair_source_label(source)}")
+    print(f"使用来源：{_format_legacy_pair_source_label(source)}")
     print(f"active_pairs 数量：{len(active_pairs)}")
     print("active_pairs：" + (", ".join(active_pairs) if active_pairs else "无"))
     print(f"临时 config 路径：{temp_config or '未生成（使用原始 config）'}")
+
+
+def _print_numbered_pairs(pairs: list[str], empty_text: str = "无") -> None:
+    if not pairs:
+        print(empty_text)
+        return
+    for idx, pair in enumerate(pairs, start=1):
+        print(f"{idx}. {pair}")
+
+
+def _print_recommended_item_list(items: Any, *, detail_active: bool = False) -> None:
+    if not isinstance(items, list) or not items:
+        print("无")
+        return
+    for idx, item in enumerate(items, start=1):
+        if isinstance(item, dict):
+            pair = _pair_name_from_recommended_item(item) or "-"
+            if detail_active:
+                score = item.get("score", "")
+                reason = item.get("reason", "")
+                score_text = score if score != "" else "-"
+                reason_text = reason if reason != "" else "-"
+                print(f"{idx}. {pair} | score={score_text} | reason={reason_text}")
+            else:
+                score = item.get("score", "")
+                reason = item.get("reason", "")
+                suffix_parts = []
+                if score != "":
+                    suffix_parts.append(f"score={score}")
+                if reason:
+                    suffix_parts.append(f"reason={reason}")
+                suffix = " | " + " | ".join(suffix_parts) if suffix_parts else ""
+                print(f"{idx}. {pair}{suffix}")
+        else:
+            print(f"{idx}. {item}")
+
+
+def _store_pair_selection_log(runtime_goal: dict[str, Any], data: dict[str, Any]) -> None:
+    runtime_goal["runtime_pair_selection_log"] = data
+
+
+def print_effective_pair_selection_log(runtime_goal: dict[str, Any]) -> None:
+    info = runtime_goal.get("runtime_pair_selection_log", {})
+    if not isinstance(info, dict) or not info:
+        return
+
+    source = str(info.get("source", "missing"))
+    fallback_reason = str(info.get("fallback_reason") or "")
+    display_source = "fallback_original" if fallback_reason == "empty_active_pairs" else source
+    source_label = _format_pair_source_label(display_source)
+    effective_pairs = [str(pair) for pair in info.get("effective_pairs", []) if str(pair).strip()]
+    recommended_data = info.get("recommended_data", {}) if isinstance(info.get("recommended_data"), dict) else {}
+    recommended_path = str(info.get("recommended_file") or "")
+    pairs_file_path = str(info.get("pairs_file") or "")
+    temp_config = str(info.get("temp_config") or "")
+
+    print("\n========== 本次实际测试交易对 ==========")
+    print(f"交易对来源：{source_label}")
+    if source == "pairs_file" and pairs_file_path:
+        print(f"文件路径：{pairs_file_path}")
+    if source == "missing":
+        print("说明：未找到 recommended_pairs.json，本次未启用优质币筛选。")
+    elif source == "ignored":
+        print("说明：已通过 --ignore-recommended-pairs 忽略 recommended_pairs.json。")
+    if fallback_reason == "empty_active_pairs":
+        print("⚠️ recommended_pairs.active_pairs 为空，已回退使用原始 config pair_whitelist。")
+    print(f"交易对数量：{len(effective_pairs)}")
+    print("交易对列表：")
+    _print_numbered_pairs(effective_pairs)
+    if temp_config:
+        print("\n本次临时 config：")
+        print(temp_config)
+
+    if fallback_reason == "empty_active_pairs" or source not in {"default_auto", "refresh_pairs"}:
+        return
+
+    active_items = recommended_data.get("active_pairs", []) if isinstance(recommended_data, dict) else []
+    watch_items = recommended_data.get("watch_pairs", []) if isinstance(recommended_data, dict) else []
+    cooldown_items = recommended_data.get("cooldown_pairs", []) if isinstance(recommended_data, dict) else []
+    scan_periods = recommended_data.get("scan_periods", "") if isinstance(recommended_data, dict) else ""
+
+    print("\n========== 优质交易对筛选来源 ==========")
+    print(f"recommended_pairs 文件：{recommended_path}")
+    print(f"source_strategy：{recommended_data.get('source_strategy', '')}")
+    print(f"created_at：{recommended_data.get('created_at', '')}")
+    print(f"scan_periods：{scan_periods}")
+    print(f"active_pairs 数量：{len(active_items) if isinstance(active_items, list) else 0}")
+    print(f"watch_pairs 数量：{len(watch_items) if isinstance(watch_items, list) else 0}")
+    print(f"cooldown_pairs 数量：{len(cooldown_items) if isinstance(cooldown_items, list) else 0}")
+
+    print("\n========== 优质交易对 active_pairs ==========")
+    _print_recommended_item_list(active_items, detail_active=True)
+
+    print("\n========== 观察交易对 watch_pairs ==========")
+    _print_recommended_item_list(watch_items)
+
+    print("\n========== 暂时冷却交易对 cooldown_pairs ==========")
+    _print_recommended_item_list(cooldown_items)
+    print("说明：cooldown_pairs 只是当前区间暂时不参与优化，不是永久剔除。")
 
 
 def apply_recommended_pairs_override(runtime_goal: dict[str, Any], args: argparse.Namespace, run_dir: Path) -> list[str]:
@@ -617,13 +759,18 @@ def apply_recommended_pairs_override(runtime_goal: dict[str, Any], args: argpars
     default_exists = default_file.exists()
     pairs_path: str | Path | None = None
     source = "missing"
+    recommended_data: dict[str, Any] = {}
     active_pairs: list[str] = []
     temp_config: str | None = None
+    fallback_reason = ""
+
+    original_pairs = _read_config_pair_whitelist(base_config)
 
     if getattr(args, "pairs_file", None):
         pairs_path = getattr(args, "pairs_file")
         source = "pairs_file"
-        active_pairs = _load_pairs_from_recommended_file(pairs_path)
+        recommended_data = _load_recommended_pairs_data(pairs_path)
+        active_pairs = _extract_active_pair_names(recommended_data)
     elif getattr(args, "ignore_recommended_pairs", False):
         source = "ignored"
     elif getattr(args, "refresh_pairs", False):
@@ -635,23 +782,29 @@ def apply_recommended_pairs_override(runtime_goal: dict[str, Any], args: argpars
         run_pair_scan(scan_goal, args, run_dir)
         default_exists = default_file.exists()
         pairs_path = default_file
-        active_pairs = _load_pairs_from_recommended_file(pairs_path) if default_exists else []
+        recommended_data = _load_recommended_pairs_data(pairs_path) if default_exists else {}
+        active_pairs = _extract_active_pair_names(recommended_data)
     elif default_exists:
         pairs_path = default_file
         source = "default_auto"
-        active_pairs = _load_pairs_from_recommended_file(pairs_path)
+        recommended_data = _load_recommended_pairs_data(pairs_path)
+        active_pairs = _extract_active_pair_names(recommended_data)
 
     if pairs_path and not active_pairs:
+        fallback_reason = "empty_active_pairs"
         print("警告：recommended_pairs.active_pairs 为空，本次 fallback 使用原始 config 的 pair_whitelist。")
 
     if active_pairs:
+        effective_pairs = active_pairs
         temp_config = _write_temp_config_with_pairs(base_config, active_pairs, run_dir, "active_pairs")
         runtime_goal["config"] = temp_config
         runtime_goal["pairs"] = active_pairs
         runtime_goal["runtime_active_pairs"] = active_pairs
         args.config = temp_config
     else:
+        effective_pairs = original_pairs
         runtime_goal["config"] = base_config
+        runtime_goal["pairs"] = original_pairs
         runtime_goal.pop("runtime_active_pairs", None)
         args.config = base_config
 
@@ -662,6 +815,25 @@ def apply_recommended_pairs_override(runtime_goal: dict[str, Any], args: argpars
         source=source,
         active_pairs=active_pairs,
         temp_config=temp_config,
+    )
+
+    _store_pair_selection_log(
+        runtime_goal,
+        {
+            "source": source,
+            "source_label": _format_pair_source_label(source),
+            "default_recommended_file": str(default_file),
+            "default_recommended_exists": default_exists,
+            "recommended_file": str(_resolve_repo_path(str(pairs_path))) if pairs_path else "",
+            "pairs_file": str(_resolve_repo_path(str(pairs_path))) if source == "pairs_file" and pairs_path else "",
+            "base_config": base_config,
+            "temp_config": temp_config or "",
+            "original_config_pairs": original_pairs,
+            "active_pairs": active_pairs,
+            "effective_pairs": effective_pairs,
+            "recommended_data": recommended_data,
+            "fallback_reason": fallback_reason,
+        },
     )
     return active_pairs
 
@@ -4849,6 +5021,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         provider_pool=list(code_runtime.provider_pool),
     )
     _print_ai_model_pool_config(advisor_runtime, code_runtime, float(args.ai_call_cooldown_seconds))
+    print_effective_pair_selection_log(runtime_goal)
 
     best: dict[str, Any] | None = None
     session_best: dict[str, Any] | None = None
