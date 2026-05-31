@@ -850,75 +850,159 @@ def _auto_trade_count_target_cfg(runtime_goal: dict[str, Any]) -> dict[str, Any]
         "enabled": bool(raw.get("enabled", False)),
         "min_trades_per_pair": int(raw.get("min_trades_per_pair", 4) or 4),
         "ideal_min_trades_per_pair": int(raw.get("ideal_min_trades_per_pair", 5) or 5),
-        "ideal_max_trades_per_pair": int(raw.get("ideal_max_trades_per_pair", 9) or 9),
-        "max_trades_per_pair": int(raw.get("max_trades_per_pair", 12) or 12),
-        "hard_max_trades": int(raw.get("hard_max_trades", 120) or 120),
+        "ideal_max_trades_per_pair": int(raw.get("ideal_max_trades_per_pair", 8) or 8),
+        "max_trades_per_pair": int(raw.get("max_trades_per_pair", 10) or 10),
+        "min_total_trades_floor": int(raw.get("min_total_trades_floor", 20) or 20),
+        "ideal_max_trades_cap": int(raw.get("ideal_max_trades_cap", 75) or 75),
+        "max_trades_cap": int(raw.get("max_trades_cap", 90) or 90),
     }
 
 
-def apply_auto_trade_count_target(runtime_goal: dict[str, Any], active_pairs: list[str]) -> None:
+def _auto_trade_count_pair_source(runtime_goal: dict[str, Any]) -> tuple[int | None, str, list[str]]:
+    """Return the actual pairs used by this optimize run and their source."""
+    info = runtime_goal.get("runtime_pair_selection_log", {})
+    if not isinstance(info, dict):
+        info = {}
+
+    active_pairs = [str(pair) for pair in info.get("active_pairs", []) if str(pair).strip()]
+    effective_pairs = [str(pair) for pair in info.get("effective_pairs", []) if str(pair).strip()]
+    original_pairs = [str(pair) for pair in info.get("original_config_pairs", []) if str(pair).strip()]
+    source = str(info.get("source") or "")
+
+    if active_pairs:
+        if source == "pairs_file":
+            return len(active_pairs), "--pairs-file", active_pairs
+        return len(active_pairs), "recommended_pairs", active_pairs
+    if effective_pairs:
+        return len(effective_pairs), "原始 config", effective_pairs
+    if original_pairs:
+        return len(original_pairs), "原始 config", original_pairs
+
+    runtime_active_pairs = [str(pair) for pair in runtime_goal.get("runtime_active_pairs", []) if str(pair).strip()]
+    if runtime_active_pairs:
+        return len(runtime_active_pairs), "recommended_pairs", runtime_active_pairs
+    runtime_pairs = [str(pair) for pair in runtime_goal.get("pairs", []) if str(pair).strip()]
+    if runtime_pairs:
+        return len(runtime_pairs), "原始 config", runtime_pairs
+    return None, "取不到", []
+
+
+def _runtime_trade_target_values(runtime_goal: dict[str, Any]) -> dict[str, int]:
+    target = runtime_goal.get("target", {}) or {}
+    return {
+        "min_trades": _safe_int(target.get("min_trades", 25)),
+        "ideal_min_trades": _safe_int(target.get("ideal_min_trades", target.get("min_trades", 25))),
+        "ideal_max_trades": _safe_int(target.get("ideal_max_trades", target.get("max_trades", 80))),
+        "max_trades": _safe_int(target.get("max_trades", 80)),
+    }
+
+
+def _runtime_trade_target_text(runtime_goal: dict[str, Any]) -> str:
+    values = _runtime_trade_target_values(runtime_goal)
+    return (
+        f"保持目标交易数 {values['min_trades']}~{values['max_trades']}，"
+        f"理想区间 {values['ideal_min_trades']}~{values['ideal_max_trades']}。"
+        f"不要低于 {values['min_trades']}，也不要高于 {values['max_trades']}。"
+    )
+
+
+def _apply_runtime_trade_target_prompt_guidance(runtime_goal: dict[str, Any]) -> None:
+    """Make runtime prompt guidance agree with final trade-count targets without editing the goal file."""
+    guidance = runtime_goal.get("prompt_guidance")
+    if not isinstance(guidance, dict):
+        return
+    replacement = _runtime_trade_target_text(runtime_goal)
+    for key in ("advisor_rules", "codegen_rules"):
+        values = guidance.get(key)
+        if not isinstance(values, list):
+            continue
+        cleaned = [item for item in values if "交易数" not in str(item)]
+        cleaned.append(replacement)
+        guidance[key] = cleaned
+
+
+def apply_auto_trade_count_target(runtime_goal: dict[str, Any]) -> None:
     cfg = _auto_trade_count_target_cfg(runtime_goal)
     target = runtime_goal.setdefault("target", {})
     if not isinstance(target, dict):
         target = {}
         runtime_goal["target"] = target
-    if not cfg.get("enabled", False):
-        return
 
-    pair_count = len(active_pairs)
-    if pair_count <= 0:
-        print("========== 自动交易数目标 ==========")
-        print("未使用 active_pairs：保留 optimization_goal.json 中原始 min_trades / max_trades。")
-        print(f"当前目标交易数：{target.get('min_trades')}~{target.get('max_trades')}")
-        return
-
-    min_trades = pair_count * int(cfg["min_trades_per_pair"])
-    ideal_min_trades = pair_count * int(cfg["ideal_min_trades_per_pair"])
-    ideal_max_trades = pair_count * int(cfg["ideal_max_trades_per_pair"])
-    max_trades_raw = pair_count * int(cfg["max_trades_per_pair"])
-    hard_max_trades = int(cfg["hard_max_trades"])
-    max_trades = min(max_trades_raw, hard_max_trades) if hard_max_trades > 0 else max_trades_raw
-
-    target["min_trades"] = min_trades
-    target["ideal_min_trades"] = ideal_min_trades
-    target["ideal_max_trades"] = ideal_max_trades
-    target["max_trades"] = max_trades
-    runtime_goal["auto_trade_count_target"] = {
-        **cfg,
-        "last_applied": {
-            "active_pair_count": pair_count,
+    pair_count, pair_source, _pairs = _auto_trade_count_pair_source(runtime_goal)
+    enabled = bool(cfg.get("enabled", False))
+    computed: dict[str, int] | None = None
+    if enabled and pair_count and pair_count > 0:
+        min_trades = max(pair_count * int(cfg["min_trades_per_pair"]), int(cfg["min_total_trades_floor"]))
+        ideal_min_trades = max(pair_count * int(cfg["ideal_min_trades_per_pair"]), min_trades)
+        ideal_max_trades = min(pair_count * int(cfg["ideal_max_trades_per_pair"]), int(cfg["ideal_max_trades_cap"]))
+        max_trades = min(pair_count * int(cfg["max_trades_per_pair"]), int(cfg["max_trades_cap"]))
+        if ideal_max_trades < ideal_min_trades:
+            ideal_max_trades = ideal_min_trades
+        if max_trades < ideal_max_trades:
+            max_trades = ideal_max_trades
+        computed = {
             "min_trades": min_trades,
             "ideal_min_trades": ideal_min_trades,
             "ideal_max_trades": ideal_max_trades,
-            "max_trades_raw": max_trades_raw,
             "max_trades": max_trades,
-        },
-    }
+        }
+        target.update(computed)
+        runtime_goal["auto_trade_count_target_runtime"] = {
+            "enabled": True,
+            "pair_count": pair_count,
+            "source": pair_source,
+            "computed_min_trades": min_trades,
+            "computed_ideal_min_trades": ideal_min_trades,
+            "computed_ideal_max_trades": ideal_max_trades,
+            "computed_max_trades": max_trades,
+        }
+    else:
+        runtime_goal["auto_trade_count_target_runtime"] = {
+            "enabled": enabled,
+            "pair_count": pair_count,
+            "source": pair_source,
+        }
+
+    _apply_runtime_trade_target_prompt_guidance(runtime_goal)
+    values = _runtime_trade_target_values(runtime_goal)
+    runtime_goal.update(values)
 
     print("========== 自动交易数目标 ==========")
-    print(f"active_pairs 数量：{pair_count}")
-    print(f"自动计算 min_trades：{min_trades}")
-    print(f"自动计算 ideal_min_trades：{ideal_min_trades}")
-    print(f"自动计算 ideal_max_trades：{ideal_max_trades}")
-    print(f"自动计算 max_trades：{max_trades}" + (f"（hard_max_trades={hard_max_trades} 已限制，原始值 {max_trades_raw}）" if hard_max_trades > 0 and max_trades_raw > hard_max_trades else ""))
+    print(f"是否启用：{'是' if enabled else '否'}")
+    print(f"交易对数量 pair_count：{pair_count if pair_count is not None else '取不到'}")
+    print(f"交易对来源：{pair_source}")
+    print(f"min_trades_per_pair：{cfg['min_trades_per_pair']}")
+    print(f"ideal_min_trades_per_pair：{cfg['ideal_min_trades_per_pair']}")
+    print(f"ideal_max_trades_per_pair：{cfg['ideal_max_trades_per_pair']}")
+    print(f"max_trades_per_pair：{cfg['max_trades_per_pair']}")
+    print("自动计算结果：")
+    print(f"min_trades: {values['min_trades']}")
+    print(f"ideal_min_trades: {values['ideal_min_trades']}")
+    print(f"ideal_max_trades: {values['ideal_max_trades']}")
+    print(f"max_trades: {values['max_trades']}")
+    print("上限：")
+    print(f"ideal_max_trades_cap: {cfg['ideal_max_trades_cap']}")
+    print(f"max_trades_cap: {cfg['max_trades_cap']}")
+    if enabled and computed is None:
+        print("警告：auto_trade_count_target 已启用，但无法取得本次实际测试交易对数量；保留 optimization_goal.json 中原来的固定交易数目标。")
 
 
 def _auto_trade_count_target_prompt_note(runtime_goal: dict[str, Any]) -> str:
-    cfg = runtime_goal.get("auto_trade_count_target", {}) or {}
-    last_applied = cfg.get("last_applied", {}) if isinstance(cfg, dict) else {}
-    if not isinstance(last_applied, dict) or not last_applied:
+    runtime = runtime_goal.get("auto_trade_count_target_runtime", {}) or {}
+    if not isinstance(runtime, dict) or not runtime.get("enabled"):
         return ""
-    target = runtime_goal.get("target", {}) or {}
+    values = _runtime_trade_target_values(runtime_goal)
+    pair_count = runtime.get("pair_count")
+    if not pair_count:
+        return ""
     return (
-        "自动交易数目标：本次交易数目标是根据 active_pairs 数量自动计算。"
-        f"active_pairs={last_applied.get('active_pair_count')}，"
-        f"min_trades={target.get('min_trades')}，"
-        f"ideal_min_trades={target.get('ideal_min_trades')}，"
-        f"ideal_max_trades={target.get('ideal_max_trades')}，"
-        f"max_trades={target.get('max_trades')}。"
-        "不要生成明显高于 max_trades 的高频策略。\n"
+        f"本次实际使用 {pair_count} 个交易对。\n"
+        "自动交易数目标：\n"
+        f"- 最低交易数：{values['min_trades']}\n"
+        f"- 理想交易数区间：{values['ideal_min_trades']}~{values['ideal_max_trades']}\n"
+        f"- 最大交易数：{values['max_trades']}\n"
+        "以上交易数目标来自 runtime_goal 的最终值，必须覆盖历史经验或旧 prompt 中的固定交易数。\n"
     )
-
 
 def compute_global_strategy_stats() -> dict[str, int]:
     """Scan all ai optimization run/version directories and return project-wide counters."""
@@ -2313,12 +2397,14 @@ def _load_pre_run_review_sources(current_run_dir: Path) -> tuple[dict[str, Any],
 
 
 def _build_pre_run_ai_review_prompt(runtime_goal: dict[str, Any], sources: dict[str, Any], missing: list[str]) -> str:
+    trade_target_text = _runtime_trade_target_text(runtime_goal)
+    trade_target_values = _runtime_trade_target_values(runtime_goal)
     return (
         "你是 Freqtrade 策略优化的 strategy_advisor。现在不是生成 mutation_spec，也不要输出 Python 代码。\n"
         "任务：在本次 run 第 1 轮生成 mutation_spec 之前，复盘上一次 run 和长期记忆，总结可复用经验。\n"
         "重要限制：本复盘只能作为后续 advisor/codegen prompt 的参考，不得覆盖 official_best、historical_best、best_strategy.json、nearest_candidate.json；所有 best 判断仍必须基于真实回测指标。\n"
         "如果输入文件缺失，请在分析中体现缺失导致的不确定性，不要编造不存在的数据。\n"
-        "交易数建议必须使用：保持目标交易数 20~30，避免低于 20，也避免高于 40。\n"
+        f"交易数建议必须使用：{trade_target_text}\n"
         "只输出一个 JSON object，不要 Markdown，不要解释，结构必须为：\n"
         "{\n"
         "  \"last_run_diagnosis\": {\n"
@@ -2332,7 +2418,7 @@ def _build_pre_run_ai_review_prompt(runtime_goal: dict[str, Any], sources: dict[
         "    \"preferred_parent\": \"official_best 或 nearest_candidate 或 last near miss\",\n"
         "    \"preferred_mutation_types\": [],\n"
         "    \"forbidden_mutation_types\": [],\n"
-        "    \"trade_count_target\": \"20~30\",\n"
+        f"    \"trade_count_target\": \"{trade_target_values['min_trades']}~{trade_target_values['max_trades']}，理想 {trade_target_values['ideal_min_trades']}~{trade_target_values['ideal_max_trades']}\",\n"
         "    \"must_fix\": [],\n"
         "    \"do_not_do\": []\n"
         "  },\n"
@@ -2358,7 +2444,7 @@ def _build_pre_run_ai_review_prompt(runtime_goal: dict[str, Any], sources: dict[
     )
 
 
-def _normalize_pre_run_ai_review(data: dict[str, Any]) -> dict[str, Any]:
+def _normalize_pre_run_ai_review(data: dict[str, Any], runtime_goal: dict[str, Any] | None = None) -> dict[str, Any]:
     if not isinstance(data, dict):
         data = {}
     data.setdefault("last_run_diagnosis", {})
@@ -2371,7 +2457,11 @@ def _normalize_pre_run_ai_review(data: dict[str, Any]) -> dict[str, Any]:
         diagnosis.setdefault(key, [])
     for key in ["preferred_mutation_types", "forbidden_mutation_types", "must_fix", "do_not_do"]:
         next_guidance.setdefault(key, [])
-    next_guidance.setdefault("trade_count_target", "20~30")
+    if runtime_goal is not None:
+        values = _runtime_trade_target_values(runtime_goal)
+        next_guidance.setdefault("trade_count_target", f"{values['min_trades']}~{values['max_trades']}，理想 {values['ideal_min_trades']}~{values['ideal_max_trades']}")
+    else:
+        next_guidance.setdefault("trade_count_target", "使用 runtime_goal.target 的最终交易数目标")
     for key in ["must_implement", "avoid_equivalent_code", "required_detectable_changes"]:
         codegen_guidance.setdefault(key, [])
     data["last_run_diagnosis"] = diagnosis
@@ -2477,7 +2567,7 @@ def run_pre_run_ai_review(
                 "preferred_parent": "",
                 "preferred_mutation_types": [],
                 "forbidden_mutation_types": [],
-                "trade_count_target": "20~30",
+                "trade_count_target": _runtime_trade_target_text(runtime_goal),
                 "must_fix": ["pre_run_ai_review 失败，继续使用 last_run_summary、best_strategy、nearest_candidate 和 prompt_guidance。"],
                 "do_not_do": [],
             },
@@ -3594,11 +3684,12 @@ def _strategy_spec_prompt(class_name: str, runtime_goal: dict[str, Any], baselin
 
 
 
-def _v045_small_step_prompt_section(champion: dict[str, Any]) -> str:
+def _v045_small_step_prompt_section(champion: dict[str, Any], runtime_goal: dict[str, Any] | None = None) -> str:
     meta = champion.get("meta", {}) if isinstance(champion, dict) else {}
     name = str((meta or {}).get("strategy_class") or (meta or {}).get("class_name") or "")
     if "MultiCoin_AI_Strategy_20260530_014158_v045" not in name:
         return ""
+    trade_target_text = _runtime_trade_target_text(runtime_goal) if runtime_goal is not None else "使用 runtime_goal.target 的最终交易数目标。"
     return (
         "\n========== v045 低频稳健阶段强约束 ==========\n"
         "当前正式 best 是 MultiCoin_AI_Strategy_20260530_014158_v045。下一轮必须围绕 v045 小步优化，禁止大改结构。\n"
@@ -3606,7 +3697,7 @@ def _v045_small_step_prompt_section(champion: dict[str, Any]) -> str:
         "v045 验证：202604 +0.4342 USDT / PF 1.0764；202603 +0.7088 USDT / PF 1.0936；202602 +3.3647 USDT / PF 1.8883。\n"
         "只允许 mutation_type: pair_specific_filter, tag_specific_filter, remove_bad_entry_condition, small_entry_filter_adjustment。\n"
         "禁止: increase_trade_frequency, loosen_entry, widen_stoploss, enable_exit_signal, enable_trailing, 大幅修改 ROI。\n"
-        "目标：训练交易数保持 20~30；202604/202603/202602 三个验证月继续全部不亏；最差验证 PF > 1.0；固定止损亏损降低；训练区间不要明显转负。\n"
+        f"目标：{trade_target_text} 202604/202603/202602 三个验证月继续全部不亏；最差验证 PF > 1.0；固定止损亏损降低；训练区间不要明显转负。\n"
         "如果必须选择系统允许枚举外的 small_entry_filter_adjustment，请在 mutation_type 用 tighten_entry_trigger 或 add_entry_filter，并在 reason 明确它只是 small_entry_filter_adjustment。\n"
     )
 
@@ -5451,7 +5542,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         spec_prompt += "\n跨 run strategy_blacklist=" + _compact_prompt_json(blacklist_items[-memory_max_items:], 4000) + "\n"
         spec_prompt += _format_pre_run_review_for_advisor(pre_run_ai_review)
         spec_prompt += f"\nchampion_strategy_class={_strategy_label(in_memory_champion, 'baseline')}\n"
-        spec_prompt += _v045_small_step_prompt_section({"meta": official_champion})
+        spec_prompt += _v045_small_step_prompt_section({"meta": official_champion}, runtime_goal)
         spec_prompt += _format_prompt_guidance_section(
             "========== 用户额外策略顾问规则 ==========",
             _prompt_guidance_rules(runtime_goal, "advisor_rules"),
@@ -5534,17 +5625,18 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "4) 不允许多个 OR 条件堆叠造成高频；不允许为了增加交易数而放宽入场。\n"
             f"3) {zero_trade_hint}\n"
             "4) 如果上一轮 total_trades=0，本轮必须大幅放宽入场条件，并确保训练区间产生交易。\n"
-            "5) 保持目标交易数 20~30，避免低于 20，也避免高于 40。\n"
+            f"5) {_runtime_trade_target_text(runtime_goal)}\n"
+            f"{_auto_trade_count_target_prompt_note(runtime_goal)}"
             "6) use_exit_signal 必须为 False，不允许改为 True。\n"
             "7) 仅现货 long only：不做空、不杠杆、不马丁格尔、不无限补仓，不允许 conditions_short。\n"
             "8) 不调用外部 API，不读取手动交易记录。\n"
             "9) 禁止使用过强过滤的全 AND 叠加（如 close>ema200_1h、rsi_1h>55、ema20>ema50>ema100、volume>rolling_mean*1.5 同时成立）。\n"
             "10) 入场逻辑可更宽松，鼓励用 OR 组合：RSI 回调反弹 / EMA 短周期金叉 / 布林带下轨反弹 / MACD 转强 / 成交量不极低。\n"
-            "11) 不允许生成完全无交易策略，也不允许 200+ 训练交易。\n"
+            f"11) 不允许生成完全无交易策略，也不允许超过 {int(max_trades * 1.5)} 笔训练交易。\n"
             "12) 目标不是追求 0 回撤，而是在足够交易数下综合表现优于 baseline。\n"
             f"{failure_context}"
             f"{compact_memory}\n"
-            f"{_v045_small_step_prompt_section({'meta': official_champion})}\n"
+            f"{_v045_small_step_prompt_section({'meta': official_champion}, runtime_goal)}\n"
             "当前 baseline：\n"
             f"- 总收益(USDT)：{baseline_cfg.get('profit_total_abs', -7.43)}\n"
             f"- 收益率(%)：{baseline_cfg.get('profit_total_pct', -0.74)}\n"
@@ -6694,8 +6786,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         "lessons_for_next_run": [
             "不要重新生成完全不同策略",
             "优先围绕 nearest_candidate 和 historical_best 做单点小步调整",
-            "保持目标交易数 20~30，避免低于 20，也避免高于 40。",
-            "如果 nearest_candidate 交易数超标，下一轮目标是压回 20~30，且避免高于 40。",
+            _runtime_trade_target_text(runtime_goal),
+            f"如果 nearest_candidate 交易数超标，下一轮目标是压回 {_runtime_trade_target_values(runtime_goal)['min_trades']}~{_runtime_trade_target_values(runtime_goal)['max_trades']}，且避免高于 {_runtime_trade_target_values(runtime_goal)['max_trades']}。",
             "不要放宽入场",
             "不要启用 exit_signal",
             "不要启用或扩大 trailing",
@@ -6758,7 +6850,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         else:
             print("- 暂无可归纳的共同失败模式")
         print("下一轮建议：")
-        print("- 保持目标交易数 20~30，避免低于 20，也避免高于 40。")
+        print(f"- {_runtime_trade_target_text(runtime_goal)}")
         print("- 不要继续宽松高频入场")
         print("- 优先控制止损损失")
         if reset_best_used:
@@ -7019,10 +7111,9 @@ def main() -> None:
         if runtime_goal.get("runtime_reset_best", False):
             args.reset_best = True
 
-        active_pairs_for_trade_target: list[str] = []
         if args.mode == "optimize":
-            active_pairs_for_trade_target = apply_pairs_file_override(runtime_goal, args, run_dir)
-            apply_auto_trade_count_target(runtime_goal, active_pairs_for_trade_target)
+            apply_pairs_file_override(runtime_goal, args, run_dir)
+            apply_auto_trade_count_target(runtime_goal)
             maybe_reset_best_strategy(args.reset_best)
         elif args.reset_best:
             print("当前为 pair-scan 模式：忽略 --reset-best，不覆盖 best_strategy.json。")
