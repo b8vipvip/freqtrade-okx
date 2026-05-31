@@ -67,6 +67,24 @@ EXPLORE_STRATEGY_FAMILY_TRADE_TARGET = {
     "max_trades": 60,
 }
 HIGH_FREQUENCY_SENSITIVE_FAMILIES = {"breakout_momentum", "strict_risk_filter"}
+EXPLORE_STRATEGY_FAMILY_DEFAULTS = {
+    "force_all_families_once": False,
+    "max_families_per_run": 3,
+    "prefer_near_miss_followup": True,
+    "disable_family_after_high_frequency_failure": True,
+}
+
+
+def _explore_strategy_family_cfg(runtime_goal: dict[str, Any]) -> dict[str, Any]:
+    raw = runtime_goal.get("explore_strategy_family", {})
+    cfg = dict(EXPLORE_STRATEGY_FAMILY_DEFAULTS)
+    if isinstance(raw, dict):
+        cfg.update({k: raw.get(k, v) for k, v in EXPLORE_STRATEGY_FAMILY_DEFAULTS.items()})
+    cfg["force_all_families_once"] = bool(cfg.get("force_all_families_once", False))
+    cfg["max_families_per_run"] = max(1, _safe_int(cfg.get("max_families_per_run", 3)))
+    cfg["prefer_near_miss_followup"] = bool(cfg.get("prefer_near_miss_followup", True))
+    cfg["disable_family_after_high_frequency_failure"] = bool(cfg.get("disable_family_after_high_frequency_failure", True))
+    return cfg
 
 
 def _normalize_strategy_family(value: Any) -> str:
@@ -98,6 +116,7 @@ def _initial_family_stats() -> dict[str, dict[str, Any]]:
             "last_low_trade_near_miss": None,
             "high_frequency_failure_count": 0,
             "consecutive_high_frequency_failure": 0,
+            "validation_high_frequency_failure_count": 0,
             "frequency_penalty_count": 0,
             "trailing_failure_count": 0,
             "final_scores": [],
@@ -120,6 +139,7 @@ def _family_stats_default() -> dict[str, Any]:
         "last_low_trade_near_miss": None,
         "high_frequency_failure_count": 0,
         "consecutive_high_frequency_failure": 0,
+        "validation_high_frequency_failure_count": 0,
         "frequency_penalty_count": 0,
         "trailing_failure_count": 0,
         "final_scores": [],
@@ -128,31 +148,87 @@ def _family_stats_default() -> dict[str, Any]:
     }
 
 
-def _is_family_blocked_by_high_frequency(stats: dict[str, Any]) -> bool:
-    return int(stats.get("consecutive_high_frequency_failure", 0)) >= 2
+def _is_family_blocked_by_high_frequency(stats: dict[str, Any], cfg: dict[str, Any] | None = None) -> bool:
+    cfg = cfg or {}
+    threshold = 1 if bool(cfg.get("disable_family_after_high_frequency_failure", False)) else 2
+    return int(stats.get("consecutive_high_frequency_failure", 0)) >= threshold
 
 
-def _select_strategy_family_for_round(family_stats: dict[str, dict[str, Any]], last_family: str = "") -> str:
-    active_families = [family for family in STRATEGY_FAMILIES if not _is_family_blocked_by_high_frequency(family_stats.get(family, {}))]
+def _select_strategy_family_for_round(
+    family_stats: dict[str, dict[str, Any]],
+    last_family: str = "",
+    cfg: dict[str, Any] | None = None,
+) -> str:
+    cfg = cfg or EXPLORE_STRATEGY_FAMILY_DEFAULTS
+    active_families = [family for family in STRATEGY_FAMILIES if not _is_family_blocked_by_high_frequency(family_stats.get(family, {}), cfg)]
     if not active_families:
         active_families = list(STRATEGY_FAMILIES)
 
-    low_trade_near_miss_families = [
+    attempted = [family for family in STRATEGY_FAMILIES if int((family_stats.get(family) or {}).get("generated", 0)) > 0]
+    if len(set(attempted)) >= int(cfg.get("max_families_per_run", 3)):
+        active_families = [family for family in active_families if family in attempted] or active_families
+
+    near_miss_families = [
         family for family in active_families
         if bool((family_stats.get(family) or {}).get("pending_low_trade_profitable_near_miss"))
+        or bool((family_stats.get(family) or {}).get("near_miss"))
     ]
-    if low_trade_near_miss_families:
+    if bool(cfg.get("prefer_near_miss_followup", True)) and near_miss_families:
         return max(
-            low_trade_near_miss_families,
+            near_miss_families,
             key=lambda fam: (
                 int((family_stats.get(fam) or {}).get("low_trade_profitable_near_miss_count", 0)),
+                int((family_stats.get(fam) or {}).get("near_miss_count", 0)),
                 float((family_stats.get(fam) or {}).get("weight", 1.0)),
             ),
         )
 
-    untried = [family for family in active_families if int((family_stats.get(family) or {}).get("generated", 0)) <= 0]
+    untried: list[str] = []
+    if bool(cfg.get("force_all_families_once", False)) or len(set(attempted)) < int(cfg.get("max_families_per_run", 3)):
+        untried = [family for family in active_families if int((family_stats.get(family) or {}).get("generated", 0)) <= 0]
     candidates = untried or [family for family in active_families if family != last_family] or active_families
     return max(candidates, key=lambda fam: float((family_stats.get(fam) or {}).get("weight", 1.0)))
+
+
+
+
+def _validation_high_frequency_failure_details(
+    train_metrics: dict[str, Any] | None,
+    validation_metrics: list[dict[str, Any]] | None,
+    max_trades: int,
+) -> list[dict[str, Any]]:
+    details: list[dict[str, Any]] = []
+    train_trades = _safe_int((train_metrics or {}).get("total_trades"))
+    absolute_limit = int(max_trades * 1.5)
+    train_relative_limit = int(train_trades * 2.0) if train_trades > 0 else 0
+    for item in validation_metrics or []:
+        metrics = item.get("metrics", {}) if isinstance(item, dict) else {}
+        trades = _safe_int(metrics.get("total_trades"))
+        period = str(item.get("period") or item.get("period_name") or item.get("timerange") or "validation")
+        reasons: list[str] = []
+        violated_limits: list[int] = []
+        if trades > absolute_limit:
+            reasons.append(f"total_trades>{absolute_limit}(max_trades*1.5)")
+            violated_limits.append(absolute_limit)
+        if train_relative_limit and trades > train_relative_limit:
+            reasons.append(f"total_trades>{train_relative_limit}(train_total_trades*2.0)")
+            violated_limits.append(train_relative_limit)
+        if reasons:
+            details.append({
+                "period": period,
+                "timerange": item.get("timerange", "") if isinstance(item, dict) else "",
+                "trades": trades,
+                "max_allowed": min(violated_limits) if violated_limits else absolute_limit,
+                "absolute_limit": absolute_limit,
+                "train_relative_limit": train_relative_limit,
+                "reasons": reasons,
+            })
+    return details
+
+
+def _validation_all_loss(validation_metrics: list[dict[str, Any]] | None) -> bool:
+    metrics = validation_metrics or []
+    return bool(metrics) and all(_safe_float((item.get("metrics", {}) or {}).get("profit_total_abs")) < 0 for item in metrics if isinstance(item, dict))
 
 
 def _is_low_trade_profitable_near_miss(train_metrics: dict[str, Any] | None, min_trades: int) -> bool:
@@ -184,6 +260,7 @@ def _update_strategy_family_stats(
     min_trades: int = 20,
     max_trades: int = 60,
     official_gate_reasons: list[str] | None = None,
+    validation_high_frequency_failure: bool = False,
 ) -> None:
     family = _normalize_strategy_family(family)
     if not family:
@@ -207,12 +284,15 @@ def _update_strategy_family_stats(
     if int(stats.get("loss_streak", 0)) >= 2:
         stats["weight"] = max(0.25, float(stats.get("weight", 1.0)) * 0.6)
 
-    high_frequency_failure = train_trades > int(max_trades) * 2
+    validation_high_frequency_failure = bool(validation_high_frequency_failure or _validation_high_frequency_failure_details(train_metrics, validation_metrics or [], int(max_trades)))
+    high_frequency_failure = train_trades > int(max_trades) * 2 or validation_high_frequency_failure
     frequency_penalty = train_trades > int(max_trades)
+    if validation_high_frequency_failure:
+        stats["validation_high_frequency_failure_count"] = int(stats.get("validation_high_frequency_failure_count", 0)) + 1
     if high_frequency_failure:
         stats["high_frequency_failure_count"] = int(stats.get("high_frequency_failure_count", 0)) + 1
         stats["consecutive_high_frequency_failure"] = int(stats.get("consecutive_high_frequency_failure", 0)) + 1
-        multiplier = 0.35 if family in HIGH_FREQUENCY_SENSITIVE_FAMILIES else 0.5
+        multiplier = 0.25 if validation_high_frequency_failure else (0.35 if family in HIGH_FREQUENCY_SENSITIVE_FAMILIES else 0.5)
         stats["weight"] = max(0.05, float(stats.get("weight", 1.0)) * multiplier)
     else:
         stats["consecutive_high_frequency_failure"] = 0
@@ -220,6 +300,10 @@ def _update_strategy_family_stats(
             stats["frequency_penalty_count"] = int(stats.get("frequency_penalty_count", 0)) + 1
             multiplier = 0.55 if family in HIGH_FREQUENCY_SENSITIVE_FAMILIES else 0.75
             stats["weight"] = max(0.1, float(stats.get("weight", 1.0)) * multiplier)
+
+    validation_all_loss = _validation_all_loss(validation_metrics or [])
+    if train_trades == 0 or (train_trades < int(min_trades) and train_profit <= 0) or validation_all_loss:
+        stats["weight"] = max(0.05, float(stats.get("weight", 1.0)) * 0.55)
 
     if _is_low_trade_profitable_near_miss(train_metrics, min_trades):
         stats["near_miss"] = True
@@ -234,7 +318,11 @@ def _update_strategy_family_stats(
             "instruction": "下一轮优先轻微放宽该 family 的入场条件，把交易数提升到 20~25，不要直接切换到完全不同 family。",
         }
         stats["weight"] = min(3.0, float(stats.get("weight", 1.0)) * 1.6)
-    elif train_profit >= -0.2 and avg_profit >= -0.2 and avg_pf >= 0.85 and (official_gate_reasons or not is_valid):
+    elif (
+        (train_profit >= -0.2 and avg_profit >= -0.2 and avg_pf >= 0.85 and (official_gate_reasons or not is_valid))
+        or (_safe_float(train_metrics.get("profit_factor")) > 1.0 and train_profit > -1.0)
+        or (abs(train_trades - int(min_trades)) <= max(5, int(min_trades * 0.25)) and train_profit > -1.0)
+    ):
         stats["near_miss"] = True
         stats["near_miss_count"] = int(stats.get("near_miss_count", 0)) + 1
         stats["weight"] = min(2.0, float(stats.get("weight", 1.0)) * 1.25)
@@ -271,7 +359,7 @@ def _build_strategy_family_leaderboard(rows: list[dict[str, Any]], family_stats:
             reason = _family_failure_reason(row)
             failure_counts[reason] = failure_counts.get(reason, 0) + 1
         main_failures = sorted(failure_counts.items(), key=lambda item: item[1], reverse=True)[:5]
-        high_frequency_failure_count = int(stats.get("high_frequency_failure_count", 0)) or sum(1 for row in family_rows if bool(row.get("high_frequency_failure")))
+        high_frequency_failure_count = int(stats.get("high_frequency_failure_count", 0)) or sum(1 for row in family_rows if bool(row.get("high_frequency_failure")) or bool(row.get("validation_high_frequency_failure")))
         low_trade_near_miss_count = int(stats.get("low_trade_profitable_near_miss_count", 0)) or sum(1 for row in family_rows if bool(row.get("low_trade_profitable_near_miss")))
         near_miss_count = int(stats.get("near_miss_count", 0)) or sum(1 for row in family_rows if bool(row.get("near_miss")) or bool(row.get("low_trade_profitable_near_miss")))
         items.append({
@@ -281,12 +369,13 @@ def _build_strategy_family_leaderboard(rows: list[dict[str, Any]], family_stats:
             "valid_count": len(valid_rows) or int(stats.get("valid", 0)),
             "near_miss_count": near_miss_count,
             "high_frequency_failure_count": high_frequency_failure_count,
+            "validation_high_frequency_failure_count": int(stats.get("validation_high_frequency_failure_count", 0)) or sum(1 for row in family_rows if bool(row.get("validation_high_frequency_failure"))),
             "consecutive_high_frequency_failure": int(stats.get("consecutive_high_frequency_failure", 0)),
             "low_trade_profitable_near_miss_count": low_trade_near_miss_count,
             "trailing_failure_count": int(stats.get("trailing_failure_count", 0)),
             "average_final_score": (sum(final_scores) / len(final_scores)) if final_scores else 0.0,
             "weight": float(stats.get("weight", 1.0)),
-            "blocked_for_rest_of_run": _is_family_blocked_by_high_frequency(stats),
+            "blocked_for_rest_of_run": _is_family_blocked_by_high_frequency(stats, EXPLORE_STRATEGY_FAMILY_DEFAULTS),
             "train_avg_profit_pct": (sum(train_values) / len(train_values)) if train_values else 0.0,
             "validation_avg_profit_pct": (sum(validation_values) / len(validation_values)) if validation_values else 0.0,
             "best_strategy": {
@@ -2236,6 +2325,72 @@ def _strategy_file_valid(path_raw: str | None) -> str:
     return "有效" if sf.exists() and sf.is_file() else "无效"
 
 
+def _resolve_strategy_file(path_raw: Any) -> Path | None:
+    if not path_raw:
+        return None
+    sf = Path(str(path_raw)).expanduser()
+    if not sf.is_absolute():
+        sf = ROOT_DIR / sf
+    return sf if sf.exists() and sf.is_file() else None
+
+
+def _load_strategy_code_from_record(record: dict[str, Any] | None) -> str:
+    if not isinstance(record, dict):
+        return ""
+    sf = _resolve_strategy_file(record.get("strategy_file"))
+    if sf is None:
+        return ""
+    return sf.read_text(encoding="utf-8", errors="ignore")
+
+
+def _pre_run_recommends_nearest_parent(review: dict[str, Any] | None) -> tuple[bool, str, str]:
+    if not isinstance(review, dict):
+        return False, "", "pre_run_ai_review 为空"
+    next_guidance = review.get("next_run_guidance", {}) if isinstance(review.get("next_run_guidance"), dict) else {}
+    preferred_parent = str(next_guidance.get("preferred_parent") or "").strip()
+    if preferred_parent.lower() == "nearest_candidate":
+        return True, preferred_parent, "next_run_guidance.preferred_parent=nearest_candidate"
+    diagnosis = review.get("last_run_diagnosis", {}) if isinstance(review.get("last_run_diagnosis"), dict) else {}
+    search_blob = json.dumps({"next_run_guidance": next_guidance, "last_run_diagnosis": diagnosis}, ensure_ascii=False).lower()
+    nearest_terms = ("nearest_candidate", "nearest candidate", "最近候选", "最接近目标")
+    parent_terms = ("preferred_parent", "parent", "父策略", "作为父", "基于", "围绕")
+    if any(term in search_blob for term in nearest_terms) and any(term in search_blob for term in parent_terms):
+        return True, preferred_parent or "nearest_candidate（主要结论）", "pre_run 主要结论明确建议围绕 nearest_candidate 作为父策略"
+    return False, preferred_parent, "pre_run 未要求 nearest_candidate 作为父策略"
+
+
+def _select_actual_session_parent_for_run(
+    *,
+    explore_strategy_family: bool,
+    pre_run_ai_review: dict[str, Any] | None,
+    historical_champion: dict[str, Any],
+    nearest_mem: dict[str, Any] | None,
+) -> dict[str, Any]:
+    recommended_nearest, preferred_parent, reason = _pre_run_recommends_nearest_parent(pre_run_ai_review)
+    nearest_valid = _resolve_strategy_file((nearest_mem or {}).get("strategy_file")) is not None
+    actual = dict(historical_champion)
+    actual.setdefault("source", "historical_best")
+    overwritten = False
+    choice_reason = "默认使用 historical_best / 当前 champion 作为本次 session_parent。"
+    if explore_strategy_family and recommended_nearest:
+        if nearest_valid and isinstance(nearest_mem, dict):
+            actual = {"meta": nearest_mem, "code": _load_strategy_code_from_record(nearest_mem), "source": "nearest_candidate_session_parent"}
+            overwritten = True
+            choice_reason = f"{reason}，且 nearest_candidate 策略文件有效；仅覆盖本次 run 的 session_parent，不覆盖 official best。"
+        else:
+            choice_reason = f"{reason}，但 nearest_candidate 策略文件无效，fallback 到 historical_best。"
+    elif explore_strategy_family:
+        choice_reason = reason
+    actual["session_parent_choice"] = {
+        "pre_run_preferred_parent": preferred_parent or "未明确",
+        "actual_parent": _strategy_label(actual.get("meta"), "baseline"),
+        "reason": choice_reason,
+        "overrode_historical_best_for_session": overwritten,
+        "nearest_candidate_file_valid": nearest_valid,
+    }
+    return actual
+
+
 def _normalize_validation_metric(item: dict[str, Any], fallback_label: str = "validation") -> dict[str, Any]:
     m = item.get("metrics", item) if isinstance(item, dict) else {}
     return {
@@ -3254,6 +3409,8 @@ def _new_round_defaults() -> dict[str, Any]:
         "strategy_family": "",
         "family_score": 0.0,
         "family_failure_reason": "",
+        "validation_high_frequency_failure": False,
+        "validation_high_frequency_details": [],
     }
 
 
@@ -5197,9 +5354,17 @@ def _compute_final_score(train_score: float, validation_score: float, train_metr
         if max_dd_target > 0 and _safe_float(m.get("max_drawdown_pct")) > max_dd_target * 0.9:
             penalty += 12.0
             penalty_reasons.append(f"{item.get('period')} DD接近上限")
-        if _safe_int(m.get("total_trades")) > max_trades:
+        trades = _safe_int(m.get("total_trades"))
+        if trades > max_trades:
             penalty += 16.0
             penalty_reasons.append(f"{item.get('period')} trades>{max_trades}")
+        train_trades = _safe_int(train_metrics.get("total_trades"))
+        if trades > int(max_trades * 1.5):
+            penalty += 80.0
+            penalty_reasons.append(f"validation_high_frequency_failure: {item.get('period')} trades>{int(max_trades * 1.5)}(max_trades*1.5)")
+        if train_trades > 0 and trades > int(train_trades * 2.0):
+            penalty += 80.0
+            penalty_reasons.append(f"validation_high_frequency_failure: {item.get('period')} trades>{int(train_trades * 2.0)}(train_total_trades*2.0)")
     roi_abs = max(0.0, _safe_float(train_metrics.get("roi_profit_abs")))
     stop_loss_abs = abs(_safe_float(train_metrics.get("stop_loss_profit_abs")))
     if stop_loss_abs > roi_abs * 1.2:
@@ -6187,10 +6352,12 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     previous_failure_reason: str | None = None
     zero_trade_streak = 0
     explore_strategy_family = bool(getattr(args, "explore_strategy_family", False) or runtime_goal.get("explore_strategy_family", False))
+    explore_family_cfg = _explore_strategy_family_cfg(runtime_goal)
     family_stats = _initial_family_stats()
     last_planned_strategy_family = ""
     if explore_strategy_family:
-        print("策略结构探索模式：已启用。将轮换尝试 trend_following / pullback_reversal / breakout_momentum / low_volatility_mean_reversion / strict_risk_filter。")
+        print("策略结构探索模式：已启用。将按 near-miss 与 family 降权动态选择，不再默认强制尝试所有 family。")
+        print("explore_strategy_family 调度参数：" + _compact_prompt_json(explore_family_cfg, 1000))
     leaderboard: list[dict[str, Any]] = []
     best_summary_path: Path | None = None
     stop_on_ai_error = bool(runtime_goal.get("stop_on_ai_error", False))
@@ -6208,6 +6375,22 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         code_runtime,
         ai_runtime_state,
     )
+    champion = _select_actual_session_parent_for_run(
+        explore_strategy_family=explore_strategy_family,
+        pre_run_ai_review=pre_run_ai_review,
+        historical_champion=champion,
+        nearest_mem=nearest_mem,
+    )
+    actual_parent_choice = champion.get("session_parent_choice", {}) or {}
+    session_state["actual_session_parent"] = champion.get("meta")
+    session_state["actual_session_parent_source"] = champion.get("source")
+    session_state["actual_session_parent_choice"] = actual_parent_choice
+    session_state["in_memory_champion"] = champion.get("meta") or session_state.get("in_memory_champion")
+    print("\n========== 本次实际父策略选择 ==========")
+    print(f"pre_run 建议父策略：{actual_parent_choice.get('pre_run_preferred_parent', '未明确')}")
+    print(f"实际父策略：{actual_parent_choice.get('actual_parent', _strategy_label(champion.get('meta'), 'baseline'))}")
+    print(f"选择原因：{actual_parent_choice.get('reason', '')}")
+    print(f"是否覆盖 historical_best 作为本次 session_parent：{'是' if actual_parent_choice.get('overrode_historical_best_for_session') else '否'}")
 
     iteration_stats: dict[str, Any] = {
         "planned_iterations": int(runtime_goal.get("max_iterations", args.iterations)),
@@ -6335,11 +6518,13 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         is_valid = round_state["is_valid"]
         is_best = round_state["is_best"]
         mutation_type = ""
-        planned_strategy_family = _select_strategy_family_for_round(family_stats, last_planned_strategy_family) if explore_strategy_family else ""
+        planned_strategy_family = _select_strategy_family_for_round(family_stats, last_planned_strategy_family, explore_family_cfg) if explore_strategy_family else ""
         selected_strategy_family = planned_strategy_family if explore_strategy_family else ""
         family_score = 0.0
         family_failure_reason = ""
         high_frequency_failure = False
+        validation_high_frequency_failure = False
+        validation_high_frequency_details: list[dict[str, Any]] = []
         low_trade_profitable_near_miss = False
         trailing_failure = False
         spec_hash = ""
@@ -6374,6 +6559,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             entry.setdefault("family_score", family_score)
             entry.setdefault("family_failure_reason", family_failure_reason or entry.get("invalid_reason") or entry.get("failure_reason", ""))
             entry.setdefault("high_frequency_failure", high_frequency_failure)
+            entry.setdefault("validation_high_frequency_failure", validation_high_frequency_failure)
+            entry.setdefault("validation_high_frequency_details", validation_high_frequency_details)
             entry.setdefault("low_trade_profitable_near_miss", low_trade_profitable_near_miss)
             entry.setdefault("trailing_failure", trailing_failure)
             return entry
@@ -6413,6 +6600,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 "family_score": family_score,
                 "family_failure_reason": family_failure_reason,
                 "high_frequency_failure": high_frequency_failure,
+                "validation_high_frequency_failure": validation_high_frequency_failure,
+                "validation_high_frequency_details": validation_high_frequency_details,
                 "low_trade_profitable_near_miss": low_trade_profitable_near_miss,
                 "trailing_failure": trailing_failure,
             })
@@ -6544,7 +6733,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         in_memory_champion = session_state.get("in_memory_champion") or official_champion
         session_best_record = session_state.get("session_best")
         session_nearest_record = session_state.get("session_nearest_candidate")
+        actual_session_parent = session_state.get("actual_session_parent") or in_memory_champion
+        actual_session_parent_choice = session_state.get("actual_session_parent_choice", {}) or {}
         session_parent_candidates = {
+            "actual_session_parent": actual_session_parent,
             "historical_best": official_champion,
             "session_best": session_best_record,
             "nearest_candidate": session_nearest_record,
@@ -6571,7 +6763,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         print(f"pre_run_ai_review.codegen_guidance 已注入 codegen prompt：{'是' if pre_run_codegen_injected else '否'}")
         print(f"当前正式 champion：{official_champion_name}")
         print(f"当前 in_memory_champion：{in_memory_champion_name}")
+        print(f"本次 actual_session_parent：{_strategy_label(actual_session_parent, 'baseline')}")
+        print(f"actual_session_parent 选择原因：{actual_session_parent_choice.get('reason', '未记录')}")
         print("当前 session_parent 候选：")
+        print(f"- actual_session_parent: {_strategy_label(session_parent_candidates['actual_session_parent'])}")
         print(f"- historical_best: {_strategy_label(session_parent_candidates['historical_best'])}")
         print(f"- session_best: {_strategy_label(session_parent_candidates['session_best'])}")
         print(f"- nearest_candidate: {_strategy_label(session_parent_candidates['nearest_candidate'])}")
@@ -6588,6 +6783,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         spec_prompt += "\n\n========== 同一次 run 动态 session_state（必须优先于跨 run 旧记忆）==========\n"
         spec_prompt += "当前 official_champion=" + _compact_prompt_json(official_champion, 5000) + "\n"
         spec_prompt += "当前 in_memory_champion=" + _compact_prompt_json(in_memory_champion, 5000) + "\n"
+        spec_prompt += "本次 actual_session_parent=" + _compact_prompt_json(actual_session_parent, 5000) + "\n"
+        spec_prompt += "硬性要求：本轮 advisor 必须把 actual_session_parent 作为代码修改父策略；pre_run_ai_review 只能解释原因，不能只停留为参考。\n"
         spec_prompt += "当前 session_best=" + _compact_prompt_json(session_best_record, 5000) + "\n"
         spec_prompt += "当前 session_nearest_candidate=" + _compact_prompt_json(session_nearest_record, 5000) + "\n"
         spec_prompt += "上一轮 last_round_summary=" + _compact_prompt_json(last_round_summary, 5000) + "\n"
@@ -6596,7 +6793,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         spec_prompt += "本次 run 已成功 mutation_type=" + _compact_prompt_json(session_state["successful_mutation_types_this_run"], 2000) + "\n"
         if explore_strategy_family:
             spec_prompt += "本次 run 已尝试 strategy_family=" + _compact_prompt_json(session_state["attempted_strategy_families_this_run"], 2000) + "\n"
-            spec_prompt += f"本轮强制 planned_strategy_family={planned_strategy_family}；mutation_spec.strategy_family 必须等于它。\n"
+            spec_prompt += f"本轮 planned_strategy_family={planned_strategy_family}；mutation_spec.strategy_family 必须等于它（除非代码显式修正）。\n"
+            if isinstance(last_round_summary, dict) and last_round_summary.get("validation_high_frequency_failure"):
+                spec_prompt += "上一轮出现 validation_high_frequency_failure：必须在本轮 reason/session_parent_reason 中说明该 family 在验证期交易数失控，并优先做同 family/相近 family 降频修复，避免机械切到完全不同 family。详情=" + _compact_prompt_json(last_round_summary.get("validation_high_frequency_details"), 2000) + "\n"
         spec_prompt += "本次 run 已出现失败模式=" + _compact_prompt_json(session_state["common_failure_patterns_this_run"], 3000) + "\n"
         spec_prompt += "请不要重复上一轮失败方向；必须在 reason/session_parent_reason 中说明本轮为什么选择当前 mutation_type。\n"
         if last_run_summary_mem:
@@ -6608,7 +6807,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         spec_prompt += "\n跨 run strategy_lessons=" + _compact_prompt_json(lessons_items[-memory_max_items:], 4000) + "\n"
         spec_prompt += "\n跨 run strategy_blacklist=" + _compact_prompt_json(blacklist_items[-memory_max_items:], 4000) + "\n"
         spec_prompt += _format_pre_run_review_for_advisor(pre_run_ai_review)
-        spec_prompt += f"\nchampion_strategy_class={_strategy_label(in_memory_champion, 'baseline')}\n"
+        spec_prompt += f"\nchampion_strategy_class={_strategy_label(actual_session_parent, 'baseline')}\n"
+        spec_prompt += f"actual_session_parent_strategy_class={_strategy_label(actual_session_parent, 'baseline')}\n"
         spec_prompt += _v045_small_step_prompt_section({"meta": official_champion}, runtime_goal)
         spec_prompt += _format_prompt_guidance_section(
             "========== 用户额外策略顾问规则 ==========",
@@ -6696,7 +6896,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         prompt = (
             f"{codegen_mode_intro}，只输出 Python 代码。类名必须为 {class_name}，继承 IStrategy，"
             f"timeframe='{timeframe}'，并实现 populate_indicators/populate_entry_trend/populate_exit_trend。\n"
-            f"champion_strategy_code=\n{champion.get('code', '')}\n"
+            f"actual_session_parent_strategy_code=\n{champion.get('code', '')}\n"
+            "注意：本轮代码修改必须基于 actual_session_parent_strategy_code，而不是仅把 nearest_candidate / pre_run 复盘当参考。\n"
             f"mutation_spec={json.dumps(strategy_spec, ensure_ascii=False)}\n"
             f"当前失败摘要={previous_failure_reason or '无'}\n"
             "硬性约束：\n"
@@ -6772,6 +6973,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         similarity_report = {"is_similar": False, "similarity_score": 0.0, "similar_to": "", "similar_type": "none", "reasons": [], "decision": "auto_continue", "user_prompt_required": False}
         parent_pool = [
             ("session_parent", champion.get("meta") if champion.get("meta") else None),
+            ("actual_session_parent", session_parent_candidates.get("actual_session_parent")),
             ("historical_best", session_parent_candidates.get("historical_best")),
             ("session_best", session_parent_candidates.get("session_best")),
             ("nearest_candidate", session_parent_candidates.get("nearest_candidate")),
@@ -7232,11 +7434,21 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             validation_metrics=validation_metrics,
             target_cfg=target_cfg,
         )
+        validation_high_frequency_details = _validation_high_frequency_failure_details(train_metrics, validation_metrics, max_trades)
+        validation_high_frequency_failure = bool(validation_high_frequency_details)
+        if validation_high_frequency_failure:
+            for detail in validation_high_frequency_details:
+                print(
+                    f"验证交易数失控：period={detail.get('period')}, "
+                    f"trades={detail.get('trades')}, max_allowed={detail.get('max_allowed')}"
+                )
         final_score = final_score - overfit_penalty - baseline_dd_penalty
         if hard_invalid_reason:
             final_score = 0
         if train_trades > max_trades:
             final_score = min(final_score, 0.0)
+        if validation_high_frequency_failure:
+            final_score = min(final_score - 80.0, -80.0)
         is_overfit = train_score > validation_score * 1.3 if validation_score else True
         zero_reason = _score_zero_reason(final_score, train_metrics, validation_metrics, validation_score)
         if zero_reason:
@@ -7293,6 +7505,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             failure_reasons.append("trailing_failure：移动止损亏损超过 ROI 收益的 50%。")
         elif trailing_stop_loss_profit_abs < -20:
             failure_reasons.append("移动止盈/止损结构造成大额亏损。")
+        if validation_high_frequency_failure:
+            failure_reasons.append("validation_high_frequency_failure：验证期交易数失控，超过 max_trades*1.5 或 train_total_trades*2.0")
         if high_frequency_failure:
             failure_reasons.append("high_frequency_failure：交易数超过 max_trades * 2")
         elif high_freq_risk:
@@ -7307,6 +7521,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "train_metrics": train_metrics, "train_score": train_score, "validation_score": validation_score,
             "overfit_penalty": overfit_penalty, "final_score": final_score, "is_overfit": is_overfit,
             "is_valid": is_valid, "invalid_reason": invalid_reason,
+            "validation_high_frequency_failure": validation_high_frequency_failure,
+            "validation_high_frequency_details": validation_high_frequency_details,
         }
         write_json(run_dir / f"round_{i:03d}.json", round_data)
         avg_validation_profit_pct, avg_validation_profit_factor, max_validation_drawdown_pct = _aggregate_validation_metrics(validation_metrics)
@@ -7340,6 +7556,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 min_trades=min_trades,
                 max_trades=max_trades,
                 official_gate_reasons=official_gate_reasons,
+                validation_high_frequency_failure=validation_high_frequency_failure,
             )
             last_planned_strategy_family = selected_strategy_family
         behavior_duplicate = _behavior_duplicate_report(
@@ -7462,6 +7679,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "min_trades_grace_ratio": min_trades_grace_ratio,
             "trade_count_warning": trade_count_warning,
             "high_frequency_failure": high_frequency_failure,
+            "validation_high_frequency_failure": validation_high_frequency_failure,
+            "validation_high_frequency_details": validation_high_frequency_details,
             "low_trade_profitable_near_miss": low_trade_profitable_near_miss,
             "trailing_failure": trailing_failure,
             "backtest_errors": backtest_errors,
@@ -7489,6 +7708,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "validation_strong": validation_strong,
             "trade_count_warning": trade_count_warning,
             "high_frequency_failure": high_frequency_failure,
+            "validation_high_frequency_failure": validation_high_frequency_failure,
+            "validation_high_frequency_details": validation_high_frequency_details,
             "low_trade_profitable_near_miss": low_trade_profitable_near_miss,
             "trailing_failure": trailing_failure,
             "profit_factor": _safe_float(train_metrics.get("profit_factor")),
