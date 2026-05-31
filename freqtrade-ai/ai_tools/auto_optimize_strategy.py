@@ -52,6 +52,106 @@ LAST_RUN_SUMMARY_FILE = ROOT_DIR / "user_data" / "ai_memory" / "last_run_summary
 RECOMMENDED_PAIRS_FILE = ROOT_DIR / "user_data" / "ai_memory" / "recommended_pairs.json"
 PAIR_LEADERBOARD_FILE = ROOT_DIR / "user_data" / "ai_memory" / "pair_leaderboard.json"
 PAIR_STRATEGY_VOTE_FILE = ROOT_DIR / "user_data" / "ai_memory" / "pair_strategy_vote.json"
+
+STRATEGY_FAMILIES = [
+    "trend_following",
+    "pullback_reversal",
+    "breakout_momentum",
+    "low_volatility_mean_reversion",
+    "strict_risk_filter",
+]
+
+
+def _normalize_strategy_family(value: Any) -> str:
+    family = str(value or "").strip()
+    return family if family in STRATEGY_FAMILIES else ""
+
+
+def _family_failure_reason(row: dict[str, Any]) -> str:
+    return str(row.get("family_failure_reason") or row.get("invalid_reason") or row.get("failure_reason") or row.get("not_best_reason") or "通过")
+
+
+def _strategy_family_score(final_score: float, train_metrics: dict[str, Any] | None, validation_metrics: list[dict[str, Any]] | None) -> float:
+    train_metrics = train_metrics or {}
+    validation_metrics = validation_metrics or []
+    avg_profit, avg_pf, _max_dd = _aggregate_validation_metrics(validation_metrics)
+    return float(final_score) + _safe_float(train_metrics.get("profit_total_pct")) * 0.15 + avg_profit * 0.25 + max(0.0, avg_pf - 1.0) * 5.0
+
+
+def _initial_family_stats() -> dict[str, dict[str, Any]]:
+    return {family: {"generated": 0, "valid": 0, "loss_streak": 0, "near_miss": False, "weight": 1.0, "failure_reasons": []} for family in STRATEGY_FAMILIES}
+
+
+def _select_strategy_family_for_round(family_stats: dict[str, dict[str, Any]], last_family: str = "") -> str:
+    untried = [family for family in STRATEGY_FAMILIES if int((family_stats.get(family) or {}).get("generated", 0)) <= 0]
+    candidates = untried or [family for family in STRATEGY_FAMILIES if family != last_family] or list(STRATEGY_FAMILIES)
+    return max(candidates, key=lambda fam: float((family_stats.get(fam) or {}).get("weight", 1.0)))
+
+
+def _update_strategy_family_stats(
+    family_stats: dict[str, dict[str, Any]],
+    family: str,
+    *,
+    is_valid: bool,
+    train_metrics: dict[str, Any] | None,
+    validation_metrics: list[dict[str, Any]] | None,
+    failure_reason: str,
+    official_gate_reasons: list[str] | None = None,
+) -> None:
+    family = _normalize_strategy_family(family)
+    if not family:
+        return
+    stats = family_stats.setdefault(family, {"generated": 0, "valid": 0, "loss_streak": 0, "near_miss": False, "weight": 1.0, "failure_reasons": []})
+    stats["generated"] = int(stats.get("generated", 0)) + 1
+    if is_valid:
+        stats["valid"] = int(stats.get("valid", 0)) + 1
+    train_profit = _safe_float((train_metrics or {}).get("profit_total_pct"))
+    avg_profit, avg_pf, _ = _aggregate_validation_metrics(validation_metrics or [])
+    clearly_losing = train_profit < -0.5 and (not validation_metrics or avg_profit < -0.5 or avg_pf < 0.85)
+    stats["loss_streak"] = int(stats.get("loss_streak", 0)) + 1 if clearly_losing else 0
+    if int(stats.get("loss_streak", 0)) >= 2:
+        stats["weight"] = max(0.25, float(stats.get("weight", 1.0)) * 0.6)
+    if train_profit >= -0.2 and avg_profit >= -0.2 and avg_pf >= 0.85 and (official_gate_reasons or not is_valid):
+        stats["near_miss"] = True
+        stats["weight"] = min(2.0, float(stats.get("weight", 1.0)) * 1.25)
+    if failure_reason and failure_reason != "通过":
+        reasons = list(stats.get("failure_reasons", []) or [])
+        reasons.append(failure_reason)
+        stats["failure_reasons"] = reasons[-20:]
+
+
+def _build_strategy_family_leaderboard(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    items: list[dict[str, Any]] = []
+    for family in STRATEGY_FAMILIES:
+        family_rows = [row for row in rows if _normalize_strategy_family(row.get("strategy_family")) == family]
+        valid_rows = [row for row in family_rows if row.get("is_valid")]
+        train_values = [_safe_float(row.get("train_profit_pct")) for row in family_rows if row.get("train_profit_pct") is not None]
+        validation_values = [_safe_float(row.get("avg_validation_profit_pct")) for row in family_rows if row.get("avg_validation_profit_pct") is not None]
+        best_row = max(family_rows, key=lambda row: _safe_float(row.get("family_score") if row.get("family_score") is not None else row.get("final_score")), default=None)
+        failure_counts: dict[str, int] = {}
+        for row in family_rows:
+            if row.get("is_valid"):
+                continue
+            reason = _family_failure_reason(row)
+            failure_counts[reason] = failure_counts.get(reason, 0) + 1
+        main_failures = sorted(failure_counts.items(), key=lambda item: item[1], reverse=True)[:5]
+        items.append({
+            "strategy_family": family,
+            "generated_count": len(family_rows),
+            "valid_count": len(valid_rows),
+            "train_avg_profit_pct": (sum(train_values) / len(train_values)) if train_values else 0.0,
+            "validation_avg_profit_pct": (sum(validation_values) / len(validation_values)) if validation_values else 0.0,
+            "best_strategy": {
+                "version": best_row.get("version"),
+                "strategy_class": best_row.get("strategy_class"),
+                "strategy_file": best_row.get("strategy_file"),
+                "family_score": best_row.get("family_score"),
+                "final_score": best_row.get("final_score"),
+            } if best_row else None,
+            "main_failure_reasons": [{"reason": reason, "count": count} for reason, count in main_failures],
+        })
+    preferred = [item["strategy_family"] for item in sorted(items, key=lambda item: (_safe_float(((item.get("best_strategy") or {}).get("family_score"))), item.get("validation_avg_profit_pct", 0.0)), reverse=True) if item.get("generated_count", 0) > 0]
+    return {"created_at": datetime.utcnow().isoformat(), "items": items, "preferred_families_for_next_optimize": preferred[:3]}
 ITERATION_STATS_FILE_NAME = "iteration_stats.json"
 MEMORY_EXAMPLE_FILE = ROOT_DIR / "ai_tools" / "strategy_memory.example.json"
 BLACKLIST_EXAMPLE_FILE = ROOT_DIR / "ai_tools" / "strategy_blacklist.example.json"
@@ -304,6 +404,7 @@ def _copy_log_repo_summary_files(run_dir: Path, dest_dir: Path) -> None:
         "leaderboard.json",
         "pair_strategy_vote.json",
         "pair_leaderboard.json",
+        "strategy_family_leaderboard.json",
         "recommended_pairs.json",
         "last_run_summary.json",
         "nearest_candidate_snapshot.json",
@@ -2954,6 +3055,9 @@ def _new_round_defaults() -> dict[str, Any]:
         "random_sample_usage": dict(RANDOM_SAMPLE_USAGE),
         "random_sample_observation": summarize_random_sample_observation([]),
         "random_sample_errors": [],
+        "strategy_family": "",
+        "family_score": 0.0,
+        "family_failure_reason": "",
     }
 
 
@@ -3027,6 +3131,9 @@ def _minimal_round_summary(
         "random_sample_usage": state.get("random_sample_usage", dict(RANDOM_SAMPLE_USAGE)),
         "random_sample_observation": state.get("random_sample_observation", summarize_random_sample_observation([])),
         "random_sample_errors": state.get("random_sample_errors", []),
+        "strategy_family": state.get("strategy_family", ""),
+        "family_score": state.get("family_score", 0.0),
+        "family_failure_reason": state.get("family_failure_reason", failure_reason or state.get("invalid_reason", "")),
     }
 
 
@@ -3707,7 +3814,17 @@ def _print_ai_model_pool_config(advisor_runtime: AIRoleRuntime, code_runtime: AI
     print(f"AI 请求超时：{max(advisor_runtime.timeout_sec, code_runtime.timeout_sec)} 秒")
     print(f"AI 请求冷却：{cooldown_seconds:g} 秒")
 
-def _strategy_spec_prompt(class_name: str, runtime_goal: dict[str, Any], baseline_cfg: dict[str, Any], compact_memory: str, previous_failure_reason: str | None) -> str:
+def _strategy_spec_prompt(
+    class_name: str,
+    runtime_goal: dict[str, Any],
+    baseline_cfg: dict[str, Any],
+    compact_memory: str,
+    previous_failure_reason: str | None,
+    *,
+    explore_strategy_family: bool = False,
+    planned_strategy_family: str = "",
+    family_stats: dict[str, Any] | None = None,
+) -> str:
     target_cfg = runtime_goal.get("target", {}) or {}
     min_trades = int(target_cfg.get("min_trades", 25))
     max_trades = int(target_cfg.get("max_trades", 80))
@@ -3724,6 +3841,19 @@ def _strategy_spec_prompt(class_name: str, runtime_goal: dict[str, Any], baselin
         f"硬约束：本轮训练区间总交易数目标是 {min_trades}~{max_trades}（不是单币种）。低于 {min_trades_grace_floor} 会直接跳过验证；{min_trades_grace_floor}~{min_trades - 1} 会继续验证但仅作候选参考。超过 {max_trades} 不能成为 best，超过 {int(max_trades * 1.5)} 会直接跳过验证。\n"
         f"{_auto_trade_count_target_prompt_note(runtime_goal)}"
         "重点：减少固定止损吞噬 ROI，不是增加交易数量。禁止/不推荐：increase_trade_frequency,loosen_entry,enable_trailing,adjust_stoploss_only,widen_stoploss。优先：add_entry_filter,tighten_entry_trigger,remove_bad_entry_condition,pair_specific_filter,tag_specific_filter。"
+        + (
+            "\n\n========== 策略结构探索模式 =========="
+            "\n当前不是微调模式，而是结构探索模式。不要只围绕 current best 做小步改动；请读取 historical_best/nearest/memory 的经验，但允许生成不同结构的策略族。"
+            "\n本轮 mutation_spec 必须包含 strategy_family 字段，且值必须严格等于 planned_strategy_family。"
+            f"\nplanned_strategy_family={planned_strategy_family}"
+            f"\n允许的 strategy_family={json.dumps(STRATEGY_FAMILIES, ensure_ascii=False)}"
+            "\n允许重构 entry 条件、indicator 组合、ROI 逻辑、exit 逻辑。"
+            "\n必须保留 Freqtrade IStrategy 策略格式、现货 long-only、不做空、不杠杆、不马丁格尔、不外部 API、use_exit_signal=False 等风控安全边界。"
+            "\n避免连续生成同类策略；每个 family 至少尝试一次；明显连续亏损的 family 会被降低权重。"
+            "\n请在 reason 中说明该 family 的结构假设、从历史 best 中借鉴了什么、与小步微调有何不同。"
+            "\n当前 family 统计=" + _compact_prompt_json(family_stats or {}, 6000)
+            if explore_strategy_family else ""
+        )
     )
 
 
@@ -5826,6 +5956,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         "successful_mutation_types_this_run": [],
         "common_failure_patterns_this_run": [],
         "attempted_mutation_types_this_run": [],
+        "attempted_strategy_families_this_run": [],
     }
     print("========== 记忆加载状态 ==========")
     h_status = "reset" if _is_reset_best(historical_best_mem) else ("存在" if historical_best_mem else "不存在")
@@ -5854,6 +5985,11 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     prev_train_trades: int | None = None
     previous_failure_reason: str | None = None
     zero_trade_streak = 0
+    explore_strategy_family = bool(getattr(args, "explore_strategy_family", False) or runtime_goal.get("explore_strategy_family", False))
+    family_stats = _initial_family_stats()
+    last_planned_strategy_family = ""
+    if explore_strategy_family:
+        print("策略结构探索模式：已启用。将轮换尝试 trend_following / pullback_reversal / breakout_momentum / low_volatility_mean_reversion / strict_risk_filter。")
     leaderboard: list[dict[str, Any]] = []
     best_summary_path: Path | None = None
     stop_on_ai_error = bool(runtime_goal.get("stop_on_ai_error", False))
@@ -5998,6 +6134,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         is_valid = round_state["is_valid"]
         is_best = round_state["is_best"]
         mutation_type = ""
+        planned_strategy_family = _select_strategy_family_for_round(family_stats, last_planned_strategy_family) if explore_strategy_family else ""
+        selected_strategy_family = planned_strategy_family if explore_strategy_family else ""
+        family_score = 0.0
+        family_failure_reason = ""
         spec_hash = ""
         code_hash = ""
         features: dict[str, Any] = {}
@@ -6026,6 +6166,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             entry.setdefault("codegen_model_used", codegen_usage.get("used_model", ""))
             entry.setdefault("advisor_attempt_count", len(advisor_usage.get("attempts", []) or []))
             entry.setdefault("codegen_attempt_count", len(codegen_usage.get("attempts", []) or []))
+            entry.setdefault("strategy_family", selected_strategy_family)
+            entry.setdefault("family_score", family_score)
+            entry.setdefault("family_failure_reason", family_failure_reason or entry.get("invalid_reason") or entry.get("failure_reason", ""))
             return entry
 
         def sync_round_state() -> None:
@@ -6059,6 +6202,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 "random_sample_usage": dict(RANDOM_SAMPLE_USAGE),
                 "random_sample_observation": random_sample_observation,
                 "random_sample_errors": random_sample_errors,
+                "strategy_family": selected_strategy_family,
+                "family_score": family_score,
+                "family_failure_reason": family_failure_reason,
             })
 
         def write_iteration_summary(extra: dict[str, Any] | None = None) -> Path:
@@ -6130,6 +6276,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             session_state["last_round_summary"] = round_summary
             session_state["round_history"].append(round_summary)
             _append_unique(session_state["attempted_mutation_types_this_run"], mutation_type)
+            if selected_strategy_family:
+                _append_unique(session_state["attempted_strategy_families_this_run"], selected_strategy_family)
             if round_summary.get("is_valid"):
                 _append_unique(session_state["successful_mutation_types_this_run"], mutation_type)
             else:
@@ -6205,6 +6353,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         print(f"当前 session_nearest_candidate：{_strategy_label(session_nearest_record)}")
         print(f"本次 run 已失败 mutation_type：{session_state['failed_mutation_types_this_run'] or '无'}")
         print(f"本次 run 已成功 mutation_type：{session_state['successful_mutation_types_this_run'] or '无'}")
+        if explore_strategy_family:
+            print(f"策略结构探索 planned_strategy_family：{planned_strategy_family}")
+            print(f"本次 run 已尝试 strategy_family：{session_state['attempted_strategy_families_this_run'] or '无'}")
         print(f"本轮 advisor prompt 已包含上一轮结果：{'是' if prompt_has_last_round else '否'}")
         print(f"pre_run_ai_review 已注入 advisor prompt：{'是' if pre_run_advisor_injected else '否'}")
         print(f"pre_run_ai_review.codegen_guidance 已注入 codegen prompt：{'是' if pre_run_codegen_injected else '否'}")
@@ -6214,7 +6365,16 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         print(f"- historical_best: {_strategy_label(session_parent_candidates['historical_best'])}")
         print(f"- session_best: {_strategy_label(session_parent_candidates['session_best'])}")
         print(f"- nearest_candidate: {_strategy_label(session_parent_candidates['nearest_candidate'])}")
-        spec_prompt = _strategy_spec_prompt(class_name, runtime_goal, baseline_cfg, compact_memory, last_round_failure or previous_failure_reason)
+        spec_prompt = _strategy_spec_prompt(
+            class_name,
+            runtime_goal,
+            baseline_cfg,
+            compact_memory,
+            last_round_failure or previous_failure_reason,
+            explore_strategy_family=explore_strategy_family,
+            planned_strategy_family=planned_strategy_family,
+            family_stats=family_stats,
+        )
         spec_prompt += "\n\n========== 同一次 run 动态 session_state（必须优先于跨 run 旧记忆）==========\n"
         spec_prompt += "当前 official_champion=" + _compact_prompt_json(official_champion, 5000) + "\n"
         spec_prompt += "当前 in_memory_champion=" + _compact_prompt_json(in_memory_champion, 5000) + "\n"
@@ -6224,10 +6384,17 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         spec_prompt += "本次 run 已尝试 mutation_type=" + _compact_prompt_json(session_state["attempted_mutation_types_this_run"], 2000) + "\n"
         spec_prompt += "本次 run 已失败 mutation_type=" + _compact_prompt_json(session_state["failed_mutation_types_this_run"], 2000) + "\n"
         spec_prompt += "本次 run 已成功 mutation_type=" + _compact_prompt_json(session_state["successful_mutation_types_this_run"], 2000) + "\n"
+        if explore_strategy_family:
+            spec_prompt += "本次 run 已尝试 strategy_family=" + _compact_prompt_json(session_state["attempted_strategy_families_this_run"], 2000) + "\n"
+            spec_prompt += f"本轮强制 planned_strategy_family={planned_strategy_family}；mutation_spec.strategy_family 必须等于它。\n"
         spec_prompt += "本次 run 已出现失败模式=" + _compact_prompt_json(session_state["common_failure_patterns_this_run"], 3000) + "\n"
         spec_prompt += "请不要重复上一轮失败方向；必须在 reason/session_parent_reason 中说明本轮为什么选择当前 mutation_type。\n"
         if last_run_summary_mem:
             spec_prompt += "\n跨 run last_run_summary=" + _compact_prompt_json(_strip_random_samples_for_ai_prompt(last_run_summary_mem), 4000) + "\n"
+            preferred_families = (last_run_summary_mem.get("preferred_strategy_families_for_next_optimize") or []) if isinstance(last_run_summary_mem, dict) else []
+            nearest_family = ((last_run_summary_mem.get("nearest_candidate") or {}).get("strategy_family") if isinstance(last_run_summary_mem, dict) else "") or ""
+            if not explore_strategy_family and (preferred_families or nearest_family):
+                spec_prompt += "普通 optimize 模式提示：上一轮结构探索的 near-miss / leaderboard 显示可优先小步优化这些 strategy_family=" + _compact_prompt_json({"preferred": preferred_families, "nearest_family": nearest_family}, 2000) + "\n"
         spec_prompt += "\n跨 run strategy_lessons=" + _compact_prompt_json(lessons_items[-memory_max_items:], 4000) + "\n"
         spec_prompt += "\n跨 run strategy_blacklist=" + _compact_prompt_json(blacklist_items[-memory_max_items:], 4000) + "\n"
         spec_prompt += _format_pre_run_review_for_advisor(pre_run_ai_review)
@@ -6292,8 +6459,18 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             print(f"strategy_spec 解析失败，请检查：{version_dir / 'strategy_spec.raw.txt'}")
             print(f"8. 第 {i} 轮完成：无效，原因：{invalid_reason}")
             continue
+        if explore_strategy_family:
+            returned_family = _normalize_strategy_family(strategy_spec.get("strategy_family"))
+            if returned_family != planned_strategy_family:
+                strategy_spec["strategy_family_validation_warning"] = (
+                    f"advisor 返回 strategy_family={returned_family or '缺失/非法'}，已按本轮结构探索计划修正为 {planned_strategy_family}"
+                )
+                strategy_spec["strategy_family"] = planned_strategy_family
+            selected_strategy_family = _normalize_strategy_family(strategy_spec.get("strategy_family")) or planned_strategy_family
         write_json(version_dir / "mutation_spec.json", strategy_spec)
         print(f"2. mutation_spec 已保存：{version_dir / 'mutation_spec.json'}")
+        if explore_strategy_family:
+            print(f"本轮 strategy_family：{selected_strategy_family}")
         spec_hash = hashlib.sha256(json.dumps(strategy_spec, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
         mutation_type = str(strategy_spec.get("mutation_type", "") or "")
         with (version_dir / "advisor_prompt.txt").open("a", encoding="utf-8") as prompt_audit:
@@ -6301,15 +6478,20 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             prompt_audit.write(f"本轮选择 mutation_type={mutation_type or '未提供'}\n")
             prompt_audit.write(f"本轮为什么选择当前 mutation_type={strategy_spec.get('reason') or strategy_spec.get('session_parent_reason') or '未提供'}\n")
             prompt_audit.write("完整 mutation_spec=" + json.dumps(strategy_spec, ensure_ascii=False, indent=2) + "\n")
+        codegen_mode_intro = (
+            f"当前启用策略结构探索模式，不是微调模式。请生成 strategy_family={selected_strategy_family} 的新结构 challenger；可以重构 entry 条件、indicator 组合、ROI 逻辑、exit 逻辑，但必须保留 Freqtrade IStrategy 格式和风控安全边界。"
+            if explore_strategy_family else
+            "请基于 champion 策略代码进行一次最小修改生成 challenger"
+        )
         prompt = (
-            f"请基于 champion 策略代码进行一次最小修改生成 challenger，只输出 Python 代码。类名必须为 {class_name}，继承 IStrategy，"
+            f"{codegen_mode_intro}，只输出 Python 代码。类名必须为 {class_name}，继承 IStrategy，"
             f"timeframe='{timeframe}'，并实现 populate_indicators/populate_entry_trend/populate_exit_trend。\n"
             f"champion_strategy_code=\n{champion.get('code', '')}\n"
             f"mutation_spec={json.dumps(strategy_spec, ensure_ascii=False)}\n"
             f"当前失败摘要={previous_failure_reason or '无'}\n"
             "硬性约束：\n"
-            "1) 仅允许在 champion 基础上一次小改动，不允许完全重写。\n"
-            "2) 策略必须在训练区间产生合理交易，严禁生成完全无交易策略。\n"
+            + ("1) 当前是结构探索模式：允许不局限于 champion 小步改动，但必须吸收历史经验，避免重复已失败结构。\n" if explore_strategy_family else "1) 仅允许在 champion 基础上一次小改动，不允许完全重写。\n")
+            + "2) 策略必须在训练区间产生合理交易，严禁生成完全无交易策略。\n"
             f"2) 训练区间总交易数目标为 {min_trades}~{max_trades}（不是单币种）。低于 {int(min_trades * min_trades_grace_ratio)} 笔直接跳过验证；{int(min_trades * min_trades_grace_ratio)}~{min_trades - 1} 笔继续验证但仅作候选参考。超过 {max_trades} 不能成为 best；超过 {int(max_trades * 1.5)} 直接跳过验证。\n"
             "3) 禁止连续状态型宽松入场；优先 crossed_above/crossed_below 事件触发；每个策略最多 1~2 个 entry_tag。\n"
             "4) 不允许多个 OR 条件堆叠造成高频；不允许为了增加交易数而放宽入场。\n"
@@ -6890,6 +7072,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         if not failure_reasons and invalid_reason:
             failure_reasons.append(invalid_reason)
         failure_reason = "；".join(failure_reasons) if failure_reasons else ("通过" if is_valid else "综合评分不达标")
+        family_failure_reason = failure_reason
+        family_score = _strategy_family_score(final_score, train_metrics, validation_metrics)
         round_data = {
             "iteration": i, "class_name": class_name, "strategy_file": str(strategy_file),
             "train_metrics": train_metrics, "train_score": train_score, "validation_score": validation_score,
@@ -6914,6 +7098,19 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             print("official best 硬门槛未通过，本轮只能作为 nearest_candidate，不能覆盖 best_strategy.json。")
             for reason in official_gate_reasons:
                 print(f"- {reason}")
+        if official_gate_reasons and family_failure_reason == "通过":
+            family_failure_reason = "；".join(official_gate_reasons)
+        if explore_strategy_family:
+            _update_strategy_family_stats(
+                family_stats,
+                selected_strategy_family,
+                is_valid=is_valid,
+                train_metrics=train_metrics,
+                validation_metrics=validation_metrics,
+                failure_reason=family_failure_reason,
+                official_gate_reasons=official_gate_reasons,
+            )
+            last_planned_strategy_family = selected_strategy_family
         behavior_duplicate = _behavior_duplicate_report(
             train_metrics=train_metrics,
             validation_metrics=validation_metrics,
@@ -7044,6 +7241,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "code_hash": code_hash,
             "created_at": datetime.utcnow().isoformat(),
             "final_score": final_score,
+            "strategy_family": selected_strategy_family,
+            "family_score": family_score,
+            "family_failure_reason": family_failure_reason,
             "train_profit_pct": _safe_float(train_metrics.get("profit_total_pct")),
             "train_profit_abs": _safe_float(train_metrics.get("profit_total_abs")),
             "avg_validation_profit_pct": avg_validation_profit_pct,
@@ -7215,6 +7415,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "holdout_metrics": holdout_metrics,
             "holdout_status": holdout_status,
             "holdout_reason": holdout_reason,
+            "strategy_family": selected_strategy_family,
+            "family_score": family_score,
+            "family_failure_reason": family_failure_reason,
             "is_best": is_best,
             "is_valid": is_valid,
             "invalid_reason": invalid_reason,
@@ -7240,6 +7443,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         leaderboard_entry["is_valid"] = bool(is_valid)
         leaderboard_entry["invalid_reason"] = invalid_reason
         leaderboard_entry["reason_detail"] = reason_detail
+        leaderboard_entry["strategy_family"] = selected_strategy_family
+        leaderboard_entry["family_score"] = family_score
+        leaderboard_entry["family_failure_reason"] = family_failure_reason
         round_strategy_record = _strategy_record_from_round(
             version=ver,
             class_name=class_name,
@@ -7264,6 +7470,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "behavior_duplicate": behavior_duplicate,
             "not_best_reason": not_best_reason,
             "mutation_type": mutation_type,
+            "strategy_family": selected_strategy_family,
+            "family_score": family_score,
+            "family_failure_reason": family_failure_reason,
             "failure_reason": failure_reason,
         })
         if is_best:
@@ -7302,6 +7511,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         row.setdefault("codegen_attempt_count", len(codegen_usage.get("attempts", []) or []))
 
     leaderboard_sorted = sorted(leaderboard, key=lambda x: float(x.get("final_score", 0.0) or 0.0), reverse=True)
+    strategy_family_leaderboard = _build_strategy_family_leaderboard(leaderboard_sorted) if explore_strategy_family else {"created_at": datetime.utcnow().isoformat(), "items": [], "preferred_families_for_next_optimize": []}
+    if explore_strategy_family:
+        write_json(run_dir / "strategy_family_leaderboard.json", strategy_family_leaderboard)
     best_version = None
     valid_rows = [row for row in leaderboard_sorted if row.get("is_valid")]
     invalid_rows = [row for row in leaderboard_sorted if not row.get("is_valid")]
@@ -7359,6 +7571,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         nearest_candidate = {
             "strategy_class": closest_failed.get("strategy_class"),
             "strategy_file": closest_failed.get("strategy_file"),
+            "strategy_family": closest_failed.get("strategy_family", ""),
+            "family_score": closest_failed.get("family_score", 0.0),
             "why_nearest": _build_why_nearest(closest_failed, target_cfg, champion.get("meta", {}) or historical_best_mem),
             "train_metrics": {
                 "profit_total_abs": closest_failed.get("train_profit_abs"),
@@ -7399,6 +7613,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     for row in leaderboard_sorted:
         row["is_best"] = row["version"] == best_version
     write_json(run_dir / "leaderboard.json", {"items": leaderboard_sorted})
+    if explore_strategy_family:
+        write_json(run_dir / "strategy_family_leaderboard.json", strategy_family_leaderboard)
     _write_json_list_file(MEMORY_FILE, memory_items[-200:])
     _write_json_list_file(BLACKLIST_FILE, blacklist_items[-200:])
     _write_json_list_file(LESSONS_FILE, lessons_items[-200:])
@@ -7442,6 +7658,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         "final_official_champion": session_state.get("official_champion"),
         "final_in_memory_champion": session_state.get("in_memory_champion"),
         "nearest_candidate": nearest_candidate,
+        "strategy_family_leaderboard": strategy_family_leaderboard if explore_strategy_family else None,
+        "preferred_strategy_families_for_next_optimize": strategy_family_leaderboard.get("preferred_families_for_next_optimize", []) if explore_strategy_family else [],
         "session_best": session_best,
         "session_nearest_candidate": session_state.get("session_nearest_candidate"),
         "round_history": session_state.get("round_history", []),
@@ -7516,7 +7734,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         best_leaderboard_entry = next((r for r in leaderboard_sorted if r.get("version") == best_version), {}) or {}
         best_validation_metrics = best_leaderboard_entry.get("validation_metrics", []) or []
         cb_avg_profit, cb_avg_pf, cb_max_dd = _aggregate_validation_metrics(best_validation_metrics)
-        current_best_saved = {"strategy_class": best["class_name"], "strategy_file": str(best_strategy_file), "source_run_id": run_id, "version": best_version, "train_metrics": best["train_metrics"], "validation_metrics": best_validation_metrics, "avg_validation_metrics": {"profit_total_pct": cb_avg_profit, "profit_factor": cb_avg_pf, "max_drawdown_pct": cb_max_dd}, "score_breakdown": {}, "final_score": best["final_score"], "created_at": datetime.utcnow().isoformat(), "why_best": "本轮 final_score 最高。", "is_overfit": bool(best.get("is_overfit"))}
+        current_best_saved = {"strategy_class": best["class_name"], "strategy_file": str(best_strategy_file), "source_run_id": run_id, "version": best_version, "strategy_family": best_leaderboard_entry.get("strategy_family", ""), "family_score": best_leaderboard_entry.get("family_score", 0.0), "train_metrics": best["train_metrics"], "validation_metrics": best_validation_metrics, "avg_validation_metrics": {"profit_total_pct": cb_avg_profit, "profit_factor": cb_avg_pf, "max_drawdown_pct": cb_max_dd}, "score_breakdown": {}, "final_score": best["final_score"], "created_at": datetime.utcnow().isoformat(), "why_best": "本轮 final_score 最高。", "is_overfit": bool(best.get("is_overfit"))}
         write_json(BEST_STRATEGY_FILE, current_best_saved)
         session_state["official_champion"] = current_best_saved
         session_state["in_memory_champion"] = current_best_saved
@@ -7720,6 +7938,7 @@ def main() -> None:
     parser.add_argument("--pair-scan-strategy-file", default=None, help="manual 策略来源使用的策略文件路径")
     parser.add_argument("--pair-scan-strategy-name", default=None, help="manual 策略来源使用的策略类名")
     parser.add_argument("--base-strategy", default="MultiCoin_AI_Strategy")
+    parser.add_argument("--explore-strategy-family", action="store_true", default=False, help="启用策略结构探索模式：轮换 trend/pullback/breakout/mean-reversion/risk-filter 策略族，不默认覆盖 official best")
     parser.add_argument("--timeframe", default="5m")
     parser.add_argument("--timerange", default=None, help="训练回测区间，例如 20260501-20260525")
     parser.add_argument("--print-current-best", dest="print_current_best", action="store_true", default=True)
