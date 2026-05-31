@@ -532,3 +532,81 @@ def test_apply_recommended_pairs_override_falls_back_when_active_pairs_empty(tmp
     output = capsys.readouterr().out
     assert "警告：recommended_pairs.active_pairs 为空" in output
     assert "使用来源：默认自动读取" in output
+
+
+def test_auto_trade_count_target_uses_effective_recommended_pairs_and_caps() -> None:
+    goal = {
+        "target": {"min_trades": 38, "max_trades": 110},
+        "auto_trade_count_target": {
+            "enabled": True,
+            "min_trades_per_pair": 4,
+            "ideal_min_trades_per_pair": 5,
+            "ideal_max_trades_per_pair": 8,
+            "max_trades_per_pair": 10,
+            "min_total_trades_floor": 20,
+            "ideal_max_trades_cap": 75,
+            "max_trades_cap": 90,
+        },
+        "runtime_pair_selection_log": {
+            "source": "default_auto",
+            "active_pairs": ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT", "ADA/USDT"],
+            "effective_pairs": ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT", "ADA/USDT"],
+        },
+    }
+
+    optimizer.apply_auto_trade_count_target(goal)
+
+    assert goal["target"]["min_trades"] == 24
+    assert goal["target"]["ideal_min_trades"] == 30
+    assert goal["target"]["ideal_max_trades"] == 48
+    assert goal["target"]["max_trades"] == 60
+    assert goal["min_trades"] == 24
+    assert goal["auto_trade_count_target_runtime"] == {
+        "enabled": True,
+        "pair_count": 6,
+        "source": "recommended_pairs",
+        "computed_min_trades": 24,
+        "computed_ideal_min_trades": 30,
+        "computed_ideal_max_trades": 48,
+        "computed_max_trades": 60,
+    }
+
+
+def test_auto_trade_count_target_falls_back_to_original_config_pair_count() -> None:
+    goal = {
+        "target": {"min_trades": 38, "max_trades": 110},
+        "auto_trade_count_target": {"enabled": True, "min_total_trades_floor": 20},
+        "runtime_pair_selection_log": {
+            "source": "ignored",
+            "active_pairs": [],
+            "effective_pairs": ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT"],
+        },
+    }
+
+    optimizer.apply_auto_trade_count_target(goal)
+
+    assert goal["target"]["min_trades"] == 20
+    assert goal["target"]["ideal_min_trades"] == 25
+    assert goal["target"]["ideal_max_trades"] == 40
+    assert goal["target"]["max_trades"] == 50
+    assert goal["auto_trade_count_target_runtime"]["source"] == "原始 config"
+
+
+def test_auto_trade_count_target_keeps_fixed_values_when_pair_count_missing() -> None:
+    goal = {
+        "target": {"min_trades": 38, "ideal_min_trades": 45, "ideal_max_trades": 75, "max_trades": 110},
+        "auto_trade_count_target": {"enabled": True},
+        "runtime_pair_selection_log": {"source": "missing", "active_pairs": [], "effective_pairs": []},
+    }
+
+    optimizer.apply_auto_trade_count_target(goal)
+
+    assert goal["target"]["min_trades"] == 38
+    assert goal["target"]["ideal_min_trades"] == 45
+    assert goal["target"]["ideal_max_trades"] == 75
+    assert goal["target"]["max_trades"] == 110
+    assert goal["auto_trade_count_target_runtime"] == {
+        "enabled": True,
+        "pair_count": None,
+        "source": "取不到",
+    }
