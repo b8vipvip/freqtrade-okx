@@ -118,6 +118,8 @@ def _initial_family_stats() -> dict[str, dict[str, Any]]:
             "high_frequency_failure_count": 0,
             "severe_high_frequency_failure_count": 0,
             "runtime_failure_count": 0,
+            "backtest_result_missing_failure_count": 0,
+            "zip_mismatch_failure_count": 0,
             "zero_trade_failure_count": 0,
             "consecutive_high_frequency_failure": 0,
             "validation_high_frequency_failure_count": 0,
@@ -144,6 +146,8 @@ def _family_stats_default() -> dict[str, Any]:
         "high_frequency_failure_count": 0,
         "severe_high_frequency_failure_count": 0,
         "runtime_failure_count": 0,
+        "backtest_result_missing_failure_count": 0,
+        "zip_mismatch_failure_count": 0,
         "zero_trade_failure_count": 0,
         "consecutive_high_frequency_failure": 0,
         "validation_high_frequency_failure_count": 0,
@@ -312,13 +316,21 @@ def _update_strategy_family_stats(
             stats["weight"] = max(0.1, float(stats.get("weight", 1.0)) * multiplier)
 
     validation_all_loss = _validation_all_loss(validation_metrics or [])
-    if train_trades == 0:
-        stats["zero_trade_failure_count"] = int(stats.get("zero_trade_failure_count", 0)) + 1
     runtime_failure_markers = ("回测失败", "运行失败", "静态检查失败", "Python 语法检查失败", "KeyError", "Exception")
+    backtest_missing_markers = ("backtest_result_missing_or_zip_mismatch", "zip 不匹配", "zip 缺失", "回测结果解析失败")
+    is_backtest_result_failure = any(marker in str(failure_reason) for marker in backtest_missing_markers)
+    if train_trades == 0 and not is_backtest_result_failure:
+        stats["zero_trade_failure_count"] = int(stats.get("zero_trade_failure_count", 0)) + 1
     if any(marker in str(failure_reason) for marker in runtime_failure_markers):
         stats["runtime_failure_count"] = int(stats.get("runtime_failure_count", 0)) + 1
         stats["weight"] = max(0.05, float(stats.get("weight", 1.0)) * 0.35)
-    if train_trades == 0 or (train_trades < int(min_trades) and train_profit <= 0) or validation_all_loss:
+    if is_backtest_result_failure:
+        stats["backtest_result_missing_failure_count"] = int(stats.get("backtest_result_missing_failure_count", 0)) + 1
+        if "zip" in str(failure_reason):
+            stats["zip_mismatch_failure_count"] = int(stats.get("zip_mismatch_failure_count", 0)) + 1
+        stats["runtime_failure_count"] = int(stats.get("runtime_failure_count", 0)) + 1
+        stats["weight"] = max(0.05, float(stats.get("weight", 1.0)) * 0.25)
+    if (train_trades == 0 and not is_backtest_result_failure) or (train_trades < int(min_trades) and train_profit <= 0 and not is_backtest_result_failure) or validation_all_loss:
         stats["weight"] = max(0.05, float(stats.get("weight", 1.0)) * 0.55)
 
     if _is_low_trade_profitable_near_miss(train_metrics, min_trades):
@@ -609,8 +621,19 @@ def _build_strategy_family_leaderboard(rows: list[dict[str, Any]], family_stats:
         hf = sum(1 for r in family_rows if bool(r.get("high_frequency_failure"))) or _safe_int(stats.get("high_frequency_failure_count"))
         severe = sum(1 for r in family_rows if bool(r.get("severe_high_frequency_failure"))) or _safe_int(stats.get("severe_high_frequency_failure_count"))
         vhf = sum(1 for r in family_rows if bool(r.get("validation_high_frequency_failure"))) or _safe_int(stats.get("validation_high_frequency_failure_count"))
-        zero = sum(1 for r in family_rows if bool(r.get("zero_trade_failure")) or _safe_int(r.get("train_total_trades", r.get("total_trades"))) == 0) or _safe_int(stats.get("zero_trade_failure_count"))
-        runtime = sum(1 for r in family_rows if bool(r.get("runtime_error_failure")) or "回测失败" in _family_failure_reason(r)) or _safe_int(stats.get("runtime_failure_count"))
+        backtest_missing = sum(1 for r in family_rows if bool(r.get("backtest_result_missing_failure"))) or _safe_int(stats.get("backtest_result_missing_failure_count"))
+        zip_mismatch = sum(1 for r in family_rows if bool(r.get("zip_mismatch_failure"))) or _safe_int(stats.get("zip_mismatch_failure_count"))
+        zero = sum(
+            1
+            for r in family_rows
+            if bool(r.get("zero_trade_failure"))
+            or (
+                not bool(r.get("backtest_result_missing_failure"))
+                and not bool(r.get("zip_mismatch_failure"))
+                and _safe_int(r.get("train_total_trades", r.get("total_trades"))) == 0
+            )
+        ) or _safe_int(stats.get("zero_trade_failure_count"))
+        runtime = sum(1 for r in family_rows if bool(r.get("runtime_error_failure")) or bool(r.get("backtest_result_missing_failure")) or bool(r.get("zip_mismatch_failure")) or "回测失败" in _family_failure_reason(r)) or _safe_int(stats.get("runtime_failure_count"))
         scores = [_safe_float(r.get("final_score")) for r in family_rows if r.get("final_score") is not None]
         avg_score = sum(scores) / len(scores) if scores else 0.0
         best_row = max(family_rows, key=lambda r: _safe_float(r.get("final_score")), default=None)
@@ -622,6 +645,8 @@ def _build_strategy_family_leaderboard(rows: list[dict[str, Any]], family_stats:
         if zero: reason_parts.append("出现 zero_trade_failure")
         if severe: reason_parts.append("出现 severe_high_frequency_failure")
         if runtime: reason_parts.append("出现 runtime_error_failure")
+        if backtest_missing: reason_parts.append("出现 backtest_result_missing_failure")
+        if zip_mismatch: reason_parts.append("出现 zip_mismatch_failure")
         if stable_followup and not valid_rows: reason_parts.append("交易数相对稳定且无 runtime/high-frequency，可作为 follow-up 修复")
         if not reason_parts: reason_parts.append("按真实 round/summary 聚合")
         data = {
@@ -633,6 +658,8 @@ def _build_strategy_family_leaderboard(rows: list[dict[str, Any]], family_stats:
             "validation_high_frequency_failure_count": vhf,
             "zero_trade_failure_count": zero,
             "runtime_error_failure_count": runtime,
+            "backtest_result_missing_failure_count": backtest_missing,
+            "zip_mismatch_failure_count": zip_mismatch,
             "avg_final_score": avg_score,
             "best_version": str((best_row or {}).get("version") or ""),
             "worst_version": str((worst_row or {}).get("version") or ""),
@@ -2173,7 +2200,14 @@ def find_backtest_zip_for_strategy(
     return None, details
 
 
-def _log_backtest_zip_filter_failure(strategy_class: str, candidates: list[dict[str, Any]]) -> None:
+def _log_backtest_zip_filter_failure(
+    strategy_class: str,
+    candidates: list[dict[str, Any]],
+    *,
+    version: str = "",
+    expected_zip_dir: Path | str = "",
+    failure_reason: str = "backtest_result_missing_or_zip_mismatch",
+) -> None:
     print("回测结果 zip 筛选失败：")
     print(f"期望策略：{strategy_class}")
     print("候选 zip：")
@@ -2184,6 +2218,14 @@ def _log_backtest_zip_filter_failure(strategy_class: str, candidates: list[dict[
         suffix = f"，读取错误：{item.get('error')}" if item.get("error") else ""
         print(f"- {item.get('zip')}，实际策略：{actual}{suffix}")
     print("处理结果：当前区间回测结果无效，当前轮标记无效，继续下一轮。")
+    print("\n========== 回测结果缺失 ==========")
+    print(f"version: {version}")
+    print(f"strategy_name: {strategy_class}")
+    print(f"expected_zip_dir: {expected_zip_dir}")
+    print(f"expected_strategy: {strategy_class}")
+    print(f"candidate_zip_count: {len(candidates)}")
+    print(f"failure_reason: {failure_reason}")
+    print("处理：当前轮标记无效，继续下一轮")
 
 
 def _copy_backtest_zip_to_version(zip_path: Path, version_dir: Path, stage: str, timerange: str, label: str | None = None) -> Path:
@@ -4181,8 +4223,32 @@ def _new_round_defaults() -> dict[str, Any]:
         "strategy_family": "",
         "family_score": 0.0,
         "family_failure_reason": "",
+        "failure_reason": "",
+        "high_frequency_failure": False,
+        "severe_high_frequency_failure": False,
         "validation_high_frequency_failure": False,
         "validation_high_frequency_details": [],
+        "zero_trade_failure": False,
+        "low_trade_failure": False,
+        "runtime_error_failure": False,
+        "static_check_failure": False,
+        "backtest_result_missing_failure": False,
+        "zip_mismatch_failure": False,
+        "stoploss_to_roi_failure": False,
+        "near_miss": False,
+        "near_miss_type": "",
+        "train_total_trades": 0,
+        "train_profit_pct": 0,
+        "train_profit_abs": 0,
+        "train_profit_factor": 0,
+        "train_max_drawdown_pct": 0,
+        "validation_avg_profit_pct": 0,
+        "validation_worst_profit_pct": 0,
+        "validation_worst_profit_factor": 0,
+        "validation_max_trades": 0,
+        "stoploss_to_roi_ratio": 0,
+        "low_trade_profitable_near_miss": False,
+        "trailing_failure": False,
     }
 
 
@@ -4259,21 +4325,28 @@ def _minimal_round_summary(
         "strategy_family": state.get("strategy_family", ""),
         "family_score": state.get("family_score", 0.0),
         "family_failure_reason": state.get("family_failure_reason", failure_reason or state.get("invalid_reason", "")),
-        "train_total_trades": _safe_int((state.get("train_metrics") or {}).get("total_trades")),
-        "train_profit_pct": _safe_float((state.get("train_metrics") or {}).get("profit_total_pct")),
-        "train_profit_abs": _safe_float((state.get("train_metrics") or {}).get("profit_total_abs")),
-        "train_profit_factor": _safe_float((state.get("train_metrics") or {}).get("profit_factor")),
-        "validation_avg_profit_pct": _aggregate_validation_metrics(state.get("validation_metrics", []))[0],
-        "validation_worst_profit_pct": _validation_risk_metrics(state.get("train_metrics") or {}, state.get("validation_metrics", []), 0).get("validation_worst_profit_pct", 0.0),
-        "validation_worst_profit_factor": _validation_risk_metrics(state.get("train_metrics") or {}, state.get("validation_metrics", []), 0).get("validation_worst_profit_factor", 0.0),
+        "train_total_trades": _safe_int(state.get("train_total_trades", (state.get("train_metrics") or {}).get("total_trades"))),
+        "train_profit_pct": _safe_float(state.get("train_profit_pct", (state.get("train_metrics") or {}).get("profit_total_pct"))),
+        "train_profit_abs": _safe_float(state.get("train_profit_abs", (state.get("train_metrics") or {}).get("profit_total_abs"))),
+        "train_profit_factor": _safe_float(state.get("train_profit_factor", (state.get("train_metrics") or {}).get("profit_factor"))),
+        "validation_avg_profit_pct": _safe_float(state.get("validation_avg_profit_pct", _aggregate_validation_metrics(state.get("validation_metrics", []))[0])),
+        "validation_worst_profit_pct": _safe_float(state.get("validation_worst_profit_pct", _validation_risk_metrics(state.get("train_metrics") or {}, state.get("validation_metrics", []), 0).get("validation_worst_profit_pct", 0.0))),
+        "validation_worst_profit_factor": _safe_float(state.get("validation_worst_profit_factor", _validation_risk_metrics(state.get("train_metrics") or {}, state.get("validation_metrics", []), 0).get("validation_worst_profit_factor", 0.0))),
         "validation_worst_month": _validation_risk_metrics(state.get("train_metrics") or {}, state.get("validation_metrics", []), 0).get("validation_worst_month", ""),
+        "validation_max_trades": _safe_int(state.get("validation_max_trades", 0)),
+        "stoploss_to_roi_ratio": _safe_float(state.get("stoploss_to_roi_ratio", 0)),
         "high_frequency_failure": bool(state.get("high_frequency_failure", False)),
         "severe_high_frequency_failure": bool(state.get("severe_high_frequency_failure", False)),
         "validation_high_frequency_failure": bool(state.get("validation_high_frequency_failure", False)),
-        "zero_trade_failure": _safe_int((state.get("train_metrics") or {}).get("total_trades")) == 0,
-        "low_trade_failure": bool(state.get("trade_under_min", False)),
-        "runtime_error_failure": any((e or {}).get("error") == "backtest_failed" for e in state.get("backtest_errors", []) or []),
-        "stoploss_to_roi_failure": _safe_float((state.get("train_metrics") or {}).get("stoploss_to_roi_ratio")) > 1.2,
+        "zero_trade_failure": bool(state.get("zero_trade_failure", False)),
+        "low_trade_failure": bool(state.get("low_trade_failure", state.get("trade_under_min", False))),
+        "runtime_error_failure": bool(state.get("runtime_error_failure", any((e or {}).get("error") == "backtest_failed" for e in state.get("backtest_errors", []) or []))),
+        "static_check_failure": bool(state.get("static_check_failure", False)),
+        "backtest_result_missing_failure": bool(state.get("backtest_result_missing_failure", False)),
+        "zip_mismatch_failure": bool(state.get("zip_mismatch_failure", False)),
+        "stoploss_to_roi_failure": bool(state.get("stoploss_to_roi_failure", False)),
+        "near_miss": bool(state.get("near_miss", False)),
+        "near_miss_type": state.get("near_miss_type", ""),
     }
 
 
@@ -7437,10 +7510,30 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         family_score = 0.0
         family_failure_reason = ""
         high_frequency_failure = False
+        severe_high_frequency_failure = False
         validation_high_frequency_failure = False
         validation_high_frequency_details: list[dict[str, Any]] = []
         low_trade_profitable_near_miss = False
         trailing_failure = False
+        zero_trade_failure = False
+        low_trade_failure = False
+        runtime_error_failure = False
+        static_check_failure = False
+        backtest_result_missing_failure = False
+        zip_mismatch_failure = False
+        stoploss_to_roi_failure = False
+        near_miss = False
+        near_miss_type = ""
+        train_total_trades = 0
+        train_profit_pct = 0
+        train_profit_abs = 0
+        train_profit_factor = 0
+        train_max_drawdown_pct = 0
+        validation_avg_profit_pct = 0
+        validation_worst_profit_pct = 0
+        validation_worst_profit_factor = 0
+        validation_max_trades = 0
+        stoploss_to_roi_ratio = 0
         spec_hash = ""
         code_hash = ""
         features: dict[str, Any] = {}
@@ -7512,14 +7605,33 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 "random_sample_errors": random_sample_errors,
                 "strategy_family": selected_strategy_family,
                 "family_score": family_score,
-                "family_failure_reason": family_failure_reason,
-                "high_frequency_failure": high_frequency_failure,
-                "high_frequency_failure": high_frequency_failure,
-            "severe_high_frequency_failure": severe_high_frequency_failure,
-            "validation_high_frequency_failure": validation_high_frequency_failure,
-                "validation_high_frequency_details": validation_high_frequency_details,
-                "low_trade_profitable_near_miss": low_trade_profitable_near_miss,
-                "trailing_failure": trailing_failure,
+                "family_failure_reason": family_failure_reason or round_state.get("family_failure_reason", ""),
+                "failure_reason": failure_reason or round_state.get("failure_reason", ""),
+                "high_frequency_failure": bool(high_frequency_failure or round_state.get("high_frequency_failure", False)),
+                "severe_high_frequency_failure": bool(severe_high_frequency_failure or round_state.get("severe_high_frequency_failure", False)),
+                "validation_high_frequency_failure": bool(validation_high_frequency_failure or round_state.get("validation_high_frequency_failure", False)),
+                "validation_high_frequency_details": validation_high_frequency_details or round_state.get("validation_high_frequency_details", []),
+                "low_trade_profitable_near_miss": bool(low_trade_profitable_near_miss or round_state.get("low_trade_profitable_near_miss", False)),
+                "trailing_failure": bool(trailing_failure or round_state.get("trailing_failure", False)),
+                "zero_trade_failure": bool(zero_trade_failure or round_state.get("zero_trade_failure", False)),
+                "low_trade_failure": bool(low_trade_failure or trade_under_min or round_state.get("low_trade_failure", False)),
+                "runtime_error_failure": bool(runtime_error_failure or round_state.get("runtime_error_failure", False)),
+                "static_check_failure": bool(static_check_failure or round_state.get("static_check_failure", False)),
+                "backtest_result_missing_failure": bool(backtest_result_missing_failure or round_state.get("backtest_result_missing_failure", False)),
+                "zip_mismatch_failure": bool(zip_mismatch_failure or round_state.get("zip_mismatch_failure", False)),
+                "stoploss_to_roi_failure": bool(stoploss_to_roi_failure or round_state.get("stoploss_to_roi_failure", False)),
+                "near_miss": bool(near_miss or round_state.get("near_miss", False)),
+                "near_miss_type": near_miss_type or round_state.get("near_miss_type", ""),
+                "train_total_trades": _safe_int((train_metrics or {}).get("total_trades") if train_metrics else (train_total_trades or round_state.get("train_total_trades", 0))),
+                "train_profit_pct": _safe_float((train_metrics or {}).get("profit_total_pct") if train_metrics else (train_profit_pct or round_state.get("train_profit_pct", 0))),
+                "train_profit_abs": _safe_float((train_metrics or {}).get("profit_total_abs") if train_metrics else (train_profit_abs or round_state.get("train_profit_abs", 0))),
+                "train_profit_factor": _safe_float((train_metrics or {}).get("profit_factor") if train_metrics else (train_profit_factor or round_state.get("train_profit_factor", 0))),
+                "train_max_drawdown_pct": _safe_float(_max_drawdown_pct(train_metrics) if train_metrics else (train_max_drawdown_pct or round_state.get("train_max_drawdown_pct", 0))),
+                "validation_avg_profit_pct": _safe_float(_aggregate_validation_metrics(validation_metrics or [])[0] if validation_metrics else (validation_avg_profit_pct or round_state.get("validation_avg_profit_pct", 0))),
+                "validation_worst_profit_pct": _safe_float(validation_worst_profit_pct or round_state.get("validation_worst_profit_pct", 0)),
+                "validation_worst_profit_factor": _safe_float(validation_worst_profit_factor or round_state.get("validation_worst_profit_factor", 0)),
+                "validation_max_trades": _safe_int(validation_max_trades or round_state.get("validation_max_trades", 0)),
+                "stoploss_to_roi_ratio": _safe_float(stoploss_to_roi_ratio or round_state.get("stoploss_to_roi_ratio", 0)),
             })
 
         def write_iteration_summary(extra: dict[str, Any] | None = None) -> Path:
@@ -8147,6 +8259,15 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 print(pyc.stderr)
                 print(f"第 {i} 轮语法检查失败，跳过。")
                 invalid_reason = "Python 语法检查失败"
+                failure_reason = invalid_reason
+                runtime_error_failure = True
+                static_check_failure = True
+                round_state.update({
+                    "failure_reason": failure_reason,
+                    "runtime_error_failure": True,
+                    "static_check_failure": True,
+                    "invalid_reason": invalid_reason,
+                })
                 previous_failure_reason = invalid_reason
                 summary_path = write_iteration_summary()
                 update_session_state_after_round(summary_path=summary_path)
@@ -8184,6 +8305,15 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         if not static_ok:
             status["static_check_status"] = "失败"
             invalid_reason = static_reason or "静态检查失败"
+            failure_reason = invalid_reason
+            runtime_error_failure = True
+            static_check_failure = True
+            round_state.update({
+                "failure_reason": failure_reason,
+                "runtime_error_failure": True,
+                "static_check_failure": True,
+                "invalid_reason": invalid_reason,
+            })
             previous_failure_reason = invalid_reason
             card = {
                 "version": ver,
@@ -8272,6 +8402,13 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             print(train_cp.stderr)
             status["train_backtest_status"] = "失败"
             invalid_reason = "训练区间回测失败"
+            failure_reason = invalid_reason
+            runtime_error_failure = True
+            round_state.update({
+                "failure_reason": failure_reason,
+                "runtime_error_failure": True,
+                "invalid_reason": invalid_reason,
+            })
             _record_backtest_error(
                 backtest_errors,
                 stage="train",
@@ -8303,7 +8440,17 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         print("正在解析回测结果……")
         train_zip, train_candidates = find_backtest_zip_for_strategy(results_dir, class_name, train_start_ts, train_before_zips)
         if train_zip is None:
-            _log_backtest_zip_filter_failure(class_name, train_candidates)
+            failure_reason = "backtest_result_missing_or_zip_mismatch"
+            backtest_result_missing_failure = True
+            zip_mismatch_failure = bool(train_candidates)
+            runtime_error_failure = True
+            _log_backtest_zip_filter_failure(
+                class_name,
+                train_candidates,
+                version=ver,
+                expected_zip_dir=results_dir,
+                failure_reason=failure_reason,
+            )
             actual = []
             wrong_zip = ""
             if train_candidates:
@@ -8313,25 +8460,90 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             _print_backtest_mismatch_summary(backtest_errors)
             status["train_backtest_status"] = "解析失败"
             invalid_reason = "训练区间回测结果 zip 不匹配或缺失"
+            family_failure_reason = failure_reason
+            round_state.update({
+                "failure_reason": failure_reason,
+                "family_failure_reason": family_failure_reason,
+                "runtime_error_failure": True,
+                "backtest_result_missing_failure": True,
+                "zip_mismatch_failure": zip_mismatch_failure,
+                "invalid_reason": invalid_reason,
+            })
             summary_path = write_iteration_summary({"backtest_errors": backtest_errors})
             update_session_state_after_round(summary_path=summary_path)
             iteration_stats["invalid_strategy_count"] += 1
             status["is_valid"] = False
             status["invalid_reason"] = invalid_reason
+            if explore_strategy_family:
+                _update_strategy_family_stats(
+                    family_stats, selected_strategy_family, is_valid=False,
+                    train_metrics={"total_trades": 0}, validation_metrics=[],
+                    failure_reason=failure_reason, final_score=0.0,
+                    min_trades=min_trades, max_trades=max_trades,
+                    official_gate_reasons=[], validation_high_frequency_failure=False,
+                )
+                leaderboard.append(enrich_leaderboard_entry({
+                    "version": ver, "run_id": run_id, "strategy_class": class_name,
+                    "strategy_file": str(strategy_file), "strategy_family": selected_strategy_family,
+                    "is_valid": False, "is_best": False, "invalid_reason": invalid_reason,
+                    "failure_reason": failure_reason, "family_failure_reason": failure_reason,
+                    "final_score": 0.0, "total_trades": 0, "train_total_trades": 0,
+                    "runtime_error_failure": True,
+                    "backtest_result_missing_failure": True,
+                    "zip_mismatch_failure": zip_mismatch_failure,
+                }))
             flush_iteration_stats()
             continue
         train_zip_local = _copy_backtest_zip_to_version(train_zip, version_dir, "train", train.timerange)
         train_result, actual_train_keys = parse_backtest_from_zip(train_zip_local, class_name, strict=False)
         if train_result is None:
+            failure_reason = "backtest_result_missing_or_zip_mismatch"
+            backtest_result_missing_failure = True
+            zip_mismatch_failure = True
+            runtime_error_failure = True
+            _log_backtest_zip_filter_failure(
+                class_name,
+                [{"zip": str(train_zip), "actual_strategies": actual_train_keys, "error": "backtest_parse_failed"}],
+                version=ver,
+                expected_zip_dir=results_dir,
+                failure_reason=failure_reason,
+            )
             _record_backtest_error(backtest_errors, stage="train", timerange=train.timerange, expected_strategy=class_name, wrong_zip=str(train_zip), actual_strategies=actual_train_keys, error="backtest_parse_failed")
             _print_backtest_mismatch_summary(backtest_errors)
             status["train_backtest_status"] = "解析失败"
             invalid_reason = "训练区间回测结果解析失败"
+            family_failure_reason = failure_reason
+            round_state.update({
+                "failure_reason": failure_reason,
+                "family_failure_reason": family_failure_reason,
+                "runtime_error_failure": True,
+                "backtest_result_missing_failure": True,
+                "zip_mismatch_failure": True,
+                "invalid_reason": invalid_reason,
+            })
             summary_path = write_iteration_summary({"backtest_errors": backtest_errors})
             update_session_state_after_round(summary_path=summary_path)
             iteration_stats["invalid_strategy_count"] += 1
             status["is_valid"] = False
             status["invalid_reason"] = invalid_reason
+            if explore_strategy_family:
+                _update_strategy_family_stats(
+                    family_stats, selected_strategy_family, is_valid=False,
+                    train_metrics={"total_trades": 0}, validation_metrics=[],
+                    failure_reason=failure_reason, final_score=0.0,
+                    min_trades=min_trades, max_trades=max_trades,
+                    official_gate_reasons=[], validation_high_frequency_failure=False,
+                )
+                leaderboard.append(enrich_leaderboard_entry({
+                    "version": ver, "run_id": run_id, "strategy_class": class_name,
+                    "strategy_file": str(strategy_file), "strategy_family": selected_strategy_family,
+                    "is_valid": False, "is_best": False, "invalid_reason": invalid_reason,
+                    "failure_reason": failure_reason, "family_failure_reason": failure_reason,
+                    "final_score": 0.0, "total_trades": 0, "train_total_trades": 0,
+                    "runtime_error_failure": True,
+                    "backtest_result_missing_failure": True,
+                    "zip_mismatch_failure": True,
+                }))
             flush_iteration_stats()
             continue
         train_attribution = write_attribution_files(train_result, version_dir)

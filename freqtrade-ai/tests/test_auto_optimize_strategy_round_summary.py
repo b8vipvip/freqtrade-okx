@@ -610,3 +610,71 @@ def test_auto_trade_count_target_keeps_fixed_values_when_pair_count_missing() ->
         "pair_count": None,
         "source": "取不到",
     }
+
+
+def test_backtest_zip_missing_summary_flags_default_without_train_metrics() -> None:
+    state = optimizer._new_round_defaults()
+    state.update(
+        {
+            "failure_reason": "backtest_result_missing_or_zip_mismatch",
+            "invalid_reason": "训练区间回测结果 zip 不匹配或缺失",
+            "runtime_error_failure": True,
+            "backtest_result_missing_failure": True,
+            "zip_mismatch_failure": False,
+            "backtest_errors": [
+                {
+                    "stage": "train",
+                    "timerange": "20260501-20260531",
+                    "expected_strategy": "TestStrategy_v001",
+                    "wrong_zip": "",
+                    "actual_strategies": [],
+                    "error": "zip_missing",
+                }
+            ],
+        }
+    )
+
+    summary = optimizer._minimal_round_summary(
+        version="v001",
+        strategy_class="TestStrategy_v001",
+        strategy_file="user_data/strategies/TestStrategy_v001.py",
+        state=state,
+        mutation_type="unit_test",
+        failure_reason=state["failure_reason"],
+    )
+
+    assert summary["failure_reason"] == "backtest_result_missing_or_zip_mismatch"
+    assert summary["runtime_error_failure"] is True
+    assert summary["backtest_result_missing_failure"] is True
+    assert summary["zip_mismatch_failure"] is False
+    assert summary["zero_trade_failure"] is False
+    assert summary["train_total_trades"] == 0
+
+
+def test_strategy_family_leaderboard_counts_backtest_zip_failures() -> None:
+    rows = [
+        {
+            "version": "v001",
+            "strategy_family": "trend_following",
+            "is_valid": False,
+            "final_score": 0.0,
+            "failure_reason": "backtest_result_missing_or_zip_mismatch",
+            "family_failure_reason": "backtest_result_missing_or_zip_mismatch",
+            "runtime_error_failure": True,
+            "backtest_result_missing_failure": True,
+            "zip_mismatch_failure": True,
+            "train_total_trades": 0,
+        }
+    ]
+
+    leaderboard = optimizer._build_strategy_family_leaderboard(rows, optimizer._initial_family_stats())
+    family = leaderboard["families"]["trend_following"]
+
+    assert family["generated_count"] == 1
+    assert family["valid_count"] == 0
+    assert family["zero_trade_failure_count"] == 0
+    assert family["runtime_error_failure_count"] == 1
+    assert family["backtest_result_missing_failure_count"] == 1
+    assert family["zip_mismatch_failure_count"] == 1
+    assert "trend_following" in leaderboard["disabled_families_for_next_run"]
+    assert "trend_following" not in leaderboard["preferred_families_for_next_optimize"]
