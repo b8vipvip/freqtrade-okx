@@ -1644,11 +1644,7 @@ def parse_cli_y_or_n(value: str, option_name: str) -> str:
     return normalized
 
 
-def ask_confirm(question: str, default: bool = False, args: argparse.Namespace | None = None) -> bool:
-    if args is not None and getattr(args, "confirm", "n") == "n":
-        print(f"{question}：中途人工确认已关闭，自动选择不确认/跳过（--confirm n）。")
-        return False
-
+def ask_yes_no_interactive(question: str, default: bool = False) -> bool:
     d = "是" if default else "否"
     while True:
         v = input(f"{question}（默认：{d}，输入 y/n）：").strip()
@@ -1660,13 +1656,46 @@ def ask_confirm(question: str, default: bool = False, args: argparse.Namespace |
         print("输入无效，请输入 y 或 n。")
 
 
+def ask_confirm(question: str, default: bool = False, args: argparse.Namespace | None = None, confirm_kind: str = "per_iteration_confirm") -> bool:
+    if args is not None and getattr(args, "confirm", "n") == "n":
+        print(f"[{confirm_kind}] {question}：中途人工确认已关闭，自动选择不确认/跳过（--confirm n）。")
+        return False
+
+    print(f"[{confirm_kind}] 等待人工确认。")
+    return ask_yes_no_interactive(question, default)
+
+
+def ask_setup_wizard_final_confirm(args: argparse.Namespace) -> bool:
+    if bool(getattr(args, "assume_yes", False)):
+        print("[setup_wizard_final_confirm] 已通过 --assume-yes 自动确认开始执行。")
+        return True
+
+    start = getattr(args, "start", None)
+    if start == "y":
+        print("[setup_wizard_final_confirm] 已通过 --start y 自动确认开始执行。")
+        return True
+    if start == "n":
+        print("[setup_wizard_final_confirm] 已通过 --start n 自动取消开始执行。")
+        return False
+
+    print("[setup_wizard_final_confirm] 等待用户确认；--confirm 仅控制 per_iteration_confirm，不会自动取消最终启动。")
+    return ask_yes_no_interactive("是否开始自动优化", True)
+
+
 def print_interaction_config(args: argparse.Namespace) -> None:
     setup_label = "进入" if getattr(args, "setup", "n") == "y" and not getattr(args, "no_wizard", False) else "跳过"
     setup_reason = "--no-wizard" if getattr(args, "no_wizard", False) else f"--setup {getattr(args, 'setup', 'n')}"
     confirm_label = "开启" if getattr(args, "confirm", "n") == "y" else "关闭"
+    if bool(getattr(args, "assume_yes", False)):
+        start_label = "自动确认（--assume-yes）"
+    elif getattr(args, "start", None) in {"y", "n"}:
+        start_label = f"自动{'确认' if getattr(args, 'start', None) == 'y' else '取消'}（--start {getattr(args, 'start', None)}）"
+    else:
+        start_label = "向导末尾手动输入（默认）"
     print("\n========== 启动交互配置 ==========")
     print(f"交互式设置：{setup_label}（{setup_reason}）")
     print(f"中途人工确认：{confirm_label}（--confirm {getattr(args, 'confirm', 'n')}）")
+    print(f"向导最终启动确认：{start_label}")
 
 
 def ask_text(prompt: str, default: str) -> str:
@@ -1749,7 +1778,8 @@ def run_wizard(goal: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]
     runtime["config"] = ask_text("配置文件路径", str(runtime.get("config", args.config)))
     cfg_path = ROOT_DIR / runtime["config"]
     if not cfg_path.exists():
-        cont = ask_confirm(f"配置文件不存在：{runtime['config']}，是否继续", False, args)
+        print("[setup_wizard_config_confirm] 配置文件不存在，等待用户确认；--confirm 仅控制 per_iteration_confirm。")
+        cont = ask_yes_no_interactive(f"配置文件不存在：{runtime['config']}，是否继续", False)
         if not cont:
             raise RuntimeError("用户取消：配置文件不存在")
 
@@ -1847,7 +1877,7 @@ def run_wizard(goal: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]
     print(f"是否允许 exit_signal：{runtime.get('target', {}).get('prefer_exit_signal')}")
     print(f"当前基准：{runtime.get('baseline')}")
 
-    if not ask_confirm("是否开始自动优化", True, args):
+    if not ask_setup_wizard_final_confirm(args):
         raise RuntimeError("用户取消执行")
 
     return runtime
@@ -8660,6 +8690,8 @@ def main() -> None:
     parser.add_argument("--advisor-to-codegen-delay-seconds", type=float, default=float(os.getenv("ADVISOR_TO_CODEGEN_DELAY_SECONDS", "5")), help="策略顾问成功后到代码生成前额外等待秒数")
     parser.add_argument("--setup", type=lambda value: parse_cli_y_or_n(value, "--setup"), default="n", help="是否启动后直接进入交互式设置：y=进入，n=跳过；默认 n")
     parser.add_argument("--confirm", type=lambda value: parse_cli_y_or_n(value, "--confirm"), default="n", help="是否开启中途人工确认：y=询问，n=自动选择默认跳过；默认 n")
+    parser.add_argument("--start", type=lambda value: parse_cli_y_or_n(value, "--start"), default=None, help="仅控制 setup wizard 最终是否开始执行：y=自动开始，n=自动取消；默认在向导末尾手动询问")
+    parser.add_argument("--assume-yes", action="store_true", default=False, help="全自动确认 setup wizard 最终启动；不改变 --confirm 的中途人工确认设置")
     parser.add_argument("--no-wizard", action="store_true")
     parser.add_argument("--save-goal", action="store_true")
     parser.add_argument("--config", default="user_data/config.5coins.json")
