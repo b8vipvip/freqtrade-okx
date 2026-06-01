@@ -355,140 +355,119 @@ def _update_strategy_family_stats(
         stats["failure_reasons"] = reasons[-20:]
 
 
+
+def _detect_near_miss(row: dict[str, Any], target_cfg: dict[str, Any]) -> dict[str, Any]:
+    min_trades = _safe_int(target_cfg.get("min_trades", 20))
+    max_trades = _safe_int(target_cfg.get("max_trades", 60))
+    trades = _safe_int(row.get("train_total_trades", row.get("total_trades")))
+    train_profit = _safe_float(row.get("train_profit_pct"))
+    train_pf = _safe_float(row.get("train_profit_factor", row.get("profit_factor")))
+    validations = row.get("validation_metrics", []) or []
+    val_rows = [(v.get("metrics", {}) or {}) for v in validations if isinstance(v, dict)]
+    profitable_vals = sum(1 for m in val_rows if _safe_float(m.get("profit_total_pct")) > 0 or _safe_float(m.get("profit_factor")) > 1)
+    bad_vals = sum(1 for m in val_rows if _safe_float(m.get("profit_total_pct")) < -0.5)
+    failure = str(row.get("failure_reason") or row.get("invalid_reason") or "")
+    sl_roi = _safe_float(row.get("stoploss_to_roi_ratio"))
+    near_type = ""
+    failed_due_to: list[str] = []
+    mutation = ""
+    if min_trades <= trades <= max_trades and train_profit > -0.4 and train_pf >= 0.65 and profitable_vals >= 1 and ("stoploss" in failure or "worst_month" in failure or "validation_loss" in failure or sl_roi > 1.2):
+        near_type = "risk_control_near_miss"
+        failed_due_to = [x for x in ["stoploss_to_roi_ratio 高" if sl_roi > 1.2 else "", "worst_month/validation_loss" if ("worst_month" in failure or "validation_loss" in failure) else ""] if x]
+        mutation = "add_regime_filter / pair_specific_entry_threshold / tighten_bad_pair_entry"
+    elif train_profit > 0 and train_pf > 1 and trades < min_trades:
+        near_type = "low_trade_profitable_near_miss"
+        failed_due_to = ["训练交易数低于 min_trades"]
+        mutation = "widen_entry_controlled"
+    elif val_rows and bad_vals == 1 and (len(val_rows) - bad_vals) >= 1:
+        near_type = "validation_one_month_bad_near_miss"
+        failed_due_to = ["只有一个 worst_month 明显亏损"]
+        mutation = "add_worst_month_filter / avoid_choppy_market_filter"
+    if not near_type:
+        return {}
+    return {
+        "near_miss_type": near_type,
+        "failed_due_to": failed_due_to or [failure],
+        "recommended_followup_mutation": mutation,
+        "key_metrics": {
+            "train_total_trades": trades,
+            "train_profit_pct": train_profit,
+            "train_profit_factor": train_pf,
+            "validation_avg_profit_pct": _safe_float(row.get("validation_avg_profit_pct", row.get("avg_validation_profit_pct"))),
+            "validation_worst_profit_pct": _safe_float(row.get("validation_worst_profit_pct")),
+            "validation_worst_profit_factor": _safe_float(row.get("validation_worst_profit_factor")),
+            "stoploss_to_roi_ratio": sl_roi,
+        },
+    }
+
 def _build_strategy_family_leaderboard(rows: list[dict[str, Any]], family_stats: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
-    family_stats = family_stats or {}
+    families: dict[str, Any] = {}
     items: list[dict[str, Any]] = []
     for family in STRATEGY_FAMILIES:
-        stats = family_stats.get(family, {}) or {}
-        family_rows = [row for row in rows if _normalize_strategy_family(row.get("strategy_family")) == family]
-        valid_rows = [row for row in family_rows if row.get("is_valid")]
-        train_values = [_safe_float(row.get("train_profit_pct")) for row in family_rows if row.get("train_profit_pct") is not None]
-        validation_values = [_safe_float(row.get("avg_validation_profit_pct")) for row in family_rows if row.get("avg_validation_profit_pct") is not None]
-        final_scores = [_safe_float(row.get("final_score")) for row in family_rows if row.get("final_score") is not None]
-        if not final_scores and stats.get("final_scores"):
-            final_scores = [_safe_float(x) for x in (stats.get("final_scores") or [])]
-        best_row = max(family_rows, key=lambda row: _safe_float(row.get("family_score") if row.get("family_score") is not None else row.get("final_score")), default=None)
-        failure_counts: dict[str, int] = {}
-        for row in family_rows:
-            if row.get("is_valid"):
-                continue
-            reason = _family_failure_reason(row)
-            failure_counts[reason] = failure_counts.get(reason, 0) + 1
-        main_failures = sorted(failure_counts.items(), key=lambda item: item[1], reverse=True)[:5]
-        high_frequency_failure_count = int(stats.get("high_frequency_failure_count", 0)) or sum(1 for row in family_rows if bool(row.get("high_frequency_failure")) or bool(row.get("validation_high_frequency_failure")))
-        severe_high_frequency_failure_count = int(stats.get("severe_high_frequency_failure_count", 0)) or sum(1 for row in family_rows if bool(row.get("severe_high_frequency_failure")))
-        runtime_failure_count = int(stats.get("runtime_failure_count", 0)) or sum(1 for row in family_rows if any(marker in _family_failure_reason(row) for marker in ("回测失败", "运行失败", "静态检查失败", "Python 语法检查失败", "KeyError", "Exception")))
-        zero_trade_failure_count = int(stats.get("zero_trade_failure_count", 0)) or sum(1 for row in family_rows if _safe_int(row.get("total_trades")) == 0 or "无交易" in _family_failure_reason(row))
-        low_trade_near_miss_count = int(stats.get("low_trade_profitable_near_miss_count", 0)) or sum(1 for row in family_rows if bool(row.get("low_trade_profitable_near_miss")))
-        near_miss_count = int(stats.get("near_miss_count", 0)) or sum(1 for row in family_rows if bool(row.get("near_miss")) or bool(row.get("low_trade_profitable_near_miss")))
-        latest_row = family_rows[-1] if family_rows else {}
-        repair_followup = bool(family_rows) and severe_high_frequency_failure_count == 0 and runtime_failure_count == 0 and zero_trade_failure_count == 0 and _safe_float(validation_values[-1] if validation_values else 0.0) < 0
-        items.append({
-            "strategy_family": family,
-            "attempt_count": len(family_rows) or int(stats.get("generated", 0)),
-            "generated_count": len(family_rows) or int(stats.get("generated", 0)),
-            "valid_count": len(valid_rows) or int(stats.get("valid", 0)),
-            "near_miss_count": near_miss_count,
-            "high_frequency_failure_count": high_frequency_failure_count,
-            "severe_high_frequency_failure_count": severe_high_frequency_failure_count,
-            "runtime_failure_count": runtime_failure_count,
-            "zero_trade_failure_count": zero_trade_failure_count,
-            "validation_high_frequency_failure_count": int(stats.get("validation_high_frequency_failure_count", 0)) or sum(1 for row in family_rows if bool(row.get("validation_high_frequency_failure"))),
-            "consecutive_high_frequency_failure": int(stats.get("consecutive_high_frequency_failure", 0)),
-            "low_trade_profitable_near_miss_count": low_trade_near_miss_count,
-            "trailing_failure_count": int(stats.get("trailing_failure_count", 0)),
-            "average_final_score": (sum(final_scores) / len(final_scores)) if final_scores else 0.0,
-            "weight": float(stats.get("weight", 1.0)),
-            "blocked_for_rest_of_run": _is_family_blocked_by_high_frequency(stats, EXPLORE_STRATEGY_FAMILY_DEFAULTS),
-            "train_avg_profit_pct": (sum(train_values) / len(train_values)) if train_values else 0.0,
-            "validation_avg_profit_pct": (sum(validation_values) / len(validation_values)) if validation_values else 0.0,
-            "best_strategy": {
-                "version": best_row.get("version"),
-                "strategy_class": best_row.get("strategy_class"),
-                "strategy_file": best_row.get("strategy_file"),
-                "family_score": best_row.get("family_score"),
-                "final_score": best_row.get("final_score"),
-            } if best_row else None,
-            "main_failure_reasons": [{"reason": reason, "count": count} for reason, count in main_failures],
-            "last_low_trade_near_miss": stats.get("last_low_trade_near_miss"),
-            "repair_followup_candidate": repair_followup,
-            "latest_failure_reason": _family_failure_reason(latest_row) if latest_row else "",
-        })
-
-    recommended_details: list[dict[str, Any]] = []
-    eligible_items = []
-    for item in items:
-        if item.get("attempt_count", 0) <= 0 or item.get("blocked_for_rest_of_run"):
-            continue
-        blocked_reasons = []
-        if _safe_int(item.get("zero_trade_failure_count")) > 0:
-            blocked_reasons.append("本轮出现 0 交易")
-        if _safe_int(item.get("severe_high_frequency_failure_count")) > 0:
-            blocked_reasons.append("本轮出现 severe_high_frequency_failure")
-        if _safe_int(item.get("runtime_failure_count")) > 0:
-            blocked_reasons.append("本轮出现代码/回测运行失败")
-        if blocked_reasons:
-            item["recommendation_blocked_reasons"] = blocked_reasons
-            continue
-        eligible_items.append(item)
-
-    sorted_items = sorted(
-        eligible_items,
-        key=lambda item: (
-            1 if item.get("repair_followup_candidate") else 0,
-            _safe_int(item.get("low_trade_profitable_near_miss_count")),
-            -_safe_int(item.get("high_frequency_failure_count")),
-            _safe_float(((item.get("best_strategy") or {}).get("family_score"))),
-            _safe_float(item.get("average_final_score")),
-            _safe_float(item.get("validation_avg_profit_pct", 0.0)),
-        ),
-        reverse=True,
-    )
-    for item in sorted_items[:3]:
-        reason = "交易数稳定且无 0 交易/严重高频/运行时错误"
-        if item.get("repair_followup_candidate"):
-            reason += "；可作为修复型 follow-up family，重点修复验证亏损/固定止损亏损"
-        if _safe_int(item.get("low_trade_profitable_near_miss_count")) > 0:
-            reason += "；存在低交易数盈利 near-miss，可小幅放宽"
-        recommended_details.append({"strategy_family": item.get("strategy_family"), "reason": reason})
-    if len(recommended_details) < 3 and not any(item.get("strategy_family") == "low_volatility_mean_reversion" for item in recommended_details):
-        low_vol_item = next((item for item in items if item.get("strategy_family") == "low_volatility_mean_reversion"), None)
-        if low_vol_item and _safe_int(low_vol_item.get("attempt_count")) == 0:
-            recommended_details.append({
-                "strategy_family": "low_volatility_mean_reversion",
-                "reason": "尚未在本轮尝试；仅作为低权重备选，用于 volatility contraction / choppy market 过滤思路",
-            })
-    preferred = [str(item.get("strategy_family")) for item in recommended_details]
-    return {"created_at": datetime.utcnow().isoformat(), "items": items, "recommended_next_families": preferred, "recommended_followup_families": recommended_details, "preferred_families_for_next_optimize": preferred}
-
-
+        family_rows = [r for r in rows if _normalize_strategy_family(r.get("strategy_family")) == family]
+        stats = (family_stats or {}).get(family, {})
+        generated = len(family_rows) or _safe_int(stats.get("generated"))
+        valid_rows = [r for r in family_rows if bool(r.get("is_valid"))]
+        near_rows = [r for r in family_rows if bool(r.get("near_miss")) or bool(r.get("low_trade_profitable_near_miss")) or bool(r.get("near_miss_type"))]
+        hf = sum(1 for r in family_rows if bool(r.get("high_frequency_failure"))) or _safe_int(stats.get("high_frequency_failure_count"))
+        severe = sum(1 for r in family_rows if bool(r.get("severe_high_frequency_failure"))) or _safe_int(stats.get("severe_high_frequency_failure_count"))
+        vhf = sum(1 for r in family_rows if bool(r.get("validation_high_frequency_failure"))) or _safe_int(stats.get("validation_high_frequency_failure_count"))
+        zero = sum(1 for r in family_rows if bool(r.get("zero_trade_failure")) or _safe_int(r.get("train_total_trades", r.get("total_trades"))) == 0) or _safe_int(stats.get("zero_trade_failure_count"))
+        runtime = sum(1 for r in family_rows if bool(r.get("runtime_error_failure")) or "回测失败" in _family_failure_reason(r)) or _safe_int(stats.get("runtime_failure_count"))
+        scores = [_safe_float(r.get("final_score")) for r in family_rows if r.get("final_score") is not None]
+        avg_score = sum(scores) / len(scores) if scores else 0.0
+        best_row = max(family_rows, key=lambda r: _safe_float(r.get("final_score")), default=None)
+        worst_row = min(family_rows, key=lambda r: _safe_float(r.get("final_score")), default=None)
+        disabled = generated > 0 and (zero > 0 or severe > 0 or runtime > 0)
+        stable_followup = generated > 0 and not disabled and hf == 0 and runtime == 0
+        action = "disable_next_run" if disabled else ("follow_up_repair" if stable_followup and not valid_rows else ("prefer" if valid_rows else "observe"))
+        reason_parts = []
+        if zero: reason_parts.append("出现 zero_trade_failure")
+        if severe: reason_parts.append("出现 severe_high_frequency_failure")
+        if runtime: reason_parts.append("出现 runtime_error_failure")
+        if stable_followup and not valid_rows: reason_parts.append("交易数相对稳定且无 runtime/high-frequency，可作为 follow-up 修复")
+        if not reason_parts: reason_parts.append("按真实 round/summary 聚合")
+        data = {
+            "generated_count": generated,
+            "valid_count": len(valid_rows),
+            "near_miss_count": len(near_rows) or _safe_int(stats.get("near_miss_count")),
+            "high_frequency_failure_count": hf,
+            "severe_high_frequency_failure_count": severe,
+            "validation_high_frequency_failure_count": vhf,
+            "zero_trade_failure_count": zero,
+            "runtime_error_failure_count": runtime,
+            "avg_final_score": avg_score,
+            "best_version": str((best_row or {}).get("version") or ""),
+            "worst_version": str((worst_row or {}).get("version") or ""),
+            "recommended_action": action,
+            "recommendation_reason": "；".join(reason_parts),
+        }
+        families[family] = data
+        items.append({"strategy_family": family, "attempt_count": generated, "average_final_score": avg_score, **data})
+    eligible = [(fam, data) for fam, data in families.items() if data["generated_count"] > 0 and data["recommended_action"] in {"prefer", "follow_up_repair", "observe"}]
+    eligible = [(fam, data) for fam, data in eligible if not (data["zero_trade_failure_count"] or data["severe_high_frequency_failure_count"] or data["runtime_error_failure_count"])]
+    preferred = [fam for fam, _ in sorted(eligible, key=lambda kv: (_safe_int(kv[1]["valid_count"]), _safe_float(kv[1]["avg_final_score"])), reverse=True)[:3]]
+    disabled = [fam for fam, data in families.items() if data["generated_count"] > 0 and (data["zero_trade_failure_count"] or data["severe_high_frequency_failure_count"] or data["runtime_error_failure_count"])]
+    return {"created_at": datetime.utcnow().isoformat(), "families": families, "items": items, "preferred_families_for_next_optimize": preferred, "disabled_families_for_next_run": disabled, "recommended_next_families": preferred, "recommended_followup_families": [{"strategy_family": f, "reason": families[f]["recommendation_reason"]} for f in preferred]}
 
 def _print_strategy_family_leaderboard(leaderboard: dict[str, Any], path: Path) -> None:
     print("\n========== strategy_family_leaderboard ==========")
     print(f"strategy_family_leaderboard.json：{path}")
-    items = leaderboard.get("items", []) if isinstance(leaderboard, dict) else []
-    if not items:
+    print("family | generated | valid | near_miss | high_freq | zero_trade | runtime_error | avg_score | action | reason")
+    families = leaderboard.get("families", {}) if isinstance(leaderboard, dict) else {}
+    if not families:
         print("无 strategy_family 统计。")
-    for item in items:
+    for family, item in families.items():
         print(
-            f"- {item.get('strategy_family')}: "
-            f"尝试={item.get('attempt_count', 0)} / "
-            f"有效={item.get('valid_count', 0)} / "
-            f"near_miss={item.get('near_miss_count', 0)} / "
-            f"high_frequency_failure={item.get('high_frequency_failure_count', 0)} / "
-            f"severe_high_frequency_failure={item.get('severe_high_frequency_failure_count', 0)} / "
-            f"runtime_failure={item.get('runtime_failure_count', 0)} / "
-            f"zero_trade={item.get('zero_trade_failure_count', 0)} / "
-            f"low_trade_profitable_near_miss={item.get('low_trade_profitable_near_miss_count', 0)} / "
-            f"平均 final_score={_safe_float(item.get('average_final_score')):.4f} / "
-            f"本 run 禁选={'是' if item.get('blocked_for_rest_of_run') else '否'}"
+            f"{family} | {_safe_int(item.get('generated_count'))} | {_safe_int(item.get('valid_count'))} | "
+            f"{_safe_int(item.get('near_miss_count'))} | {_safe_int(item.get('high_frequency_failure_count'))} | "
+            f"{_safe_int(item.get('zero_trade_failure_count'))} | {_safe_int(item.get('runtime_error_failure_count'))} | "
+            f"{_safe_float(item.get('avg_final_score')):.4f} | {item.get('recommended_action', '')} | {item.get('recommendation_reason', '')}"
         )
-    recommended = leaderboard.get("recommended_next_families", []) if isinstance(leaderboard, dict) else []
+    recommended = leaderboard.get("preferred_families_for_next_optimize", []) if isinstance(leaderboard, dict) else []
+    disabled = leaderboard.get("disabled_families_for_next_run", []) if isinstance(leaderboard, dict) else []
     print("推荐后续 family：" + ("、".join(str(x) for x in recommended) if recommended else "无"))
-    details = leaderboard.get("recommended_followup_families", []) if isinstance(leaderboard, dict) else []
-    for item in details:
-        if isinstance(item, dict):
-            print(f"  - {item.get('strategy_family')}: {item.get('reason')}")
+    print("下轮禁用 family：" + ("、".join(str(x) for x in disabled) if disabled else "无"))
 
 ITERATION_STATS_FILE_NAME = "iteration_stats.json"
 MEMORY_EXAMPLE_FILE = ROOT_DIR / "ai_tools" / "strategy_memory.example.json"
@@ -1460,7 +1439,7 @@ def _merge_auto_prompt_guidance(runtime_goal: dict[str, Any]) -> None:
 def _apply_built_in_next_round_prompt_guidance(runtime_goal: dict[str, Any]) -> None:
     """Inject non-destructive built-in codegen safety rules; advisor rules from goal stay intact."""
     codegen_rules = [
-        "Bollinger 安全规则：禁止直接使用 bollinger['middle']；qtpylib.bollinger_bands 只允许读取 upper/lower。",
+        "Bollinger 安全规则：禁止直接使用 bollinger['middle']/bollinger['mid']；qtpylib.bollinger_bands 只允许读取 upper/lower；bb_middle 用 upper/lower 计算。",
         "bb_middle 必须用 dataframe['bb_middle'] = (dataframe['bb_upper'] + dataframe['bb_lower']) / 2 计算。",
         "下一轮实现应以 trend_following + market regime/choppy/volatility contraction filter 为主，不要用 trailing 直接替代 fixed stoploss。",
     ]
@@ -2187,6 +2166,190 @@ def parse_exit_reason_details(result: dict[str, Any]) -> dict[str, Any]:
     print(f"[debug] trades 数量: {len(trades) if isinstance(trades, list) else 0}")
     return details
 
+
+
+def _trade_field(trade: dict[str, Any], *names: str, default: Any = None) -> Any:
+    for name in names:
+        if name in trade and trade.get(name) is not None:
+            return trade.get(name)
+    return default
+
+
+def _trade_month(trade: dict[str, Any]) -> str:
+    raw = _trade_field(trade, "close_date", "close_date_utc", "open_date", "open_date_utc", default="")
+    text = str(raw or "")
+    m = re.search(r"(20\d{2})[-/]?(\d{2})", text)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+    return "unknown"
+
+
+def _exit_bucket(exit_reason: Any) -> str:
+    reason = str(exit_reason or "unknown").strip().lower() or "unknown"
+    if reason in {"roi"} or "roi" in reason:
+        return "roi"
+    if reason in {"stop_loss", "stoploss", "stop_loss_on_exchange"} or ("stop" in reason and "trail" not in reason):
+        return "stoploss"
+    if "trailing" in reason:
+        return "trailing"
+    if "force_exit" in reason or "force" in reason:
+        return "force_exit"
+    return reason
+
+
+def _empty_attr_bucket() -> dict[str, Any]:
+    return {
+        "total_trades": 0,
+        "profit_abs": 0.0,
+        "profit_pct": 0.0,
+        "roi_profit_abs": 0.0,
+        "stoploss_profit_abs": 0.0,
+        "trailing_profit_abs": 0.0,
+        "force_exit_profit_abs": 0.0,
+        "wins": 0,
+        "losses": 0,
+        "gross_profit_abs": 0.0,
+        "gross_loss_abs": 0.0,
+        "winrate": 0.0,
+        "profit_factor": 0.0,
+        "stoploss_to_roi_ratio": 0.0,
+    }
+
+
+def _add_trade_to_bucket(bucket: dict[str, Any], trade: dict[str, Any]) -> None:
+    profit_abs = _safe_float(_trade_field(trade, "profit_abs", "profit_total_abs", default=0.0))
+    profit_ratio = _safe_float(_trade_field(trade, "profit_ratio", "profit_pct", "profit_percent", default=0.0))
+    if abs(profit_ratio) > 1.0:
+        profit_ratio = profit_ratio / 100.0
+    bucket["total_trades"] = _safe_int(bucket.get("total_trades")) + 1
+    bucket["profit_abs"] = _safe_float(bucket.get("profit_abs")) + profit_abs
+    bucket["profit_pct"] = _safe_float(bucket.get("profit_pct")) + profit_ratio * 100.0
+    if profit_abs >= 0:
+        bucket["wins"] = _safe_int(bucket.get("wins")) + 1
+        bucket["gross_profit_abs"] = _safe_float(bucket.get("gross_profit_abs")) + profit_abs
+    else:
+        bucket["losses"] = _safe_int(bucket.get("losses")) + 1
+        bucket["gross_loss_abs"] = _safe_float(bucket.get("gross_loss_abs")) + abs(profit_abs)
+    b = _exit_bucket(_trade_field(trade, "exit_reason", "exit_tag", default="unknown"))
+    if b == "roi":
+        bucket["roi_profit_abs"] = _safe_float(bucket.get("roi_profit_abs")) + profit_abs
+    elif b == "stoploss":
+        bucket["stoploss_profit_abs"] = _safe_float(bucket.get("stoploss_profit_abs")) + profit_abs
+    elif b == "trailing":
+        bucket["trailing_profit_abs"] = _safe_float(bucket.get("trailing_profit_abs")) + profit_abs
+    elif b == "force_exit":
+        bucket["force_exit_profit_abs"] = _safe_float(bucket.get("force_exit_profit_abs")) + profit_abs
+
+
+def _finalize_attr_bucket(bucket: dict[str, Any]) -> dict[str, Any]:
+    trades = _safe_int(bucket.get("total_trades"))
+    wins = _safe_int(bucket.get("wins"))
+    gp = _safe_float(bucket.get("gross_profit_abs"))
+    gl = _safe_float(bucket.get("gross_loss_abs"))
+    roi = max(0.0, _safe_float(bucket.get("roi_profit_abs")))
+    sl = abs(_safe_float(bucket.get("stoploss_profit_abs")))
+    bucket["winrate"] = wins / trades if trades else 0.0
+    bucket["profit_factor"] = (gp / gl) if gl > 0 else (999.0 if gp > 0 else 0.0)
+    bucket["stoploss_to_roi_ratio"] = (sl / roi) if roi > 0 else (999.0 if sl > 0 else 0.0)
+    for k, v in list(bucket.items()):
+        if isinstance(v, float):
+            bucket[k] = round(v, 8)
+    return bucket
+
+
+def build_trade_attributions(result: dict[str, Any]) -> dict[str, Any]:
+    trades_raw = result.get("trades") if isinstance(result, dict) else []
+    trades = [t for t in trades_raw if isinstance(t, dict)] if isinstance(trades_raw, list) else []
+    pairs: dict[str, Any] = {}
+    exits: dict[str, Any] = {}
+    tags: dict[str, Any] = {}
+    months: dict[str, Any] = {}
+    normalized_trades: list[dict[str, Any]] = []
+    for t in trades:
+        pair = str(_trade_field(t, "pair", default="unknown") or "unknown")
+        month = _trade_month(t)
+        tag = str(_trade_field(t, "entry_tag", "enter_tag", default="unknown") or "unknown") or "unknown"
+        reason = str(_trade_field(t, "exit_reason", "exit_tag", default="unknown") or "unknown") or "unknown"
+        nt = {
+            "pair": pair,
+            "open_date": _trade_field(t, "open_date", "open_date_utc", default=""),
+            "close_date": _trade_field(t, "close_date", "close_date_utc", default=""),
+            "month": month,
+            "entry_tag": tag,
+            "exit_reason": reason,
+            "profit_abs": _safe_float(_trade_field(t, "profit_abs", "profit_total_abs", default=0.0)),
+            "profit_ratio": _safe_float(_trade_field(t, "profit_ratio", "profit_pct", "profit_percent", default=0.0)),
+            "trade_duration": _safe_float(_trade_field(t, "trade_duration", "duration", default=0.0)),
+            "stake_amount": _safe_float(_trade_field(t, "stake_amount", "stake_amount_filled", default=0.0)),
+        }
+        normalized_trades.append(nt)
+        p_bucket = pairs.setdefault(pair, {**_empty_attr_bucket(), "months": {}, "exit_reasons": {}, "entry_tags": {}})
+        _add_trade_to_bucket(p_bucket, nt)
+        for container, key in ((p_bucket["months"], month), (p_bucket["exit_reasons"], reason), (p_bucket["entry_tags"], tag), (months, month), (exits, reason), (tags, tag)):
+            _add_trade_to_bucket(container.setdefault(key, _empty_attr_bucket()), nt)
+    for p_bucket in pairs.values():
+        for sub in ("months", "exit_reasons", "entry_tags"):
+            for b in p_bucket[sub].values():
+                _finalize_attr_bucket(b)
+        _finalize_attr_bucket(p_bucket)
+    for container in (months, exits, tags):
+        for b in container.values():
+            _finalize_attr_bucket(b)
+    worst_pairs_by_stoploss = sorted(
+        [{"pair": k, "stoploss_profit_abs": v.get("stoploss_profit_abs", 0.0), "roi_profit_abs": v.get("roi_profit_abs", 0.0), "stoploss_to_roi_ratio": v.get("stoploss_to_roi_ratio", 0.0)} for k, v in pairs.items()],
+        key=lambda x: _safe_float(x.get("stoploss_profit_abs")),
+    )[:10]
+    worst_pairs_by_total_loss = sorted(
+        [{"pair": k, "profit_abs": v.get("profit_abs", 0.0), "total_trades": v.get("total_trades", 0)} for k, v in pairs.items()],
+        key=lambda x: _safe_float(x.get("profit_abs")),
+    )[:10]
+    best_pairs_by_profit = sorted(worst_pairs_by_total_loss, key=lambda x: _safe_float(x.get("profit_abs")), reverse=True)[:10]
+    worst_months = sorted([{"month": k, "profit_abs": v.get("profit_abs", 0.0), "total_trades": v.get("total_trades", 0)} for k, v in months.items()], key=lambda x: _safe_float(x.get("profit_abs")))[:10]
+    return {
+        "pairs": pairs,
+        "worst_pairs_by_stoploss": worst_pairs_by_stoploss,
+        "worst_pairs_by_total_loss": worst_pairs_by_total_loss,
+        "best_pairs_by_profit": best_pairs_by_profit,
+        "worst_months": worst_months,
+        "summary": {
+            "total_trades": len(normalized_trades),
+            "roi_profit_abs": round(sum(_safe_float(v.get("roi_profit_abs")) for v in pairs.values()), 8),
+            "stoploss_profit_abs": round(sum(_safe_float(v.get("stoploss_profit_abs")) for v in pairs.values()), 8),
+            "trailing_profit_abs": round(sum(_safe_float(v.get("trailing_profit_abs")) for v in pairs.values()), 8),
+            "force_exit_profit_abs": round(sum(_safe_float(v.get("force_exit_profit_abs")) for v in pairs.values()), 8),
+        },
+        "trades": normalized_trades,
+        "exit_reasons": exits,
+        "entry_tags": tags,
+        "months": months,
+    }
+
+
+def write_attribution_files(result: dict[str, Any], out_dir: Path) -> dict[str, Any]:
+    attr = build_trade_attributions(result)
+    write_json(out_dir / "pair_attribution.json", {k: attr[k] for k in ["pairs", "worst_pairs_by_stoploss", "worst_pairs_by_total_loss", "best_pairs_by_profit", "worst_months", "summary"]})
+    write_json(out_dir / "exit_reason_attribution.json", {"exit_reasons": attr.get("exit_reasons", {}), "summary": attr.get("summary", {})})
+    write_json(out_dir / "tag_attribution.json", {"entry_tags": attr.get("entry_tags", {}), "summary": attr.get("summary", {})})
+    return attr
+
+
+def _print_pair_attribution_table(attr: dict[str, Any]) -> None:
+    print("\n========== Pair 归因 ==========")
+    print("pair | trades | profit | PF | ROI | fixed SL | trailing | stoploss_to_roi_ratio")
+    pairs = attr.get("pairs", {}) if isinstance(attr, dict) else {}
+    for pair, row in sorted(pairs.items(), key=lambda kv: _safe_float(kv[1].get("profit_abs"))):
+        print(f"{pair} | {_safe_int(row.get('total_trades'))} | {_safe_float(row.get('profit_abs')):.4f} | {_safe_float(row.get('profit_factor')):.4f} | {_safe_float(row.get('roi_profit_abs')):.4f} | {_safe_float(row.get('stoploss_profit_abs')):.4f} | {_safe_float(row.get('trailing_profit_abs')):.4f} | {_safe_float(row.get('stoploss_to_roi_ratio')):.4f}")
+
+
+def _summarize_pair_attr_for_summary(attr: dict[str, Any]) -> dict[str, Any]:
+    pairs = attr.get("pairs", {}) if isinstance(attr, dict) else {}
+    return {
+        "worst_pairs_by_stoploss": attr.get("worst_pairs_by_stoploss", []),
+        "worst_pairs_by_total_loss": attr.get("worst_pairs_by_total_loss", []),
+        "best_pairs_by_profit": attr.get("best_pairs_by_profit", []),
+        "stoploss_to_roi_ratio_by_pair": {p: (r or {}).get("stoploss_to_roi_ratio", 0.0) for p, r in pairs.items()},
+        "worst_month_by_pair": {p: (sorted(((r or {}).get("months") or {}).items(), key=lambda kv: _safe_float(kv[1].get("profit_abs")))[0][0] if ((r or {}).get("months") or {}) else "") for p, r in pairs.items()},
+    }
 
 
 
@@ -3651,6 +3814,21 @@ def _minimal_round_summary(
         "strategy_family": state.get("strategy_family", ""),
         "family_score": state.get("family_score", 0.0),
         "family_failure_reason": state.get("family_failure_reason", failure_reason or state.get("invalid_reason", "")),
+        "train_total_trades": _safe_int((state.get("train_metrics") or {}).get("total_trades")),
+        "train_profit_pct": _safe_float((state.get("train_metrics") or {}).get("profit_total_pct")),
+        "train_profit_abs": _safe_float((state.get("train_metrics") or {}).get("profit_total_abs")),
+        "train_profit_factor": _safe_float((state.get("train_metrics") or {}).get("profit_factor")),
+        "validation_avg_profit_pct": _aggregate_validation_metrics(state.get("validation_metrics", []))[0],
+        "validation_worst_profit_pct": _validation_risk_metrics(state.get("train_metrics") or {}, state.get("validation_metrics", []), 0).get("validation_worst_profit_pct", 0.0),
+        "validation_worst_profit_factor": _validation_risk_metrics(state.get("train_metrics") or {}, state.get("validation_metrics", []), 0).get("validation_worst_profit_factor", 0.0),
+        "validation_worst_month": _validation_risk_metrics(state.get("train_metrics") or {}, state.get("validation_metrics", []), 0).get("validation_worst_month", ""),
+        "high_frequency_failure": bool(state.get("high_frequency_failure", False)),
+        "severe_high_frequency_failure": bool(state.get("severe_high_frequency_failure", False)),
+        "validation_high_frequency_failure": bool(state.get("validation_high_frequency_failure", False)),
+        "zero_trade_failure": _safe_int((state.get("train_metrics") or {}).get("total_trades")) == 0,
+        "low_trade_failure": bool(state.get("trade_under_min", False)),
+        "runtime_error_failure": any((e or {}).get("error") == "backtest_failed" for e in state.get("backtest_errors", []) or []),
+        "stoploss_to_roi_failure": _safe_float((state.get("train_metrics") or {}).get("stoploss_to_roi_ratio")) > 1.2,
     }
 
 
@@ -4471,10 +4649,10 @@ def _check_bollinger_static(tree: ast.AST) -> tuple[bool, str | None]:
                 if isinstance(key, str) and key not in allowed_fields:
                     return False, (
                         "静态检查失败：qtpylib.bollinger_bands 字段访问不在白名单 upper/lower；"
-                        "禁止 bollinger['middle']，bb_middle 必须用 (bb_upper + bb_lower) / 2 计算"
+                        "禁止 bollinger['middle']/bollinger['mid']，bb_middle 必须用 (bb_upper + bb_lower) / 2 计算"
                     )
-    if re.search(r"bollinger\s*\[\s*['\"]middle['\"]\s*\]", ast.unparse(tree)):
-        return False, "静态检查失败：禁止直接使用 bollinger['middle']；请用 (bb_upper + bb_lower) / 2 计算 bb_middle"
+    if re.search(r"bollinger\s*\[\s*['\"](?:middle|mid)['\"]\s*\]", ast.unparse(tree)):
+        return False, "静态检查失败：禁止直接使用 bollinger['middle']/bollinger['mid']；请用 (bb_upper + bb_lower) / 2 计算 bb_middle"
     return True, None
 
 def check_entry_long_static(strategy_file: Path) -> tuple[bool, str | None]:
@@ -4619,6 +4797,9 @@ def _extract_metrics(result: dict[str, Any]) -> dict[str, Any]:
     exit_reason_details = parse_exit_reason_details(result)
     if not exit_reason_details.get("parsed", False):
         print("无法解析 exit reason 明细。")
+    roi_abs = max(0.0, _safe_float(exit_reason_details.get("roi_profit_abs")))
+    sl_abs = abs(_safe_float(exit_reason_details.get("stop_loss_profit_abs")))
+    stoploss_to_roi_ratio = sl_abs / roi_abs if roi_abs > 0 else (999.0 if sl_abs > 0 else 0.0)
     return {
         "total_trades": total_trades,
         "profit_total_abs": profit_total_abs,
@@ -4629,6 +4810,9 @@ def _extract_metrics(result: dict[str, Any]) -> dict[str, Any]:
         "max_drawdown_pct": max_drawdown_pct,
         "winrate": float(result.get("winrate", 0.0) or 0.0),
         **exit_reason_details,
+        "stoploss_profit_abs": exit_reason_details.get("stop_loss_profit_abs", 0.0),
+        "trailing_profit_abs": exit_reason_details.get("trailing_stop_loss_profit_abs", 0.0),
+        "stoploss_to_roi_ratio": stoploss_to_roi_ratio,
         "pairs": result.get("results_per_pair", []),
         "entry_tags": result.get("results_per_enter_tag", []),
     }
@@ -5538,42 +5722,105 @@ def run_pair_scan(runtime_goal: dict[str, Any], args: argparse.Namespace, run_di
     print(f"pair_leaderboard.json：{run_dir / 'pair_leaderboard.json'}")
     print(f"recommended_pairs.json：{run_dir / 'recommended_pairs.json'}")
 
+
+def _validation_risk_metrics(train_metrics: dict[str, Any], validation_metrics: list[dict[str, Any]], max_trades: int) -> dict[str, Any]:
+    rows = []
+    for item in validation_metrics or []:
+        m = item.get("metrics", {}) if isinstance(item, dict) else {}
+        label = str(item.get("period") or item.get("timerange") or "validation") if isinstance(item, dict) else "validation"
+        rows.append({
+            "label": label,
+            "month": str(item.get("period") or item.get("timerange") or label) if isinstance(item, dict) else label,
+            "profit_pct": _safe_float(m.get("profit_total_pct")),
+            "profit_factor": _safe_float(m.get("profit_factor")),
+            "total_trades": _safe_int(m.get("total_trades")),
+        })
+    profits = [r["profit_pct"] for r in rows]
+    pfs = [r["profit_factor"] for r in rows]
+    trades = [r["total_trades"] for r in rows]
+    worst = min(rows, key=lambda r: r["profit_pct"], default={"month": "", "profit_pct": 0.0, "profit_factor": 0.0})
+    train_trades = _safe_int((train_metrics or {}).get("total_trades"))
+    validation_max_trades = max(trades, default=0)
+    ratio_to_train = validation_max_trades / train_trades if train_trades > 0 else 0.0
+    roi_abs = max(0.0, _safe_float((train_metrics or {}).get("roi_profit_abs")))
+    sl_abs = abs(_safe_float((train_metrics or {}).get("stop_loss_profit_abs", (train_metrics or {}).get("stoploss_profit_abs", 0.0))))
+    sl_roi_ratio = sl_abs / roi_abs if roi_abs > 0 else (999.0 if sl_abs > 0 else 0.0)
+    return {
+        "validation_avg_profit_pct": sum(profits) / len(profits) if profits else 0.0,
+        "validation_worst_profit_pct": min(profits) if profits else 0.0,
+        "validation_worst_profit_factor": min(pfs) if pfs else 0.0,
+        "validation_worst_month": worst.get("month", ""),
+        "validation_max_trades": validation_max_trades,
+        "validation_trade_count_ratio_to_train": ratio_to_train,
+        "stoploss_to_roi_ratio": sl_roi_ratio,
+        "validation_rows": rows,
+    }
+
+
+def _print_validation_risk_check(risk: dict[str, Any], allow_official_best: bool) -> None:
+    print("\n========== 验证期风险检查 ==========")
+    print(f"worst_month: {risk.get('validation_worst_month', '')}")
+    print(f"worst_month_profit_pct: {_safe_float(risk.get('validation_worst_profit_pct')):.4f}")
+    print(f"worst_month_pf: {_safe_float(risk.get('validation_worst_profit_factor')):.4f}")
+    print(f"validation_high_frequency_failure: {'是' if risk.get('validation_high_frequency_failure') else '否'}")
+    print(f"stoploss_to_roi_ratio: {_safe_float(risk.get('stoploss_to_roi_ratio')):.4f}")
+    print(f"是否允许成为 official best: {'是' if allow_official_best else '否'}")
+
 def _compute_final_score(train_score: float, validation_score: float, train_metrics: dict[str, Any], validation_metrics: list[dict[str, Any]], target_cfg: dict[str, Any]) -> tuple[float, dict[str, Any]]:
     max_dd_target = _safe_float(target_cfg.get("max_drawdown_pct", 3.0))
     max_trades = _safe_int(target_cfg.get("max_trades", 80))
     worst_val_score = min((_score(v["metrics"], PeriodDef(v["period"], v["timerange"], 1.0, "validation")) for v in validation_metrics), default=0.0)
+    risk = _validation_risk_metrics(train_metrics, validation_metrics, max_trades)
     penalty = 0.0
     penalty_reasons: list[str] = []
+    train_trades = _safe_int(train_metrics.get("total_trades"))
     for item in validation_metrics:
         m = item.get("metrics", {}) or {}
-        if _safe_float(m.get("profit_total_pct")) < -2.5:
+        period = item.get("period") or item.get("timerange") or "validation"
+        profit_pct = _safe_float(m.get("profit_total_pct"))
+        pf = _safe_float(m.get("profit_factor"))
+        if profit_pct < -0.5:
+            penalty += 60.0
+            penalty_reasons.append(f"worst_month/validation_loss: {period} profit_total_pct<{ -0.5 }%")
+        if profit_pct < -2.5:
             penalty += 40.0
-            penalty_reasons.append(f"{item.get('period')} profit_total_pct<-2.5%")
-        if _safe_float(m.get("profit_factor")) < 0.45:
+            penalty_reasons.append(f"worst_month/validation_loss: {period} profit_total_pct<-2.5%")
+        if pf < 0.7:
+            penalty += 55.0
+            penalty_reasons.append(f"worst_month: {period} PF<0.7")
+        if pf < 0.45:
             penalty += 30.0
-            penalty_reasons.append(f"{item.get('period')} PF<0.45")
+            penalty_reasons.append(f"{period} PF<0.45")
         if max_dd_target > 0 and _safe_float(m.get("max_drawdown_pct")) > max_dd_target * 0.9:
             penalty += 12.0
-            penalty_reasons.append(f"{item.get('period')} DD接近上限")
+            penalty_reasons.append(f"{period} DD接近上限")
         trades = _safe_int(m.get("total_trades"))
         if trades > max_trades:
             penalty += 16.0
-            penalty_reasons.append(f"{item.get('period')} trades>{max_trades}")
-        train_trades = _safe_int(train_metrics.get("total_trades"))
+            penalty_reasons.append(f"{period} trades>{max_trades}")
         if trades > int(max_trades * 1.5):
-            penalty += 80.0
-            penalty_reasons.append(f"validation_high_frequency_failure: {item.get('period')} trades>{int(max_trades * 1.5)}(max_trades*1.5)")
+            penalty += 200.0
+            penalty_reasons.append(f"validation_high_frequency_failure: {period} trades>{int(max_trades * 1.5)}(max_trades*1.5)")
         if train_trades > 0 and trades > int(train_trades * 2.0):
             penalty += 80.0
-            penalty_reasons.append(f"validation_high_frequency_failure: {item.get('period')} trades>{int(train_trades * 2.0)}(train_total_trades*2.0)")
+            penalty_reasons.append(f"validation_high_frequency_failure: {period} trades>{int(train_trades * 2.0)}(train_total_trades*2.0)")
     roi_abs = max(0.0, _safe_float(train_metrics.get("roi_profit_abs")))
-    stop_loss_abs = abs(_safe_float(train_metrics.get("stop_loss_profit_abs")))
-    if stop_loss_abs > roi_abs * 1.2:
-        penalty += 30.0
-        penalty_reasons.append("固定止损亏损>ROI*1.2")
-    score = train_score * 0.4 + validation_score * 0.4 + worst_val_score * 0.2 - penalty
-    return score, {"worst_validation_score": worst_val_score, "penalty_total": penalty, "penalty_reasons": penalty_reasons}
-
+    stop_loss_abs = abs(_safe_float(train_metrics.get("stop_loss_profit_abs", train_metrics.get("stoploss_profit_abs", 0.0))))
+    stoploss_to_roi_ratio = _safe_float(risk.get("stoploss_to_roi_ratio"))
+    if stop_loss_abs > roi_abs:
+        penalty += 55.0
+        penalty_reasons.append("stoploss_to_roi_failure: abs(stoploss_profit_abs)>roi_profit_abs")
+    if stoploss_to_roi_ratio > 1.2:
+        penalty += 45.0
+        penalty_reasons.append("stoploss_to_roi_failure: stoploss_to_roi_ratio>1.2")
+    if _safe_float(train_metrics.get("profit_total_pct")) > 0 and _safe_float(risk.get("validation_avg_profit_pct")) < 0:
+        penalty += 120.0
+        penalty_reasons.append("validation_loss: 训练期盈利但验证期平均亏损")
+    score = train_score * 0.3 + validation_score * 0.4 + worst_val_score * 0.3 - penalty
+    if _safe_int(risk.get("validation_max_trades")) > int(max_trades * 1.5):
+        score = min(score, 0.0)
+    detail = {"worst_validation_score": worst_val_score, "penalty_total": penalty, "penalty_reasons": penalty_reasons, **risk}
+    return score, detail
 
 def _score(metrics: dict[str, Any], period: PeriodDef) -> float:
     return (
@@ -7007,6 +7254,15 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             nearest_family = ((last_run_summary_mem.get("nearest_candidate") or {}).get("strategy_family") if isinstance(last_run_summary_mem, dict) else "") or ""
             if not explore_strategy_family and (preferred_families or nearest_family):
                 spec_prompt += "普通 optimize 模式提示：上一轮结构探索的 near-miss / leaderboard 显示可优先小步优化这些 strategy_family=" + _compact_prompt_json({"preferred": preferred_families, "nearest_family": nearest_family}, 2000) + "\n"
+        if nearest_mem and isinstance(nearest_mem, dict) and nearest_mem.get("near_miss_type"):
+            spec_prompt += (
+                f"\n上一轮 near-miss: {nearest_mem.get('source_run_id', '')}/{nearest_mem.get('source_version', '')}\n"
+                f"near_miss_type: {nearest_mem.get('near_miss_type')}\n"
+                f"关键指标: {_compact_prompt_json(nearest_mem.get('key_metrics', {}), 2000)}\n"
+                f"失败原因: {_compact_prompt_json(nearest_mem.get('failed_due_to', []), 1000)}\n"
+                f"推荐修复方向: {nearest_mem.get('recommended_followup_mutation', '')}\n"
+                "不得简单放宽入场或盲目调 ROI；near-miss 只能作为 session_parent/prompt 参考，不得自动覆盖 official best。\n"
+            )
         spec_prompt += "\n跨 run strategy_lessons=" + _compact_prompt_json(lessons_items[-memory_max_items:], 4000) + "\n"
         spec_prompt += "\n跨 run strategy_blacklist=" + _compact_prompt_json(blacklist_items[-memory_max_items:], 4000) + "\n"
         spec_prompt += _format_pre_run_review_for_advisor(pre_run_ai_review)
@@ -7138,7 +7394,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "- 如果 mutation_spec.mutation_type 是 pair_specific_filter、tag_specific_filter、add_entry_filter、tighten_entry_trigger，必须在 populate_entry_trend 中生成对应的实际条件，并影响 enter_long。\n"
             "- 如果 mutation_spec 要求 ETH/USDT 专属过滤，代码里必须出现明确的 ETH/USDT 分支或等价 pair-specific 条件（例如 metadata['pair'] == 'ETH/USDT' 或 pair 变量判断）。\n"
             "- 如果 mutation_spec 要求新增指标（ema20、ema50、adx、atr_pct、bollinger_middleband、volume_mean_20 等），必须在 populate_indicators 中实际计算这些 dataframe 列，并在入场条件中引用相关列。\n"
-            "- Bollinger 安全规则：禁止直接使用 bollinger['middle']；qtpylib.bollinger_bands 只允许安全读取 upper/lower。\n"
+            "- Bollinger 安全规则：禁止直接使用 bollinger['middle']/bollinger['mid']；qtpylib.bollinger_bands 只允许安全读取 upper/lower；bb_middle 必须通过 upper/lower 计算。\n"
             "- 如果需要 bb_middle，必须先计算 bb_upper/bb_lower，再写 dataframe['bb_middle'] = (dataframe['bb_upper'] + dataframe['bb_lower']) / 2。\n"
             "- 避免把入场条件写成几乎永远不触发的苛刻组合。\n"
         )
@@ -7392,7 +7648,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             print(f"静态检查失败且触发 Bollinger 安全规则，要求 codegen/repair 重试一次：{static_reason}")
             repair_prompt = (
                 "请修复以下 Freqtrade 策略代码，仅输出完整可运行 Python。\n"
-                "硬性规则：禁止 bollinger['middle']；qtpylib.bollinger_bands 只允许读取 upper/lower；"
+                "硬性规则：禁止 bollinger['middle']/bollinger['mid']；qtpylib.bollinger_bands 只允许读取 upper/lower；"
                 "bb_middle 必须用 dataframe['bb_middle'] = (dataframe['bb_upper'] + dataframe['bb_lower']) / 2。\n"
                 f"静态检查错误：{static_reason}\n代码:\n{code}"
             )
@@ -7568,7 +7824,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             status["invalid_reason"] = invalid_reason
             flush_iteration_stats()
             continue
+        train_attribution = write_attribution_files(train_result, version_dir)
+        _print_pair_attribution_table(train_attribution)
         train_metrics = _extract_metrics(train_result)
+        train_metrics.update(_summarize_pair_attr_for_summary(train_attribution))
         pair_metrics = _normalize_pair_metrics(train_metrics.get("pairs", []))
         entry_tag_metrics = _normalize_entry_tag_metrics(train_metrics.get("entry_tags", []))
         status["train_backtest_status"] = "已训练回测"
@@ -7669,7 +7928,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                     validation_status = "backtest_parse_failed"
                     invalid_reason = "验证区间回测结果解析失败"
                     break
+                val_attr = build_trade_attributions(val_result)
                 vm = _extract_metrics(val_result)
+                vm.update(_summarize_pair_attr_for_summary(val_attr))
                 validation_metrics.append({"period": p.name, "timerange": p.timerange, "metrics": vm})
                 iteration_stats["validation_backtest_total_count"] += 1
                 _print_round_table(ver, p.timerange, vm)
@@ -7699,8 +7960,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             validation_metrics=validation_metrics,
             target_cfg=target_cfg,
         )
+        validation_risk = _validation_risk_metrics(train_metrics, validation_metrics, max_trades)
         validation_high_frequency_details = _validation_high_frequency_failure_details(train_metrics, validation_metrics, max_trades)
         validation_high_frequency_failure = bool(validation_high_frequency_details)
+        validation_risk["validation_high_frequency_failure"] = validation_high_frequency_failure
         if validation_high_frequency_failure:
             for detail in validation_high_frequency_details:
                 print(
@@ -7716,6 +7979,11 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             final_score = min(final_score, 0.0)
         if validation_high_frequency_failure:
             final_score = 0.0
+        if _safe_float(validation_risk.get("validation_worst_profit_pct")) < -0.5 or _safe_float(validation_risk.get("validation_worst_profit_factor")) < 0.7:
+            final_score = min(final_score, 0.0)
+        if _safe_float(train_metrics.get("profit_total_pct")) > 0 and _safe_float(validation_risk.get("validation_avg_profit_pct")) < 0:
+            final_score = min(final_score, 0.0)
+        _print_validation_risk_check(validation_risk, final_score > 0 and not validation_high_frequency_failure and _safe_float(validation_risk.get("validation_avg_profit_pct")) >= 0)
         is_overfit = train_score > validation_score * 1.3 if validation_score else True
         zero_reason = _score_zero_reason(final_score, train_metrics, validation_metrics, validation_score)
         if zero_reason:
@@ -7774,6 +8042,12 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             failure_reasons.append("trailing_failure：移动止损亏损超过 ROI 收益的 50%。")
         elif trailing_stop_loss_profit_abs < -20:
             failure_reasons.append("移动止盈/止损结构造成大额亏损。")
+        if _safe_float(validation_risk.get("validation_worst_profit_pct")) < -0.5:
+            failure_reasons.append(f"worst_month/validation_loss：{validation_risk.get('validation_worst_month')} 收益 {_safe_float(validation_risk.get('validation_worst_profit_pct')):.4f}%")
+        if _safe_float(validation_risk.get("validation_worst_profit_factor")) < 0.7 and validation_metrics:
+            failure_reasons.append(f"worst_month：最差验证 PF {_safe_float(validation_risk.get('validation_worst_profit_factor')):.4f}<0.7")
+        if _safe_float(train_metrics.get("profit_total_pct")) > 0 and _safe_float(validation_risk.get("validation_avg_profit_pct")) < 0:
+            failure_reasons.append("validation_loss：训练期盈利但验证期平均亏损")
         if validation_high_frequency_failure:
             failure_reasons.append("validation_high_frequency_failure：验证期交易数失控，超过 max_trades*1.5 或 train_total_trades*2.0")
         if severe_high_frequency_failure:
@@ -7797,6 +8071,19 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "severe_high_frequency_failure": severe_high_frequency_failure,
             "validation_high_frequency_failure": validation_high_frequency_failure,
             "validation_high_frequency_details": validation_high_frequency_details,
+            **validation_risk,
+            "strategy_family": selected_strategy_family,
+            "mutation_type": mutation_type,
+            "train_total_trades": _safe_int(train_metrics.get("total_trades")),
+            "train_profit_pct": _safe_float(train_metrics.get("profit_total_pct")),
+            "train_profit_abs": _safe_float(train_metrics.get("profit_total_abs")),
+            "train_profit_factor": _safe_float(train_metrics.get("profit_factor")),
+            "is_new_best": False,
+            "failure_reason": failure_reason,
+            "zero_trade_failure": _safe_int(train_metrics.get("total_trades")) == 0,
+            "low_trade_failure": trade_under_min,
+            "runtime_error_failure": any((e or {}).get("error") == "backtest_failed" for e in backtest_errors),
+            "stoploss_to_roi_failure": _safe_float(validation_risk.get("stoploss_to_roi_ratio")) > 1.2,
         }
         write_json(run_dir / f"round_{i:03d}.json", round_data)
         avg_validation_profit_pct, avg_validation_profit_factor, max_validation_drawdown_pct = _aggregate_validation_metrics(validation_metrics)
@@ -7957,6 +8244,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "validation_high_frequency_failure": validation_high_frequency_failure,
             "validation_high_frequency_details": validation_high_frequency_details,
             "low_trade_profitable_near_miss": low_trade_profitable_near_miss,
+            "zero_trade_failure": _safe_int(train_metrics.get("total_trades")) == 0,
+            "low_trade_failure": trade_under_min,
+            "runtime_error_failure": any((e or {}).get("error") == "backtest_failed" for e in backtest_errors),
+            "stoploss_to_roi_failure": _safe_float(validation_risk.get("stoploss_to_roi_ratio")) > 1.2,
             "trailing_failure": trailing_failure,
             "backtest_errors": backtest_errors,
         }
@@ -7975,6 +8266,13 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "train_profit_pct": _safe_float(train_metrics.get("profit_total_pct")),
             "train_profit_abs": _safe_float(train_metrics.get("profit_total_abs")),
             "avg_validation_profit_pct": avg_validation_profit_pct,
+            "validation_avg_profit_pct": avg_validation_profit_pct,
+            "validation_worst_profit_pct": _safe_float(validation_risk.get("validation_worst_profit_pct")),
+            "validation_worst_profit_factor": _safe_float(validation_risk.get("validation_worst_profit_factor")),
+            "validation_worst_month": validation_risk.get("validation_worst_month", ""),
+            "validation_max_trades": _safe_int(validation_risk.get("validation_max_trades")),
+            "validation_trade_count_ratio_to_train": _safe_float(validation_risk.get("validation_trade_count_ratio_to_train")),
+            "stoploss_to_roi_ratio": _safe_float(validation_risk.get("stoploss_to_roi_ratio")),
             "avg_validation_profit_factor": avg_validation_profit_factor,
             "max_validation_drawdown_pct": max_validation_drawdown_pct,
             "validation_metrics": validation_metrics,
@@ -7987,6 +8285,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "validation_high_frequency_failure": validation_high_frequency_failure,
             "validation_high_frequency_details": validation_high_frequency_details,
             "low_trade_profitable_near_miss": low_trade_profitable_near_miss,
+            "zero_trade_failure": _safe_int(train_metrics.get("total_trades")) == 0,
+            "low_trade_failure": trade_under_min,
+            "runtime_error_failure": any((e or {}).get("error") == "backtest_failed" for e in backtest_errors),
+            "stoploss_to_roi_failure": _safe_float(validation_risk.get("stoploss_to_roi_ratio")) > 1.2,
             "trailing_failure": trailing_failure,
             "profit_factor": _safe_float(train_metrics.get("profit_factor")),
             "max_drawdown_pct": _safe_float(train_metrics.get("max_drawdown")) * 100.0,
@@ -8247,6 +8549,15 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     leaderboard_sorted = sorted(leaderboard, key=lambda x: float(x.get("final_score", 0.0) or 0.0), reverse=True)
     strategy_family_leaderboard = _build_strategy_family_leaderboard(leaderboard_sorted, family_stats)
     write_json(run_dir / "strategy_family_leaderboard.json", strategy_family_leaderboard)
+    # Write run-level attribution from the best scored available version.
+    attr_source = next((row for row in leaderboard_sorted if (run_dir / str(row.get("version", "")) / "pair_attribution.json").exists()), None)
+    if attr_source:
+        attr_dir = run_dir / str(attr_source.get("version"))
+        for name in ["pair_attribution.json", "exit_reason_attribution.json", "tag_attribution.json"]:
+            src = attr_dir / name
+            if src.exists():
+                shutil.copy2(src, run_dir / name)
+
     best_version = None
     valid_rows = [row for row in leaderboard_sorted if row.get("is_valid")]
     invalid_rows = [row for row in leaderboard_sorted if not row.get("is_valid")]
@@ -8326,6 +8637,11 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 "profit_factor_delta": _safe_float(closest_failed.get("profit_factor")) - _safe_float(baseline_cfg.get("profit_factor")),
             },
         }
+        near_miss_info = _detect_near_miss(closest_failed, target_cfg)
+        if near_miss_info:
+            nearest_candidate.update(near_miss_info)
+            nearest_candidate["source_run_id"] = run_id
+            nearest_candidate["source_version"] = closest_failed.get("version")
         if not nearest_validation_metrics:
             nearest_candidate["validation_metrics_missing_reason"] = "训练区间触发硬约束，跳过验证"
         if bool(closest_failed.get("trade_under_min", False)):
@@ -8389,6 +8705,16 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         "target": target_cfg,
         "official_best": current_best_saved if 'current_best_saved' in locals() else None,
         "historical_best": historical_best_mem,
+        "historical_best_name": _strategy_label(historical_best_mem, ""),
+        "historical_best_path": (historical_best_mem or {}).get("strategy_file", "") if isinstance(historical_best_mem, dict) else "",
+        "nearest_candidate_name": _strategy_label(nearest_candidate or nearest_mem, ""),
+        "nearest_candidate_path": ((nearest_candidate or nearest_mem or {}).get("strategy_file", "") if isinstance((nearest_candidate or nearest_mem), dict) else ""),
+        "pre_run_recommended_parent": actual_parent_choice.get("pre_run_preferred_parent", "未明确"),
+        "actual_session_parent_name": actual_parent_choice.get("actual_parent", _strategy_label(champion.get("meta"), "baseline")),
+        "actual_session_parent_path": (champion.get("meta") or {}).get("strategy_file", "") if isinstance(champion.get("meta"), dict) else "",
+        "actual_session_parent_source": champion.get("source", ""),
+        "actual_session_parent_reason": actual_parent_choice.get("reason", ""),
+        "did_override_historical_best_for_session": bool(actual_parent_choice.get("overrode_historical_best_for_session")),
         "final_official_champion": session_state.get("official_champion"),
         "final_in_memory_champion": session_state.get("in_memory_champion"),
         "nearest_candidate": nearest_candidate,
