@@ -14,6 +14,7 @@ import random
 import queue
 import re
 import shutil
+import secrets
 import statistics
 import subprocess
 import sys
@@ -483,6 +484,13 @@ def _infer_failure_type(summary: dict[str, Any] | None, nearest: dict[str, Any] 
     if near_type == "low_trade_profitable_near_miss":
         return "low_trade_profitable"
     failure_blob = json.dumps({"summary": data, "nearest": nearest or {}}, ensure_ascii=False).lower()
+    explicit_reason = str(data.get("failure_reason") or data.get("family_failure_reason") or data.get("invalid_reason") or "")
+    if _is_system_backtest_failure(explicit_reason) or data.get("backtest_result_missing_failure") or data.get("zip_mismatch_failure"):
+        if "zip" in explicit_reason or data.get("zip_mismatch_failure"):
+            return "zip_mismatch"
+        if explicit_reason in {"backtest_command_failed", "freqtrade_config_validation_failed", "result_parse_error"}:
+            return explicit_reason
+        return "backtest_result_missing"
     train = data.get("train_metrics", {}) if isinstance(data.get("train_metrics"), dict) else {}
     trade_value = data.get("train_total_trades", train.get("total_trades"))
     has_trade_value = trade_value is not None and str(trade_value) != ""
@@ -571,6 +579,14 @@ def _select_round_parent(
     failure_type: str,
     default_parent: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    if failure_type in {"backtest_result_missing", "zip_mismatch", "backtest_command_failed", "freqtrade_config_validation_failed", "result_parse_error"}:
+        return {
+            "source": "actual_session_parent",
+            "meta": default_parent or {},
+            "code": _load_strategy_code_from_record(default_parent),
+            "reason": f"failure_type={failure_type} 属于系统/执行失败，保持 actual_session_parent，不按策略失败切换 parent",
+            "repair_target": "修系统回测/导出/解析故障",
+        }
     if failure_type in {"stoploss_to_roi_high"}:
         order = ["nearest_candidate", "best_low_stoploss_candidate", "session_best", "official_best"]
         repair_target = "修 stoploss/ROI 风险控制"
@@ -1244,6 +1260,45 @@ def _read_config_pair_whitelist(config_path: str | Path) -> list[str]:
     return pairs
 
 
+
+def _ensure_freqtrade_config_compatible(config_data: dict[str, Any], config_path: Path | None = None) -> dict[str, str]:
+    """Patch generated configs for Freqtrade schema defaults that fail validation."""
+    actions: dict[str, str] = {}
+    api_server = config_data.setdefault("api_server", {})
+    if not isinstance(api_server, dict):
+        api_server = {}
+        config_data["api_server"] = api_server
+        actions["api_server"] = "已重建为 object"
+
+    jwt_value = str(api_server.get("jwt_secret_key") or "")
+    if (not jwt_value) or jwt_value == "change-this-local-secret" or len(jwt_value) < 32:
+        api_server["jwt_secret_key"] = secrets.token_hex(32)
+        actions["api_server.jwt_secret_key"] = "已自动修复"
+    else:
+        actions["api_server.jwt_secret_key"] = "无需修复"
+
+    ws_value = str(api_server.get("ws_token") or "")
+    if ws_value in {"change-this-local-token", "change-this-local-secret"} or (ws_value and len(ws_value) < 32):
+        api_server["ws_token"] = secrets.token_hex(32)
+        actions["api_server.ws_token"] = "已自动修复"
+    else:
+        actions["api_server.ws_token"] = "无需修复"
+
+    cors_value = api_server.get("CORS_origins", [])
+    if cors_value is None or not isinstance(cors_value, list):
+        api_server["CORS_origins"] = []
+        actions["api_server.CORS_origins"] = "已自动修复"
+    else:
+        actions["api_server.CORS_origins"] = "无需修复"
+
+    print("\n========== 配置兼容性检查 ==========")
+    print(f"api_server.jwt_secret_key: {actions.get('api_server.jwt_secret_key', '无需修复')}")
+    print(f"api_server.ws_token: {actions.get('api_server.ws_token', '无需修复')}")
+    print(f"api_server.CORS_origins: {actions.get('api_server.CORS_origins', '无需修复')}")
+    if config_path is not None:
+        print(f"config.active_pairs.json: {config_path}")
+    return actions
+
 def _write_temp_config_with_pairs(base_config: str, pairs: list[str], run_dir: Path, label: str) -> str:
     if not pairs:
         return base_config
@@ -1251,12 +1306,15 @@ def _write_temp_config_with_pairs(base_config: str, pairs: list[str], run_dir: P
     if not base_path.exists():
         raise FileNotFoundError(f"配置文件不存在：{base_path}")
     config_data = read_json(base_path)
+    if not isinstance(config_data, dict):
+        raise RuntimeError(f"配置文件顶层不是 object：{base_path}")
     exchange = config_data.setdefault("exchange", {})
     if not isinstance(exchange, dict):
         raise RuntimeError(f"配置文件 exchange 字段不是 object：{base_path}")
     exchange["pair_whitelist"] = list(pairs)
     safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", label).strip("_") or "pairs"
     dest = run_dir / f"config.{safe_label}.json"
+    _ensure_freqtrade_config_compatible(config_data, dest)
     write_json(dest, config_data)
     try:
         return str(dest.relative_to(ROOT_DIR))
@@ -2138,6 +2196,136 @@ def _list_backtest_zips(results_dir: Path) -> list[Path]:
     return sorted(results_dir.glob("backtest-result-*.zip"), key=lambda p: p.stat().st_mtime)
 
 
+def _list_backtest_jsons(results_dir: Path) -> list[Path]:
+    return sorted(
+        [p for p in results_dir.glob("backtest-result-*.json") if not p.name.endswith(".meta.json") and not p.name.endswith("_config.json")],
+        key=lambda p: p.stat().st_mtime,
+    )
+
+
+def _snapshot_backtest_result_files(*dirs: Path) -> set[Path]:
+    files: set[Path] = set()
+    for directory in dirs:
+        if not directory:
+            continue
+        for pattern in ("*.zip", "*.json"):
+            files.update(p.resolve() for p in directory.glob(pattern) if p.is_file() and not p.name.endswith(".meta.json") and not p.name.endswith("_config.json"))
+    return files
+
+
+def _tail_lines(text: str | None, line_count: int = 200) -> str:
+    lines = str(text or "").splitlines()
+    return "\n".join(lines[-line_count:])
+
+
+def _backtest_error_tail(cp: subprocess.CompletedProcess[str], line_count: int = 200) -> str:
+    return (
+        f"returncode: {cp.returncode}\n"
+        f"stdout_tail:\n{_tail_lines(cp.stdout, line_count)}\n\n"
+        f"stderr_tail:\n{_tail_lines(cp.stderr, line_count)}"
+    )
+
+
+def _classify_backtest_command_failure(cp: subprocess.CompletedProcess[str]) -> str:
+    blob = f"{cp.stdout or ''}\n{cp.stderr or ''}".lower()
+    config_markers = ("invalid configuration", "configuration error", "jwt_secret_key", "too short")
+    if any(marker in blob for marker in config_markers):
+        return "freqtrade_config_validation_failed"
+    return "backtest_command_failed"
+
+
+def _is_system_backtest_failure(reason: str | None) -> bool:
+    return str(reason or "") in {
+        "backtest_result_missing",
+        "backtest_result_missing_or_zip_mismatch",
+        "zip_mismatch",
+        "backtest_command_failed",
+        "freqtrade_config_validation_failed",
+        "result_parse_error",
+    }
+
+
+def _log_backtest_command_header(
+    *,
+    version: str,
+    strategy_name: str,
+    timerange: str,
+    config: str,
+    strategy_file: Path | str,
+    command: list[str],
+    cwd: Path,
+    result_dir_before_count: int,
+) -> None:
+    print("\n========== 回测命令 ==========")
+    print(f"version: {version}")
+    print(f"strategy_name: {strategy_name}")
+    print(f"timerange: {timerange}")
+    print(f"config: {config}")
+    print(f"strategy_file: {strategy_file}")
+    print("command: " + " ".join(command))
+    print(f"cwd: {cwd}")
+    print(f"Docker compose 命令实际执行目录: {cwd}")
+    print(f"result_dir_before_count: {result_dir_before_count}")
+
+
+def _log_backtest_scan_summary(
+    *,
+    returncode: int,
+    result_dir: Path,
+    new_zip_count: int,
+    new_json_count: int,
+    candidate_files: list[dict[str, Any]],
+    selected_result_file: Path | None,
+    selected_strategy_name: str,
+    failure_reason: str,
+) -> None:
+    print("\n========== 回测结果扫描 ==========")
+    print(f"returncode: {returncode}")
+    print(f"result_dir: {result_dir}")
+    print(f"new_zip_count: {new_zip_count}")
+    print(f"new_json_count: {new_json_count}")
+    print("candidate_files:")
+    if not candidate_files:
+        print("- 无")
+    for item in candidate_files:
+        actual = ", ".join(item.get("actual_strategies") or []) or "无"
+        err = f"，error={item.get('error')}" if item.get("error") else ""
+        print(f"- {item.get('file')} ({item.get('kind')}), actual_strategies={actual}{err}")
+    print(f"selected_result_file: {selected_result_file or ''}")
+    print(f"selected_strategy_name: {selected_strategy_name}")
+    print(f"failure_reason: {failure_reason}")
+
+
+
+def _backtest_result_candidates(
+    results_dir: Path,
+    started_at: float,
+    existing_files: set[Path],
+    extra_dirs: list[Path] | None = None,
+) -> list[Path]:
+    candidates: list[Path] = []
+    scan_dirs = [results_dir] + list(extra_dirs or [])
+    seen: set[Path] = set()
+    for directory in scan_dirs:
+        if not directory.exists():
+            continue
+        for pattern in ("*.zip", "*.json"):
+            for path in directory.glob(pattern):
+                if not path.is_file() or path.name.endswith(".meta.json") or path.name.endswith("_config.json"):
+                    continue
+                resolved = path.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                try:
+                    is_new = resolved not in existing_files
+                    is_recent = path.stat().st_mtime >= started_at
+                except OSError:
+                    continue
+                if is_new or is_recent:
+                    candidates.append(path)
+    return sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
+
 def _backtest_zip_candidates(results_dir: Path, started_at: float, existing_zips: set[Path]) -> list[Path]:
     """Return only zips that could have been produced by the current backtest."""
     candidates: list[Path] = []
@@ -2171,6 +2359,23 @@ def _read_backtest_zip_payload(zip_path: Path) -> tuple[dict[str, Any], str]:
     return data, json_name
 
 
+
+def _read_backtest_json_payload(json_path: Path) -> dict[str, Any]:
+    data = read_json(json_path)
+    if not isinstance(data, dict):
+        raise RuntimeError(f"回测结果 JSON 顶层不是 object: {json_path}")
+    return data
+
+
+def _read_backtest_result_strategy_keys(result_path: Path) -> list[str]:
+    if result_path.suffix.lower() == ".zip":
+        return _read_backtest_zip_strategy_keys(result_path)
+    data = _read_backtest_json_payload(result_path)
+    strategy_data = data.get("strategy")
+    if not isinstance(strategy_data, dict):
+        return []
+    return sorted(str(k) for k in strategy_data.keys())
+
 def _read_backtest_zip_strategy_keys(zip_path: Path) -> list[str]:
     data, _ = _read_backtest_zip_payload(zip_path)
     strategy_data = data.get("strategy")
@@ -2200,6 +2405,35 @@ def find_backtest_zip_for_strategy(
     return None, details
 
 
+
+def find_backtest_result_for_strategy(
+    backtest_dir: Path,
+    strategy_class: str,
+    started_at: float,
+    existing_files: set[Path],
+    extra_dirs: list[Path] | None = None,
+) -> tuple[Path | None, list[dict[str, Any]]]:
+    details: list[dict[str, Any]] = []
+    for result_path in _backtest_result_candidates(backtest_dir, started_at, existing_files, extra_dirs):
+        try:
+            strategy_keys = _read_backtest_result_strategy_keys(result_path)
+            error = ""
+        except Exception as exc:  # noqa: BLE001 - bad result files must not stop optimization.
+            strategy_keys = []
+            error = f"{type(exc).__name__}: {exc}"
+        item = {
+            "file": str(result_path),
+            "zip": str(result_path) if result_path.suffix.lower() == ".zip" else "",
+            "json": str(result_path) if result_path.suffix.lower() == ".json" else "",
+            "kind": result_path.suffix.lower().lstrip("."),
+            "actual_strategies": strategy_keys,
+            "error": error,
+        }
+        details.append(item)
+        if strategy_class in strategy_keys:
+            return result_path, details
+    return None, details
+
 def _log_backtest_zip_filter_failure(
     strategy_class: str,
     candidates: list[dict[str, Any]],
@@ -2227,6 +2461,16 @@ def _log_backtest_zip_filter_failure(
     print(f"failure_reason: {failure_reason}")
     print("处理：当前轮标记无效，继续下一轮")
 
+
+
+def _copy_backtest_result_to_version(result_path: Path, version_dir: Path, stage: str, timerange: str, label: str | None = None) -> Path:
+    safe_label = f"_{re.sub(r'[^A-Za-z0-9_.-]+', '_', label)}" if label else ""
+    suffix = result_path.suffix.lower() if result_path.suffix.lower() in {".zip", ".json"} else ".json"
+    dest_name = f"{stage}{safe_label}_{timerange}{suffix}"
+    dest = version_dir / "backtests" / dest_name
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(result_path, dest)
+    return dest
 
 def _copy_backtest_zip_to_version(zip_path: Path, version_dir: Path, stage: str, timerange: str, label: str | None = None) -> Path:
     safe_label = f"_{re.sub(r'[^A-Za-z0-9_.-]+', '_', label)}" if label else ""
@@ -2309,6 +2553,30 @@ def parse_backtest_from_zip(zip_path: Path, strategy_class: str, strict: bool = 
     print(f"找到策略: {strategy_class}")
     return result, actual_strategy_keys
 
+
+
+def parse_backtest_from_result_file(result_path: Path, strategy_class: str, strict: bool = True) -> tuple[dict[str, Any] | None, list[str]]:
+    if result_path.suffix.lower() == ".zip":
+        return parse_backtest_from_zip(result_path, strategy_class, strict=strict)
+    print(f"正在解析 json: {result_path}")
+    try:
+        data = _read_backtest_json_payload(result_path)
+    except Exception:
+        if strict:
+            raise
+        return None, []
+    strategy_data = data.get("strategy")
+    if not isinstance(strategy_data, dict):
+        if strict:
+            raise RuntimeError("回测结果缺少 strategy 字段")
+        return None, []
+    actual_strategy_keys = sorted(str(k) for k in strategy_data.keys())
+    if strategy_class not in strategy_data:
+        if strict:
+            raise RuntimeError(f"未在回测结果中找到当前策略 {strategy_class}，实际策略：{actual_strategy_keys}")
+        return None, actual_strategy_keys
+    print(f"找到策略: {strategy_class}")
+    return strategy_data[strategy_class], actual_strategy_keys
 
 def run_cmd(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, cwd=cwd, text=True, capture_output=True)
@@ -6962,7 +7230,7 @@ def run_manual_ai_backtest(runtime_goal: dict[str, Any], args: argparse.Namespac
     if train_zip is None:
         _log_backtest_zip_filter_failure(class_name, train_candidates)
         actual = list(train_candidates[0].get("actual_strategies") or []) if train_candidates else []
-        wrong_zip = str(train_candidates[0].get("zip") or "") if train_candidates else ""
+        wrong_zip = str(train_candidates[0].get("file") or train_candidates[0].get("zip") or train_candidates[0].get("json") or "") if train_candidates else ""
         _record_backtest_error(backtest_errors, stage="train", timerange=train.timerange, expected_strategy=class_name, wrong_zip=wrong_zip, actual_strategies=actual, error="wrong_strategy_zip_detected" if wrong_zip else "zip_missing")
         finish_invalid("训练区间回测结果 zip 不匹配或缺失")
         return
@@ -7317,6 +7585,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     prev_train_trades: int | None = None
     previous_failure_reason: str | None = None
     zero_trade_streak = 0
+    consecutive_system_backtest_failures = 0
+    recent_system_backtest_failures: list[dict[str, Any]] = []
+    system_failure_stop = False
     explore_strategy_family = bool(getattr(args, "explore_strategy_family", False) or runtime_goal.get("explore_strategy_family", False))
     explore_family_cfg = _explore_strategy_family_cfg(runtime_goal)
     family_stats = _initial_family_stats()
@@ -7385,6 +7656,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         "random_sample_total_backtests": 0,
         "early_stop_triggered": False,
         "early_stop_reason": "",
+        "system_failure_stop": False,
         "early_stop_settings": early_stopping_settings,
         "early_stop_monitor_state": early_stop_monitor_state,
         "improvement_monitor": early_stop_monitor_state,
@@ -7705,11 +7977,15 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             _append_unique(session_state["attempted_mutation_types_this_run"], mutation_type)
             if selected_strategy_family:
                 _append_unique(session_state["attempted_strategy_families_this_run"], selected_strategy_family)
+            round_failure_reason = str(round_summary.get("failure_reason") or round_summary.get("family_failure_reason") or "")
+            is_system_backtest_failure = _is_system_backtest_failure(round_failure_reason) or bool(round_summary.get("backtest_result_missing_failure")) or bool(round_summary.get("zip_mismatch_failure"))
             if round_summary.get("is_valid"):
                 _append_unique(session_state["successful_mutation_types_this_run"], mutation_type)
-            else:
+            elif not is_system_backtest_failure:
                 _append_unique(session_state["failed_mutation_types_this_run"], mutation_type)
                 _append_unique(session_state["common_failure_patterns_this_run"], round_summary.get("invalid_reason") or round_summary.get("failure_reason"))
+            else:
+                _append_unique(session_state["common_failure_patterns_this_run"], round_failure_reason)
 
             if became_best and strategy_record:
                 session_state["official_champion"] = strategy_record
@@ -8390,42 +8666,75 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "--timerange", train.timerange, "--export", "trades", "--cache", "none",
         ]
         results_dir = ROOT_DIR / "user_data" / "backtest_results"
-        train_before_zips = set(_list_backtest_zips(results_dir))
+        train_backtests_dir = version_dir / "backtests"
+        train_before_files = _snapshot_backtest_result_files(results_dir, train_backtests_dir)
         train_start_ts = time.time()
+        _log_backtest_command_header(
+            version=ver,
+            strategy_name=class_name,
+            timerange=train.timerange,
+            config=config,
+            strategy_file=strategy_file,
+            command=train_cmd,
+            cwd=ROOT_DIR,
+            result_dir_before_count=len(train_before_files),
+        )
         train_cp = run_cmd(train_cmd, ROOT_DIR)
-        _write_backtest_process_log(version_dir, "train", train.timerange, train_cp)
+        train_log_path = _write_backtest_process_log(version_dir, "train", train.timerange, train_cp)
         (version_dir / "backtest_logs.txt").write_text(
-            f"[Train {train.timerange}]\nRETURNCODE: {train_cp.returncode}\nSTDOUT:\n{train_cp.stdout}\n\nSTDERR:\n{train_cp.stderr}\n",
+            f"[Train {train.timerange}]\nCOMMAND: {' '.join(train_cmd)}\nCWD: {ROOT_DIR}\nLOG_PATH: {train_log_path}\nRETURNCODE: {train_cp.returncode}\nSTDOUT:\n{train_cp.stdout}\n\nSTDERR:\n{train_cp.stderr}\n",
             encoding="utf-8",
         )
         if train_cp.returncode != 0:
-            print(train_cp.stderr)
+            failure_reason = _classify_backtest_command_failure(train_cp)
+            backtest_error_tail = _backtest_error_tail(train_cp)
+            print("回测命令执行失败。")
+            print(f"command: {' '.join(train_cmd)}")
+            print(f"returncode: {train_cp.returncode}")
+            print(f"backtest log 路径: {train_log_path}")
+            print(f"当前工作目录: {Path.cwd()}")
+            print(f"Docker compose 命令实际执行目录: {ROOT_DIR}")
+            print(backtest_error_tail)
+            _log_backtest_scan_summary(
+                returncode=train_cp.returncode,
+                result_dir=results_dir,
+                new_zip_count=0,
+                new_json_count=0,
+                candidate_files=[],
+                selected_result_file=None,
+                selected_strategy_name="",
+                failure_reason=failure_reason,
+            )
             status["train_backtest_status"] = "失败"
-            invalid_reason = "训练区间回测失败"
-            failure_reason = invalid_reason
+            invalid_reason = "训练区间回测命令失败"
             runtime_error_failure = True
             round_state.update({
                 "failure_reason": failure_reason,
+                "family_failure_reason": failure_reason,
                 "runtime_error_failure": True,
                 "invalid_reason": invalid_reason,
+                "backtest_returncode": train_cp.returncode,
+                "backtest_error_tail": backtest_error_tail,
             })
             _record_backtest_error(
                 backtest_errors,
                 stage="train",
                 timerange=train.timerange,
                 expected_strategy=class_name,
-                error="backtest_failed",
+                error=failure_reason,
             )
-            summary_path = write_iteration_summary({"backtest_errors": backtest_errors})
+            summary_path = write_iteration_summary({"backtest_errors": backtest_errors, "backtest_error_tail": backtest_error_tail, "backtest_returncode": train_cp.returncode})
             update_session_state_after_round(summary_path=summary_path)
             iteration_stats["invalid_strategy_count"] += 1
             status["is_valid"] = False
             status["invalid_reason"] = invalid_reason
-            if explore_strategy_family:
+            consecutive_system_backtest_failures += 1
+            recent_system_backtest_failures.append({"version": ver, "failure_reason": failure_reason, "timerange": train.timerange})
+            if explore_strategy_family and not _is_system_backtest_failure(failure_reason):
                 _update_strategy_family_stats(
                     family_stats, selected_strategy_family, is_valid=False,
-                    train_metrics={"total_trades": 0}, validation_metrics=[],
-                    failure_reason=invalid_reason, final_score=0.0,
+                    train_metrics={}, validation_metrics=[],
+                    failure_reason=failure_reason, final_score=0.0,
                     min_trades=min_trades, max_trades=max_trades,
                     official_gate_reasons=[], validation_high_frequency_failure=False,
                 )
@@ -8433,13 +8742,33 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                     "version": ver, "run_id": run_id, "strategy_class": class_name,
                     "strategy_file": str(strategy_file), "strategy_family": selected_strategy_family,
                     "is_valid": False, "is_best": False, "invalid_reason": invalid_reason,
-                    "family_failure_reason": invalid_reason, "final_score": 0.0, "total_trades": 0,
+                    "failure_reason": failure_reason, "family_failure_reason": failure_reason,
+                    "final_score": 0.0, "runtime_error_failure": True, "backtest_returncode": train_cp.returncode,
                 }))
             flush_iteration_stats()
+            if consecutive_system_backtest_failures >= 3:
+                system_failure_stop = True
+                iteration_stats["system_failure_stop"] = True
+                print("\n========== 系统级回测故障 ==========")
+                print(f"连续回测结果缺失次数: {consecutive_system_backtest_failures}")
+                print("最近3轮:")
+                for item in recent_system_backtest_failures[-3:]:
+                    print(f"- {item}")
+                print("建议排查:")
+                print("- docker backtesting returncode")
+                print("- export 目录")
+                print("- strategy name")
+                print("- config path")
+                print("- data path")
+                print("- result scan pattern")
+                flush_iteration_stats()
+                break
             continue
         print("正在解析回测结果……")
-        train_zip, train_candidates = find_backtest_zip_for_strategy(results_dir, class_name, train_start_ts, train_before_zips)
-        if train_zip is None:
+        train_result_file, train_candidates = find_backtest_result_for_strategy(results_dir, class_name, train_start_ts, train_before_files, [train_backtests_dir])
+        new_zip_count = sum(1 for item in train_candidates if item.get("kind") == "zip")
+        new_json_count = sum(1 for item in train_candidates if item.get("kind") == "json")
+        if train_result_file is None:
             failure_reason = "backtest_result_missing_or_zip_mismatch"
             backtest_result_missing_failure = True
             zip_mismatch_failure = bool(train_candidates)
@@ -8474,7 +8803,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             iteration_stats["invalid_strategy_count"] += 1
             status["is_valid"] = False
             status["invalid_reason"] = invalid_reason
-            if explore_strategy_family:
+            if explore_strategy_family and not _is_system_backtest_failure(failure_reason):
                 _update_strategy_family_stats(
                     family_stats, selected_strategy_family, is_valid=False,
                     train_metrics={"total_trades": 0}, validation_metrics=[],
@@ -8492,10 +8821,49 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                     "backtest_result_missing_failure": True,
                     "zip_mismatch_failure": zip_mismatch_failure,
                 }))
+            consecutive_system_backtest_failures += 1
+            recent_system_backtest_failures.append({"version": ver, "failure_reason": failure_reason, "timerange": train.timerange})
+            _log_backtest_scan_summary(
+                returncode=train_cp.returncode,
+                result_dir=results_dir,
+                new_zip_count=new_zip_count,
+                new_json_count=new_json_count,
+                candidate_files=train_candidates,
+                selected_result_file=None,
+                selected_strategy_name="",
+                failure_reason=failure_reason,
+            )
             flush_iteration_stats()
+            if consecutive_system_backtest_failures >= 3:
+                system_failure_stop = True
+                iteration_stats["system_failure_stop"] = True
+                print("\n========== 系统级回测故障 ==========")
+                print(f"连续回测结果缺失次数: {consecutive_system_backtest_failures}")
+                print("最近3轮:")
+                for item in recent_system_backtest_failures[-3:]:
+                    print(f"- {item}")
+                print("建议排查:")
+                print("- docker backtesting returncode")
+                print("- export 目录")
+                print("- strategy name")
+                print("- config path")
+                print("- data path")
+                print("- result scan pattern")
+                flush_iteration_stats()
+                break
             continue
-        train_zip_local = _copy_backtest_zip_to_version(train_zip, version_dir, "train", train.timerange)
-        train_result, actual_train_keys = parse_backtest_from_zip(train_zip_local, class_name, strict=False)
+        _log_backtest_scan_summary(
+            returncode=train_cp.returncode,
+            result_dir=results_dir,
+            new_zip_count=new_zip_count,
+            new_json_count=new_json_count,
+            candidate_files=train_candidates,
+            selected_result_file=train_result_file,
+            selected_strategy_name=class_name,
+            failure_reason="",
+        )
+        train_result_local = _copy_backtest_result_to_version(train_result_file, version_dir, "train", train.timerange)
+        train_result, actual_train_keys = parse_backtest_from_result_file(train_result_local, class_name, strict=False)
         if train_result is None:
             failure_reason = "backtest_result_missing_or_zip_mismatch"
             backtest_result_missing_failure = True
@@ -8503,12 +8871,12 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             runtime_error_failure = True
             _log_backtest_zip_filter_failure(
                 class_name,
-                [{"zip": str(train_zip), "actual_strategies": actual_train_keys, "error": "backtest_parse_failed"}],
+                [{"file": str(train_result_file), "actual_strategies": actual_train_keys, "error": "backtest_parse_failed"}],
                 version=ver,
                 expected_zip_dir=results_dir,
                 failure_reason=failure_reason,
             )
-            _record_backtest_error(backtest_errors, stage="train", timerange=train.timerange, expected_strategy=class_name, wrong_zip=str(train_zip), actual_strategies=actual_train_keys, error="backtest_parse_failed")
+            _record_backtest_error(backtest_errors, stage="train", timerange=train.timerange, expected_strategy=class_name, wrong_zip=str(train_result_file), actual_strategies=actual_train_keys, error="backtest_parse_failed")
             _print_backtest_mismatch_summary(backtest_errors)
             status["train_backtest_status"] = "解析失败"
             invalid_reason = "训练区间回测结果解析失败"
@@ -8526,7 +8894,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             iteration_stats["invalid_strategy_count"] += 1
             status["is_valid"] = False
             status["invalid_reason"] = invalid_reason
-            if explore_strategy_family:
+            if explore_strategy_family and not _is_system_backtest_failure(failure_reason):
                 _update_strategy_family_stats(
                     family_stats, selected_strategy_family, is_valid=False,
                     train_metrics={"total_trades": 0}, validation_metrics=[],
@@ -9509,6 +9877,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         },
         "nearest_candidate_improved_without_official_best": bool(not best and (early_stop_monitor_state.get("last_improvement_flags") or {}).get("nearest_candidate_improved")),
         "session_best_improved_without_official_best": bool(not best and (early_stop_monitor_state.get("last_improvement_flags") or {}).get("session_best_final_score_improved")),
+        "system_failure_stop": bool(system_failure_stop or iteration_stats.get("system_failure_stop")),
         "should_continue_instead_of_early_stop": bool(not iteration_stats.get("early_stop_triggered") and (not best) and (session_state.get("session_nearest_candidate") or session_state.get("session_best"))),
         "failed_mutation_types_this_run": session_state.get("failed_mutation_types_this_run", []),
         "successful_mutation_types_this_run": session_state.get("successful_mutation_types_this_run", []),
