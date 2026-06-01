@@ -373,6 +373,8 @@ def _detect_near_miss(row: dict[str, Any], target_cfg: dict[str, Any]) -> dict[s
     min_trades = _safe_int(target_cfg.get("min_trades", 20))
     max_trades = _safe_int(target_cfg.get("max_trades", 60))
     trades = _safe_int(row.get("train_total_trades", row.get("total_trades")))
+    if bool(row.get("severe_high_frequency_failure")) or trades > int(max_trades) * 1.5:
+        return {}
     train_profit = _safe_float(row.get("train_profit_pct"))
     train_pf = _safe_float(row.get("train_profit_factor", row.get("profit_factor")))
     validations = row.get("validation_metrics", []) or []
@@ -457,6 +459,10 @@ FAILURE_TYPE_TO_MUTATION_MAP: dict[str, dict[str, list[str]]] = {
         "prefer": ["reduce_trade_frequency", "add_cooldown", "stricter_adx"],
         "avoid": ["remove_bad_entry_condition"],
     },
+    "duplicate_strategy": {
+        "prefer": ["change_entry_conditions", "change_indicators", "rewrite_populate_entry_trend"],
+        "avoid": ["widen_entry_controlled", "adjust_roi_only", "remove_risk_filter"],
+    },
     "train_positive_validation_negative": {
         "prefer": ["anti_overfit_filter", "regime_filter", "pair_specific_filter"],
         "avoid": ["increase_trade_frequency", "adjust_roi_only"],
@@ -485,6 +491,8 @@ def _infer_failure_type(summary: dict[str, Any] | None, nearest: dict[str, Any] 
         return "low_trade_profitable"
     failure_blob = json.dumps({"summary": data, "nearest": nearest or {}}, ensure_ascii=False).lower()
     explicit_reason = str(data.get("failure_reason") or data.get("family_failure_reason") or data.get("invalid_reason") or "")
+    if data.get("duplicate_strategy_failure") or str(data.get("failure_type") or "") == "duplicate_strategy" or "duplicate_strategy" in failure_blob or "高度重复" in explicit_reason:
+        return "duplicate_strategy"
     if _is_system_backtest_failure(explicit_reason) or data.get("backtest_result_missing_failure") or data.get("zip_mismatch_failure"):
         if "zip" in explicit_reason or data.get("zip_mismatch_failure"):
             return "zip_mismatch"
@@ -515,6 +523,24 @@ def _mutation_policy_for_failure_type(failure_type: str) -> dict[str, list[str]]
 
 def _candidate_has_valid_file(candidate: dict[str, Any] | None) -> bool:
     return isinstance(candidate, dict) and _resolve_strategy_file(candidate.get("strategy_file")) is not None
+
+
+def _is_safe_parent_candidate(candidate: dict[str, Any] | None) -> bool:
+    if not isinstance(candidate, dict) or not candidate:
+        return False
+    return not (
+        bool(candidate.get("severe_high_frequency_failure"))
+        or bool(candidate.get("duplicate_strategy_failure"))
+        or bool((candidate.get("duplicate_report") or {}).get("is_duplicate") if isinstance(candidate.get("duplicate_report"), dict) else False)
+        or str(candidate.get("failure_type") or "") == "duplicate_strategy"
+        or bool(candidate.get("runtime_error_failure"))
+        or bool(candidate.get("backtest_result_missing_failure"))
+        or bool(candidate.get("zip_mismatch_failure"))
+    )
+
+
+def _candidate_has_valid_file_and_safe(candidate: dict[str, Any] | None) -> bool:
+    return _candidate_has_valid_file(candidate) and _is_safe_parent_candidate(candidate)
 
 
 def _leaderboard_record(row: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -556,7 +582,7 @@ def _build_round_parent_pool(
     session_best: dict[str, Any] | None,
     leaderboard: list[dict[str, Any]],
 ) -> dict[str, dict[str, Any] | None]:
-    rows = [r for r in leaderboard if isinstance(r, dict) and _candidate_has_valid_file(r)]
+    rows = [r for r in leaderboard if isinstance(r, dict) and _candidate_has_valid_file_and_safe(r)]
     best_train = max(rows, key=lambda r: (_safe_float(r.get("train_profit_pct")), _safe_float(r.get("profit_factor"))), default=None)
     apr_rows = [r for r in rows if any("apr" in str((v or {}).get("period", "")).lower() or "202604" in str((v or {}).get("timerange", "")) for v in (r.get("validation_metrics") or []))]
     best_apr = max(apr_rows or rows, key=lambda r: _safe_float(r.get("avg_validation_profit_factor")), default=None)
@@ -579,13 +605,13 @@ def _select_round_parent(
     failure_type: str,
     default_parent: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    if failure_type in {"backtest_result_missing", "zip_mismatch", "backtest_command_failed", "freqtrade_config_validation_failed", "result_parse_error"}:
+    if failure_type in {"backtest_result_missing", "zip_mismatch", "backtest_command_failed", "freqtrade_config_validation_failed", "result_parse_error", "duplicate_strategy"}:
         return {
             "source": "actual_session_parent",
             "meta": default_parent or {},
             "code": _load_strategy_code_from_record(default_parent),
-            "reason": f"failure_type={failure_type} 属于系统/执行失败，保持 actual_session_parent，不按策略失败切换 parent",
-            "repair_target": "修系统回测/导出/解析故障",
+            "reason": f"failure_type={failure_type} 属于系统/执行/重复代码失败，保持 actual_session_parent，不按策略失败切换 parent",
+            "repair_target": "强制改写重复策略" if failure_type == "duplicate_strategy" else "修系统回测/导出/解析故障",
         }
     if failure_type in {"stoploss_to_roi_high"}:
         order = ["nearest_candidate", "best_low_stoploss_candidate", "session_best", "official_best"]
@@ -612,7 +638,7 @@ def _select_round_parent(
     selected = default_parent or {}
     for source in order:
         candidate = parent_pool.get(source)
-        if _candidate_has_valid_file(candidate) or (source == "official_best" and isinstance(candidate, dict)):
+        if _is_safe_parent_candidate(candidate) and (_candidate_has_valid_file(candidate) or (source == "official_best" and isinstance(candidate, dict))):
             selected_source = source
             selected = candidate or selected
             break
@@ -4502,6 +4528,8 @@ def _new_round_defaults() -> dict[str, Any]:
         "static_check_failure": False,
         "backtest_result_missing_failure": False,
         "zip_mismatch_failure": False,
+        "duplicate_strategy_failure": False,
+        "failure_type": "",
         "stoploss_to_roi_failure": False,
         "near_miss": False,
         "near_miss_type": "",
@@ -7793,6 +7821,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         static_check_failure = False
         backtest_result_missing_failure = False
         zip_mismatch_failure = False
+        duplicate_strategy_failure = False
         stoploss_to_roi_failure = False
         near_miss = False
         near_miss_type = ""
@@ -7838,7 +7867,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             entry.setdefault("family_score", family_score)
             entry.setdefault("family_failure_reason", family_failure_reason or entry.get("invalid_reason") or entry.get("failure_reason", ""))
             entry.setdefault("high_frequency_failure", high_frequency_failure)
+            entry.setdefault("severe_high_frequency_failure", severe_high_frequency_failure)
             entry.setdefault("validation_high_frequency_failure", validation_high_frequency_failure)
+            entry.setdefault("duplicate_strategy_failure", duplicate_strategy_failure)
             entry.setdefault("validation_high_frequency_details", validation_high_frequency_details)
             entry.setdefault("low_trade_profitable_near_miss", low_trade_profitable_near_miss)
             entry.setdefault("trailing_failure", trailing_failure)
@@ -7891,6 +7922,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 "static_check_failure": bool(static_check_failure or round_state.get("static_check_failure", False)),
                 "backtest_result_missing_failure": bool(backtest_result_missing_failure or round_state.get("backtest_result_missing_failure", False)),
                 "zip_mismatch_failure": bool(zip_mismatch_failure or round_state.get("zip_mismatch_failure", False)),
+                "duplicate_strategy_failure": bool(duplicate_strategy_failure or round_state.get("duplicate_strategy_failure", False)),
+                "failure_type": "duplicate_strategy" if bool(duplicate_strategy_failure or round_state.get("duplicate_strategy_failure", False)) else round_state.get("failure_type", ""),
                 "stoploss_to_roi_failure": bool(stoploss_to_roi_failure or round_state.get("stoploss_to_roi_failure", False)),
                 "near_miss": bool(near_miss or round_state.get("near_miss", False)),
                 "near_miss_type": near_miss_type or round_state.get("near_miss_type", ""),
@@ -7981,6 +8014,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             is_system_backtest_failure = _is_system_backtest_failure(round_failure_reason) or bool(round_summary.get("backtest_result_missing_failure")) or bool(round_summary.get("zip_mismatch_failure"))
             if round_summary.get("is_valid"):
                 _append_unique(session_state["successful_mutation_types_this_run"], mutation_type)
+            elif bool(round_summary.get("duplicate_strategy_failure")) or str(round_summary.get("failure_type") or "") == "duplicate_strategy":
+                _append_unique(session_state["common_failure_patterns_this_run"], "duplicate_strategy：上一轮为重复代码，不是 zero_trade；下一轮强制换 provider 并改 entry/indicator/populate_entry_trend")
             elif not is_system_backtest_failure:
                 _append_unique(session_state["failed_mutation_types_this_run"], mutation_type)
                 _append_unique(session_state["common_failure_patterns_this_run"], round_summary.get("invalid_reason") or round_summary.get("failure_reason"))
@@ -7995,14 +8030,23 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 return
 
             if strategy_record and not became_best:
+                session_best_eligible = (
+                    _is_safe_parent_candidate(strategy_record)
+                    and _safe_float(strategy_record.get("final_score")) > 0
+                    and bool((strategy_record.get("validation_metrics") or []))
+                )
                 current_session_best = session_state.get("session_best")
-                if not isinstance(current_session_best, dict) or _safe_float(strategy_record.get("final_score")) > _safe_float(current_session_best.get("final_score")):
+                if session_best_eligible and (not isinstance(current_session_best, dict) or _safe_float(strategy_record.get("final_score")) > _safe_float(current_session_best.get("final_score"))):
                     session_state["session_best"] = strategy_record
                     print(f"第 {ver} 轮未成为 official best，但 session_best final_score 有改善，已加入 parent_pool。")
+                elif not session_best_eligible:
+                    print(f"第 {ver} 轮未进入 session_best：存在 severe_high_frequency/duplicate/runtime/backtest_missing 或 final_score<=0/无验证结果。")
             candidate = nearest_candidate_record or strategy_record
-            if candidate and not became_best and _is_better_session_nearest(candidate, session_state.get("session_nearest_candidate"), target_cfg, baseline_cfg):
+            if candidate and not became_best and _is_safe_parent_candidate(candidate) and _is_better_session_nearest(candidate, session_state.get("session_nearest_candidate"), target_cfg, baseline_cfg):
                 session_state["session_nearest_candidate"] = candidate
                 print(f"第 {ver} 轮未成为 best，但已更新为本次 run 的 nearest_candidate，下一轮将作为参考。")
+            elif candidate and not became_best and not _is_safe_parent_candidate(candidate):
+                print(f"第 {ver} 轮未进入 nearest_candidate：severe_high_frequency/duplicate/runtime/backtest_missing 候选被禁止。")
 
         print(f"\n========== 第 {i} 轮 / {ver} ==========")
         print("1. 正在生成 mutation_spec（冠军-挑战者小步改动）……")
@@ -8059,7 +8103,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         )
         # `champion` remains the code-generation parent for this round only; official_best is kept separately in session_state.
         champion = {"meta": selected_round_parent.get("meta") or actual_session_parent, "code": selected_round_parent.get("code", ""), "source": selected_round_parent.get("source", "parent_pool")}
-        actual_session_parent = champion.get("meta") or actual_session_parent
+        run_level_actual_session_parent = actual_session_parent
         session_parent_candidates = {
             "actual_session_parent": actual_session_parent,
             "historical_best": official_champion,
@@ -8093,7 +8137,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         print(f"pre_run_ai_review.codegen_guidance 已注入 codegen prompt：{'是' if pre_run_codegen_injected else '否'}")
         print(f"当前正式 champion：{official_champion_name}")
         print(f"当前 in_memory_champion：{in_memory_champion_name}")
-        print(f"本次 actual_session_parent：{_strategy_label(actual_session_parent, 'baseline')}")
+        print(f"run_level_actual_session_parent：{_strategy_label(run_level_actual_session_parent, 'baseline')}")
         print(f"actual_session_parent 选择原因：{actual_session_parent_choice.get('reason', '未记录')}")
         print("当前 session_parent 候选：")
         print(f"- actual_session_parent: {_strategy_label(session_parent_candidates['actual_session_parent'])}")
@@ -8105,8 +8149,12 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         print(f"- best_low_stoploss_candidate: {_strategy_label(session_parent_candidates['best_low_stoploss_candidate'])}")
         print(f"- best_worst_month_candidate: {_strategy_label(session_parent_candidates['best_worst_month_candidate'])}")
         print("\n========== 本轮父策略选择 ==========")
-        print(f"parent_source: {selected_round_parent.get('source')}")
-        print(f"parent_strategy: {_strategy_label(selected_round_parent.get('meta'), 'baseline')}")
+        print(f"round_parent_source: {selected_round_parent.get('source')}")
+        print(f"round_parent_strategy: {_strategy_label(selected_round_parent.get('meta'), 'baseline')}")
+        if _strategy_label(selected_round_parent.get('meta'), 'baseline') != _strategy_label(run_level_actual_session_parent, 'baseline'):
+            print(f"本轮覆盖 run_level_actual_session_parent：是；原因：{selected_round_parent.get('reason')}")
+        else:
+            print("本轮覆盖 run_level_actual_session_parent：否")
         print(f"选择原因: {selected_round_parent.get('reason')}")
         print(f"本轮修复目标: {selected_round_parent.get('repair_target')}")
         print("========== mutation 选择约束 ==========")
@@ -8126,11 +8174,14 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         spec_prompt += "\n\n========== 同一次 run 动态 session_state（必须优先于跨 run 旧记忆）==========\n"
         spec_prompt += "当前 official_champion=" + _compact_prompt_json(official_champion, 5000) + "\n"
         spec_prompt += "当前 in_memory_champion=" + _compact_prompt_json(in_memory_champion, 5000) + "\n"
-        spec_prompt += "本次 actual_session_parent=" + _compact_prompt_json(actual_session_parent, 5000) + "\n"
+        spec_prompt += "run_level_actual_session_parent=" + _compact_prompt_json(run_level_actual_session_parent, 5000) + "\n"
         spec_prompt += "当前 parent_pool=" + _compact_prompt_json({k: _strategy_label(v) for k, v in round_parent_pool.items()}, 3000) + "\n"
         spec_prompt += "本轮已选择 parent_source=" + str(selected_round_parent.get("source")) + "；parent_strategy=" + _strategy_label(selected_round_parent.get("meta"), "baseline") + "；选择原因=" + str(selected_round_parent.get("reason")) + "；本轮修复目标=" + str(selected_round_parent.get("repair_target")) + "\n"
         spec_prompt += "硬性要求：本轮 advisor 必须把已选择 parent_strategy 作为代码修改父策略；pre_run_ai_review/near-miss 只能解释原因，不能只停留为参考。\n"
         spec_prompt += "当前 failure_type=" + current_failure_type + "\n"
+        if current_failure_type == "duplicate_strategy":
+            spec_prompt += "硬性澄清：上一轮失败是 duplicate_strategy，不是 zero_trade；除非上一轮真实回测 total_trades=0，否则禁止写成 zero_trade，禁止选择 widen_entry_controlled。必须强制更换 codegen provider，并要求改变 entry_conditions / indicators / populate_entry_trend。\n"
+        spec_prompt += "pair_attribution 定向要求：BTC/USDT、OP/USDT 需要更严格 entry threshold；OP 不允许高频入场；SOL/BNB/DOGE 可以保持相对宽松，但 DOGE 样本少，不能过拟合。下一轮优先尝试 pair_specific_entry_threshold for BTC/OP、avoid_choppy_market_filter、stoploss_to_roi_ratio reduction。禁止 remove_risk_filter、adjust_roi_only、replace_stoploss_with_trailing，禁止让 OP 交易数暴涨。\n"
         spec_prompt += "允许 mutation=" + _compact_prompt_json(mutation_policy.get("prefer", []), 1000) + "\n"
         spec_prompt += "禁止 mutation=" + _compact_prompt_json(mutation_policy.get("avoid", []), 1000) + "\n"
         spec_prompt += "本轮只修一个主要问题；mutation_spec.mutation_type 必须优先从允许 mutation 中选择，且不得使用禁止 mutation。\n"
@@ -8301,6 +8352,12 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "========== 用户额外代码生成规则 ==========",
             _prompt_guidance_rules(runtime_goal, "codegen_rules"),
         )
+        if current_failure_type == "duplicate_strategy":
+            code_runtime.forced_provider_offset = int(getattr(code_runtime, "forced_provider_offset", 0) or 0) + 1
+            prompt = (
+                "【强制去重】上一轮失败是 duplicate_strategy，不是 zero_trade；本次必须更换代码结构，改变 entry_conditions / indicators / populate_entry_trend，禁止 widen_entry_controlled。\n"
+                + prompt
+            )
         (version_dir / "codegen_prompt.txt").write_text(prompt, encoding="utf-8")
         print("3. 正在调用代码生成模型池生成 Freqtrade 策略代码……")
         response_text = ""
@@ -8412,7 +8469,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             tested_features = tested.get("features", {}) or {}
             fp_equal = str((tested_fp.get("hash") or "")) == str(strategy_fingerprint.get("hash"))
             fp_score, fp_reasons = strategy_similarity(features, tested_features)
-            if fp_equal or fp_score >= 0.92:
+            if fp_equal or fp_score >= 0.98:
                 duplicate_report.update({
                     "is_duplicate": True,
                     "matched_hash": str(tested_fp.get("hash") or ""),
@@ -8434,76 +8491,161 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         print(f"current_run_similarity: duplicate_with={duplicate_report['matched_version'] or '无'}, score={float(duplicate_report['similarity_score']):.2f}, is_duplicate={'是' if duplicate_report['is_duplicate'] else '否'}")
         print(f"final_duplicate_decision: {duplicate_report['decision']}")
         if duplicate_report["is_duplicate"]:
-            duplicate_strategy_path = version_dir / "strategy.duplicate.py"
-            duplicate_strategy_path.write_text(code, encoding="utf-8")
-            matched_code = ""
-            matched_version = duplicate_report.get("matched_version") or ""
-            if matched_version:
-                matched_strategy_path = run_dir / str(matched_version) / "strategy.py"
-                if matched_strategy_path.exists():
-                    matched_code = matched_strategy_path.read_text(encoding="utf-8", errors="ignore")
-            if not matched_code and matched_tested:
-                matched_code = str(matched_tested.get("code") or "")
-            duplicate_reason = {
-                "duplicate_with_version": duplicate_report.get("matched_version", ""),
-                "similarity_score": duplicate_report.get("similarity_score", 0.0),
-                "repeated_fingerprint_fields": duplicate_report.get("repeated_fingerprint_fields", []),
-                "mutation_type": mutation_type,
-                "expected_changes": duplicate_report.get("expected_changes", []),
-                "detected_changes": duplicate_report.get("detected_changes", []),
-                "why_rejected": duplicate_report.get("why_rejected", ""),
-            }
-            write_json(version_dir / "duplicate_reason.json", duplicate_reason)
-            (version_dir / "duplicate_diff_summary.txt").write_text(
-                build_duplicate_diff_summary(
-                    version=ver,
-                    matched_version=str(duplicate_report.get("matched_version") or ""),
-                    similarity_score=float(duplicate_report.get("similarity_score") or 0.0),
-                    mutation_type=mutation_type,
-                    expected_changes=list(duplicate_report.get("expected_changes") or []),
-                    detected_changes=list(duplicate_report.get("detected_changes") or []),
-                    repeated_fields=list(duplicate_report.get("repeated_fingerprint_fields") or []),
-                    current_code=code,
-                    matched_code=matched_code,
-                ),
-                encoding="utf-8",
-            )
-            print(f"重复策略草稿已保存：{duplicate_strategy_path}")
-            print(f"重复原因已保存：{version_dir / 'duplicate_reason.json'}")
-            print(f"重复 diff 摘要已保存：{version_dir / 'duplicate_diff_summary.txt'}")
-            invalid_reason = "策略与本次 run 已测试策略高度重复"
-            previous_failure_reason = invalid_reason
-            status["train_backtest_status"] = "跳过"
-            status["validation_backtest_status"] = "跳过"
-            status["is_valid"] = False
-            status["is_best"] = False
-            status["invalid_reason"] = invalid_reason
-            status["final_score"] = 0.0
-            iteration_stats["invalid_strategy_count"] += 1
-            print("策略与本次 run 已测试策略高度重复，跳过训练/验证回测。")
-            print(f"重复对象：{duplicate_report['matched_version']} {duplicate_report['matched_strategy_class']}，相似度 {float(duplicate_report['similarity_score']):.2f}")
-            summary_path = write_iteration_summary({
-                "features": features,
-                "strategy_fingerprint": strategy_fingerprint,
-                "duplicate_report": duplicate_report,
-                "final_score": 0.0,
-                "invalid_reason": invalid_reason,
-            })
-            update_session_state_after_round(summary_path=summary_path)
-            leaderboard.append(enrich_leaderboard_entry({
-                "version": ver,
-                "run_id": run_id,
-                "strategy_class": class_name,
-                "strategy_file": str(strategy_file),
-                "strategy_fingerprint": strategy_fingerprint,
-                "duplicate_report": duplicate_report,
-                "is_valid": False,
-                "is_best": False,
-                "invalid_reason": invalid_reason,
-                "final_score": 0.0,
-            }))
-            flush_iteration_stats()
-            continue
+            for duplicate_retry_idx in range(1, 3):
+                print(f"重复策略触发同版本 codegen retry：{duplicate_retry_idx}/2，切换下一个 codegen provider。")
+                code_runtime.forced_provider_offset = int(getattr(code_runtime, "forced_provider_offset", 0) or 0) + 1
+                retry_prompt = (
+                    f"【同一版本强制重试 {duplicate_retry_idx}/2】上一次代码与 {ver} 已测策略完全重复，必须改变 populate_entry_trend 的实际条件和至少一个指标，否则视为失败。\n"
+                    "必须改变 entry_conditions / indicators / populate_entry_trend；禁止只改注释、类名、ROI 或 stoploss；禁止 widen_entry_controlled。\n"
+                    + prompt
+                )
+                (version_dir / f"codegen_retry_{duplicate_retry_idx}_prompt.txt").write_text(retry_prompt, encoding="utf-8")
+                try:
+                    retry_response_text = safe_ask_ai(
+                        code_runtime,
+                        [{"role": "user", "content": retry_prompt}],
+                        state=ai_runtime_state,
+                    )
+                except AIRequestFailed as exc:
+                    print(f"重复策略 retry {duplicate_retry_idx}/2 调用失败：{exc}")
+                    continue
+                (version_dir / f"codegen_retry_{duplicate_retry_idx}.raw.txt").write_text(retry_response_text, encoding="utf-8")
+                status["codegen_status"] = "成功"
+                iteration_stats["codegen_success_count"] += 1
+                code = extract_python_code(retry_response_text)
+                features = extract_strategy_features(code)
+                strategy_fingerprint = build_strategy_fingerprint(features)
+                signature = strategy_fingerprint["hash"]
+                code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
+                duplicate_report = {
+                    "is_duplicate": False,
+                    "strategy_fingerprint": strategy_fingerprint,
+                    "matched_hash": "",
+                    "matched_version": "",
+                    "matched_strategy_class": "",
+                    "similarity_score": 0.0,
+                    "reasons": [],
+                    "decision": "continue",
+                    "repeated_fingerprint_fields": [],
+                    "mutation_type": mutation_type,
+                    "expected_changes": _mutation_expected_changes(strategy_spec),
+                    "detected_changes": [],
+                    "why_rejected": "",
+                    "codegen_retry_count": duplicate_retry_idx,
+                }
+                matched_tested = None
+                for tested in tested_strategy_fingerprints:
+                    tested_fp = tested.get("strategy_fingerprint", {}) or {}
+                    tested_features = tested.get("features", {}) or {}
+                    fp_equal = str((tested_fp.get("hash") or "")) == str(strategy_fingerprint.get("hash"))
+                    fp_score, fp_reasons = strategy_similarity(features, tested_features)
+                    if fp_equal or fp_score >= 0.98:
+                        duplicate_report.update({
+                            "is_duplicate": True,
+                            "matched_hash": str(tested_fp.get("hash") or ""),
+                            "matched_version": str(tested.get("version") or ""),
+                            "matched_strategy_class": str(tested.get("strategy_class") or ""),
+                            "similarity_score": 1.0 if fp_equal else round(float(fp_score), 4),
+                            "reasons": (["strategy_fingerprint 完全相同"] if fp_equal else fp_reasons),
+                            "decision": "retry_duplicate" if duplicate_retry_idx < 2 else "skip_backtest",
+                            "repeated_fingerprint_fields": repeated_fingerprint_fields(features, tested_features),
+                            "detected_changes": _detected_feature_changes(features, tested_features),
+                            "why_rejected": "同一版本 codegen retry 后仍与本次 run 已测试策略重复。",
+                        })
+                        matched_tested = tested
+                        break
+                write_json(version_dir / "strategy_fingerprint.json", strategy_fingerprint)
+                write_json(version_dir / "duplicate_report.json", duplicate_report)
+                print(f"retry current_run_similarity: duplicate_with={duplicate_report['matched_version'] or '无'}, score={float(duplicate_report['similarity_score']):.2f}, is_duplicate={'是' if duplicate_report['is_duplicate'] else '否'}")
+                if not duplicate_report["is_duplicate"]:
+                    print("同版本 codegen retry 已生成非重复策略，继续训练/验证。")
+                    break
+
+            if not duplicate_report["is_duplicate"]:
+                duplicate_report["decision"] = "continue_after_retry"
+                write_json(version_dir / "duplicate_report.json", duplicate_report)
+            else:
+                duplicate_strategy_path = version_dir / "strategy.duplicate.py"
+                duplicate_strategy_path.write_text(code, encoding="utf-8")
+                matched_code = ""
+                matched_version = duplicate_report.get("matched_version") or ""
+                if matched_version:
+                    matched_strategy_path = run_dir / str(matched_version) / "strategy.py"
+                    if matched_strategy_path.exists():
+                        matched_code = matched_strategy_path.read_text(encoding="utf-8", errors="ignore")
+                if not matched_code and matched_tested:
+                    matched_code = str(matched_tested.get("code") or "")
+                duplicate_reason = {
+                    "duplicate_with_version": duplicate_report.get("matched_version", ""),
+                    "similarity_score": duplicate_report.get("similarity_score", 0.0),
+                    "repeated_fingerprint_fields": duplicate_report.get("repeated_fingerprint_fields", []),
+                    "mutation_type": mutation_type,
+                    "expected_changes": duplicate_report.get("expected_changes", []),
+                    "detected_changes": duplicate_report.get("detected_changes", []),
+                    "why_rejected": duplicate_report.get("why_rejected", ""),
+                }
+                write_json(version_dir / "duplicate_reason.json", duplicate_reason)
+                (version_dir / "duplicate_diff_summary.txt").write_text(
+                    build_duplicate_diff_summary(
+                        version=ver,
+                        matched_version=str(duplicate_report.get("matched_version") or ""),
+                        similarity_score=float(duplicate_report.get("similarity_score") or 0.0),
+                        mutation_type=mutation_type,
+                        expected_changes=list(duplicate_report.get("expected_changes") or []),
+                        detected_changes=list(duplicate_report.get("detected_changes") or []),
+                        repeated_fields=list(duplicate_report.get("repeated_fingerprint_fields") or []),
+                        current_code=code,
+                        matched_code=matched_code,
+                    ),
+                    encoding="utf-8",
+                )
+                print(f"重复策略草稿已保存：{duplicate_strategy_path}")
+                print(f"重复原因已保存：{version_dir / 'duplicate_reason.json'}")
+                print(f"重复 diff 摘要已保存：{version_dir / 'duplicate_diff_summary.txt'}")
+                duplicate_strategy_failure = True
+                round_state["duplicate_strategy_failure"] = True
+                round_state["failure_type"] = "duplicate_strategy"
+                invalid_reason = "duplicate_strategy：策略与本次 run 已测试策略高度重复"
+                failure_reason = invalid_reason
+                previous_failure_reason = invalid_reason
+                status["train_backtest_status"] = "跳过"
+                status["validation_backtest_status"] = "跳过"
+                status["is_valid"] = False
+                status["is_best"] = False
+                status["invalid_reason"] = invalid_reason
+                status["final_score"] = 0.0
+                iteration_stats["invalid_strategy_count"] += 1
+                print("策略与本次 run 已测试策略高度重复，跳过训练/验证回测。")
+                print(f"重复对象：{duplicate_report['matched_version']} {duplicate_report['matched_strategy_class']}，相似度 {float(duplicate_report['similarity_score']):.2f}")
+                summary_path = write_iteration_summary({
+                    "features": features,
+                    "strategy_fingerprint": strategy_fingerprint,
+                    "duplicate_report": duplicate_report,
+                    "final_score": 0.0,
+                    "invalid_reason": invalid_reason,
+                    "failure_reason": invalid_reason,
+                    "failure_type": "duplicate_strategy",
+                    "duplicate_strategy_failure": True,
+                    "zero_trade_failure": False,
+                })
+                update_session_state_after_round(summary_path=summary_path)
+                leaderboard.append(enrich_leaderboard_entry({
+                    "version": ver,
+                    "run_id": run_id,
+                    "strategy_class": class_name,
+                    "strategy_file": str(strategy_file),
+                    "strategy_fingerprint": strategy_fingerprint,
+                    "duplicate_report": duplicate_report,
+                    "failure_type": "duplicate_strategy",
+                    "duplicate_strategy_failure": True,
+                    "zero_trade_failure": False,
+                    "is_valid": False,
+                    "is_best": False,
+                    "invalid_reason": invalid_reason,
+                    "final_score": 0.0,
+                }))
+                flush_iteration_stats()
+                continue
 
         strategy_file.parent.mkdir(parents=True, exist_ok=True)
         strategy_file.write_text(code, encoding="utf-8")
@@ -9064,7 +9206,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         if hard_invalid_reason:
             final_score = 0
         if severe_high_frequency_failure:
-            final_score = 0.0
+            final_score = min(final_score, 0.0)
         elif train_trades > max_trades:
             final_score = min(final_score, 0.0)
         if validation_high_frequency_failure:
@@ -9113,6 +9255,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         if not is_valid:
             previous_failure_reason = invalid_reason
         failure_reasons = []
+        if severe_high_frequency_failure:
+            failure_reasons.append("训练区间交易数严重超过目标上限")
         if _safe_float(train_metrics.get("profit_total_pct")) < _safe_float((runtime_goal.get("baseline", {}) or {}).get("profit_total_pct")):
             failure_reasons.append("训练区间亏损超过 baseline")
         if _safe_float(train_metrics.get("profit_factor")) < _safe_float((runtime_goal.get("baseline", {}) or {}).get("profit_factor")):
@@ -9246,7 +9390,15 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             iteration_stats["valid_strategy_count"] += 1
         else:
             iteration_stats["invalid_strategy_count"] += 1
-        if session_best is None or final_score > float(session_best.get("final_score", -1e18)):
+        if (
+            not severe_high_frequency_failure
+            and not runtime_error_failure
+            and not duplicate_strategy_failure
+            and not backtest_result_missing_failure
+            and validation_metrics
+            and final_score > 0
+            and (session_best is None or final_score > float(session_best.get("final_score", -1e18)))
+        ):
             session_best = {"version": ver, "class_name": class_name, "final_score": final_score, "is_valid": is_valid, "invalid_reason": invalid_reason, "not_best_reason": not_best_reason}
         score_breakdown = {
             "train_score": train_score,
@@ -9399,6 +9551,13 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "strategy_fingerprint": strategy_fingerprint,
             "duplicate_report": duplicate_report,
             "behavior_duplicate": behavior_duplicate,
+            "high_frequency_failure": high_frequency_failure,
+            "severe_high_frequency_failure": severe_high_frequency_failure,
+            "validation_high_frequency_failure": validation_high_frequency_failure,
+            "duplicate_strategy_failure": duplicate_strategy_failure,
+            "backtest_result_missing_failure": backtest_result_missing_failure,
+            "zip_mismatch_failure": zip_mismatch_failure,
+            "runtime_error_failure": runtime_error_failure,
             "not_best_reason": not_best_reason,
             "official_best_hard_gate_reasons": official_gate_reasons,
             "spec_hash": spec_hash,
@@ -9407,7 +9566,13 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "avoid_next": "降低高频宽松入场，控制回撤与止损亏损。",
             **_extract_exit_profit_fields(train_metrics),
         }
-        round_near_miss_info = _detect_near_miss(leaderboard_entry, target_cfg)
+        round_near_miss_info = {} if severe_high_frequency_failure else _detect_near_miss(leaderboard_entry, target_cfg)
+        if severe_high_frequency_failure:
+            near_miss = False
+            near_miss_type = ""
+            leaderboard_entry["near_miss"] = False
+            summary["near_miss"] = False
+            summary["near_miss_type"] = ""
         if round_near_miss_info:
             round_near_miss_info["source_run_id"] = run_id
             round_near_miss_info["source_version"] = ver
@@ -9609,6 +9774,13 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "strategy_fingerprint": strategy_fingerprint,
             "duplicate_report": duplicate_report,
             "behavior_duplicate": behavior_duplicate,
+            "high_frequency_failure": high_frequency_failure,
+            "severe_high_frequency_failure": severe_high_frequency_failure,
+            "validation_high_frequency_failure": validation_high_frequency_failure,
+            "duplicate_strategy_failure": duplicate_strategy_failure,
+            "backtest_result_missing_failure": backtest_result_missing_failure,
+            "zip_mismatch_failure": zip_mismatch_failure,
+            "runtime_error_failure": runtime_error_failure,
             "not_best_reason": not_best_reason,
             "mutation_type": mutation_type,
             "strategy_family": selected_strategy_family,
