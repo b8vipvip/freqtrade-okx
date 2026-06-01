@@ -80,14 +80,14 @@
   },
   "prompt_guidance": {
     "advisor_rules": [
-    "当前固定使用 BTC/USDT、OP/USDT、SOL/USDT、BNB/USDT、DOGE/USDT 五个交易对。",
-    "本次交易数目标由 auto_trade_count_target 自动计算，当前为 20~60，理想区间 25~45。",
-    "不要生成明显高频策略，训练交易数超过 60 的策略没有意义。",
-    "如果某个策略盈利但交易数低于 20，应优先轻微放宽入场，把交易数提升到 20~25，而不是换完全不同结构。",
-    "不要简单用 trailing 替代 fixed stoploss。trailing 只能在已有盈利后启用，不能让移动止损成为主要亏损来源。",
-    "当前核心目标是减少低质量入场和亏损单数量，不是盲目提高交易频率。",
-    "如果某个 family 连续产生高频亏损，应降低该 family 权重。"
-  ],
+      "当前固定使用 BTC/USDT、OP/USDT、SOL/USDT、BNB/USDT、DOGE/USDT 五个交易对。",
+      "本次交易数目标由 auto_trade_count_target 自动计算，当前为 20~60，理想区间 25~45。",
+      "不要生成明显高频策略，训练交易数超过 60 的策略没有意义。",
+      "如果某个策略盈利但交易数低于 20，应优先轻微放宽入场，把交易数提升到 20~25，而不是换完全不同结构。",
+      "不要简单用 trailing 替代 fixed stoploss。trailing 只能在已有盈利后启用，不能让移动止损成为主要亏损来源。",
+      "当前核心目标是减少低质量入场和亏损单数量，不是盲目提高交易频率。",
+      "如果某个 family 连续产生高频亏损，应降低该 family 权重。"
+    ],
     "codegen_rules": [
       "必须真实落地 mutation_spec。",
       "禁止只改 class name、注释、变量名。",
@@ -138,5 +138,15 @@
     "ideal_max_trades_per_pair": 9,
     "max_trades_per_pair": 12,
     "hard_max_trades": 120
-  }
+  },
+  "early_stopping": {
+    "enabled": true,
+    "patience": 50,
+    "min_iterations_before_stop": 50,
+    "monitor": "multi_metric_progress",
+    "reset_on_nearest_candidate_improvement": true,
+    "reset_on_session_best_improvement": true,
+    "reset_on_stoploss_to_roi_improvement": true
+  },
+  "use_pre_run_parent_recommendation": true
 }

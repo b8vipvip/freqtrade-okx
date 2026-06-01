@@ -364,25 +364,48 @@ def _detect_near_miss(row: dict[str, Any], target_cfg: dict[str, Any]) -> dict[s
     train_pf = _safe_float(row.get("train_profit_factor", row.get("profit_factor")))
     validations = row.get("validation_metrics", []) or []
     val_rows = [(v.get("metrics", {}) or {}) for v in validations if isinstance(v, dict)]
-    profitable_vals = sum(1 for m in val_rows if _safe_float(m.get("profit_total_pct")) > 0 or _safe_float(m.get("profit_factor")) > 1)
-    bad_vals = sum(1 for m in val_rows if _safe_float(m.get("profit_total_pct")) < -0.5)
-    failure = str(row.get("failure_reason") or row.get("invalid_reason") or "")
+    val_profit_values = [_safe_float(m.get("profit_total_pct")) for m in val_rows]
+    val_pf_values = [_safe_float(m.get("profit_factor")) for m in val_rows]
+    validation_avg_profit = _safe_float(row.get("validation_avg_profit_pct", row.get("avg_validation_profit_pct")))
+    if val_profit_values and not validation_avg_profit:
+        validation_avg_profit = sum(val_profit_values) / len(val_profit_values)
+    worst_validation_pf = _safe_float(row.get("validation_worst_profit_factor"))
+    if val_pf_values and not worst_validation_pf:
+        worst_validation_pf = min(val_pf_values)
+    worst_validation_profit = _safe_float(row.get("validation_worst_profit_pct"))
+    if val_profit_values and not worst_validation_profit:
+        worst_validation_profit = min(val_profit_values)
+    worst_month = str(row.get("validation_worst_month") or "")
+    bad_vals = sum(1 for v in val_profit_values if v < -0.5)
+    near_vals = sum(1 for v in val_profit_values if v >= -0.5)
+    failure = str(row.get("failure_reason") or row.get("not_best_reason") or row.get("invalid_reason") or "")
     sl_roi = _safe_float(row.get("stoploss_to_roi_ratio"))
+    roi_profit_abs = _safe_float(row.get("roi_profit_abs"))
+    stop_loss_profit_abs = _safe_float(row.get("stop_loss_profit_abs"))
+
     near_type = ""
     failed_due_to: list[str] = []
     mutation = ""
-    if min_trades <= trades <= max_trades and train_profit > -0.4 and train_pf >= 0.65 and profitable_vals >= 1 and ("stoploss" in failure or "worst_month" in failure or "validation_loss" in failure or sl_roi > 1.2):
+    if train_profit > 0 and train_pf > 1 and validation_avg_profit < 0 and worst_validation_pf < 0.7:
+        near_type = "train_positive_validation_weak"
+        failed_due_to = ["训练期盈利/PF>1，但验证平均亏损且 worst_validation_pf<0.7"]
+        mutation = "anti_overfit_filter / regime_filter / pair_specific_filter"
+    elif roi_profit_abs > 0 and abs(stop_loss_profit_abs) > roi_profit_abs:
+        near_type = "risk_control_near_miss"
+        failed_due_to = ["fixed stoploss 吞噬 ROI", f"stoploss_to_roi_ratio={sl_roi:.4f}"]
+        mutation = "add_regime_filter / avoid_choppy_market_filter / pair_specific_entry_threshold"
+    elif val_rows and bad_vals == 1 and near_vals >= 1 and (worst_validation_profit < -0.5 or worst_validation_pf < 0.7):
+        near_type = "worst_month_near_miss"
+        failed_due_to = [f"{worst_month or '某个验证月份'} 严重拖累", f"worst_validation_pf={worst_validation_pf:.4f}"]
+        mutation = "add_worst_month_filter / market_regime_filter / volatility_contraction_filter"
+    elif train_profit > 0 and train_pf > 1 and trades < min_trades:
+        near_type = "low_trade_profitable_near_miss"
+        failed_due_to = ["训练收益>0 且 PF>1，但交易数低于 min_trades"]
+        mutation = "widen_entry_controlled"
+    elif min_trades <= trades <= max_trades and train_profit > -0.4 and train_pf >= 0.65 and ("stoploss" in failure or "worst_month" in failure or "validation_loss" in failure or sl_roi > 1.2):
         near_type = "risk_control_near_miss"
         failed_due_to = [x for x in ["stoploss_to_roi_ratio 高" if sl_roi > 1.2 else "", "worst_month/validation_loss" if ("worst_month" in failure or "validation_loss" in failure) else ""] if x]
         mutation = "add_regime_filter / pair_specific_entry_threshold / tighten_bad_pair_entry"
-    elif train_profit > 0 and train_pf > 1 and trades < min_trades:
-        near_type = "low_trade_profitable_near_miss"
-        failed_due_to = ["训练交易数低于 min_trades"]
-        mutation = "widen_entry_controlled"
-    elif val_rows and bad_vals == 1 and (len(val_rows) - bad_vals) >= 1:
-        near_type = "validation_one_month_bad_near_miss"
-        failed_due_to = ["只有一个 worst_month 明显亏损"]
-        mutation = "add_worst_month_filter / avoid_choppy_market_filter"
     if not near_type:
         return {}
     return {
@@ -393,11 +416,185 @@ def _detect_near_miss(row: dict[str, Any], target_cfg: dict[str, Any]) -> dict[s
             "train_total_trades": trades,
             "train_profit_pct": train_profit,
             "train_profit_factor": train_pf,
-            "validation_avg_profit_pct": _safe_float(row.get("validation_avg_profit_pct", row.get("avg_validation_profit_pct"))),
-            "validation_worst_profit_pct": _safe_float(row.get("validation_worst_profit_pct")),
-            "validation_worst_profit_factor": _safe_float(row.get("validation_worst_profit_factor")),
+            "validation_avg_profit_pct": validation_avg_profit,
+            "validation_worst_profit_pct": worst_validation_profit,
+            "validation_worst_profit_factor": worst_validation_pf,
+            "validation_worst_month": worst_month,
+            "roi_profit_abs": roi_profit_abs,
+            "stop_loss_profit_abs": stop_loss_profit_abs,
             "stoploss_to_roi_ratio": sl_roi,
         },
+    }
+
+
+FAILURE_TYPE_TO_MUTATION_MAP: dict[str, dict[str, list[str]]] = {
+    "stoploss_to_roi_high": {
+        "prefer": ["add_regime_filter", "avoid_choppy_market_filter", "pair_specific_entry_threshold"],
+        "avoid": ["adjust_roi_only", "replace_stoploss_with_trailing"],
+    },
+    "worst_month_loss": {
+        "prefer": ["add_worst_month_filter", "market_regime_filter", "volatility_contraction_filter"],
+        "avoid": ["adjust_roi_only", "remove_risk_filter"],
+    },
+    "zero_trade": {
+        "prefer": ["widen_entry_controlled"],
+        "avoid": ["tighten_entry_trigger"],
+    },
+    "high_frequency": {
+        "prefer": ["reduce_trade_frequency", "add_cooldown", "stricter_adx"],
+        "avoid": ["remove_bad_entry_condition"],
+    },
+    "train_positive_validation_negative": {
+        "prefer": ["anti_overfit_filter", "regime_filter", "pair_specific_filter"],
+        "avoid": ["increase_trade_frequency", "adjust_roi_only"],
+    },
+    "low_trade_profitable": {
+        "prefer": ["widen_entry_controlled"],
+        "avoid": ["tighten_entry_trigger", "add_entry_filter"],
+    },
+    "general_improvement": {
+        "prefer": ["add_entry_filter", "pair_specific_filter", "tag_specific_filter"],
+        "avoid": ["random_rewrite", "replace_stoploss_with_trailing"],
+    },
+}
+
+
+def _infer_failure_type(summary: dict[str, Any] | None, nearest: dict[str, Any] | None = None) -> str:
+    data = summary if isinstance(summary, dict) and summary else {}
+    near_type = str((nearest or {}).get("near_miss_type") or data.get("near_miss_type") or "")
+    if near_type == "risk_control_near_miss":
+        return "stoploss_to_roi_high"
+    if near_type == "worst_month_near_miss":
+        return "worst_month_loss"
+    if near_type == "train_positive_validation_weak":
+        return "train_positive_validation_negative"
+    if near_type == "low_trade_profitable_near_miss":
+        return "low_trade_profitable"
+    failure_blob = json.dumps({"summary": data, "nearest": nearest or {}}, ensure_ascii=False).lower()
+    train = data.get("train_metrics", {}) if isinstance(data.get("train_metrics"), dict) else {}
+    trade_value = data.get("train_total_trades", train.get("total_trades"))
+    has_trade_value = trade_value is not None and str(trade_value) != ""
+    if data.get("zero_trade_failure") or (has_trade_value and _safe_int(trade_value) == 0) or "0 交易" in failure_blob:
+        return "zero_trade"
+    if data.get("high_frequency_failure") or data.get("severe_high_frequency_failure") or "high_frequency" in failure_blob or "交易数超过" in failure_blob:
+        return "high_frequency"
+    if data.get("stoploss_to_roi_failure") or _safe_float(data.get("stoploss_to_roi_ratio")) > 1.2 or "止损" in failure_blob or "stoploss" in failure_blob:
+        return "stoploss_to_roi_high"
+    if _safe_float(data.get("validation_worst_profit_pct")) < -0.5 or _safe_float(data.get("validation_worst_profit_factor")) < 0.7 or "worst_month" in failure_blob:
+        return "worst_month_loss"
+    if _safe_float(train.get("profit_total_pct", data.get("train_profit_pct"))) > 0 and _safe_float(data.get("validation_avg_profit_pct")) < 0:
+        return "train_positive_validation_negative"
+    if data.get("trade_under_min") or data.get("low_trade_failure"):
+        return "low_trade_profitable"
+    return "general_improvement"
+
+
+def _mutation_policy_for_failure_type(failure_type: str) -> dict[str, list[str]]:
+    return FAILURE_TYPE_TO_MUTATION_MAP.get(failure_type) or FAILURE_TYPE_TO_MUTATION_MAP["general_improvement"]
+
+
+def _candidate_has_valid_file(candidate: dict[str, Any] | None) -> bool:
+    return isinstance(candidate, dict) and _resolve_strategy_file(candidate.get("strategy_file")) is not None
+
+
+def _leaderboard_record(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(row, dict) or not row:
+        return None
+    return {
+        "version": row.get("version", ""),
+        "strategy_class": row.get("strategy_class", ""),
+        "strategy_file": row.get("strategy_file", ""),
+        "train_metrics": {
+            "profit_total_pct": row.get("train_profit_pct"),
+            "profit_total_abs": row.get("train_profit_abs"),
+            "profit_factor": row.get("profit_factor"),
+            "max_drawdown_pct": row.get("max_drawdown_pct"),
+            "total_trades": row.get("total_trades"),
+            "roi_profit_abs": row.get("roi_profit_abs"),
+            "stop_loss_profit_abs": row.get("stop_loss_profit_abs"),
+        },
+        "validation_metrics": row.get("validation_metrics", []) or [],
+        "final_score": row.get("final_score", 0.0),
+        "is_valid": bool(row.get("is_valid")),
+        "invalid_reason": row.get("invalid_reason", ""),
+        "features": row.get("features", {}) or {},
+        "avg_validation_metrics": {
+            "profit_total_pct": row.get("validation_avg_profit_pct", row.get("avg_validation_profit_pct")),
+            "profit_factor": row.get("avg_validation_profit_factor"),
+            "worst_profit_factor": row.get("validation_worst_profit_factor"),
+            "worst_profit_pct": row.get("validation_worst_profit_pct"),
+            "worst_month": row.get("validation_worst_month", ""),
+        },
+        "stoploss_to_roi_ratio": row.get("stoploss_to_roi_ratio", 0.0),
+    }
+
+
+def _build_round_parent_pool(
+    *,
+    official_best: dict[str, Any] | None,
+    nearest_candidate: dict[str, Any] | None,
+    session_best: dict[str, Any] | None,
+    leaderboard: list[dict[str, Any]],
+) -> dict[str, dict[str, Any] | None]:
+    rows = [r for r in leaderboard if isinstance(r, dict) and _candidate_has_valid_file(r)]
+    best_train = max(rows, key=lambda r: (_safe_float(r.get("train_profit_pct")), _safe_float(r.get("profit_factor"))), default=None)
+    apr_rows = [r for r in rows if any("apr" in str((v or {}).get("period", "")).lower() or "202604" in str((v or {}).get("timerange", "")) for v in (r.get("validation_metrics") or []))]
+    best_apr = max(apr_rows or rows, key=lambda r: _safe_float(r.get("avg_validation_profit_factor")), default=None)
+    low_sl = min(rows, key=lambda r: _safe_float(r.get("stoploss_to_roi_ratio", 1e18)), default=None)
+    worst_month = max(rows, key=lambda r: (_safe_float(r.get("validation_worst_profit_factor")), _safe_float(r.get("validation_worst_profit_pct"))), default=None)
+    return {
+        "official_best": official_best,
+        "nearest_candidate": nearest_candidate,
+        "session_best": session_best,
+        "best_train_candidate": _leaderboard_record(best_train),
+        "best_validation_apr_candidate": _leaderboard_record(best_apr),
+        "best_low_stoploss_candidate": _leaderboard_record(low_sl),
+        "best_worst_month_candidate": _leaderboard_record(worst_month),
+    }
+
+
+def _select_round_parent(
+    *,
+    parent_pool: dict[str, dict[str, Any] | None],
+    failure_type: str,
+    default_parent: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if failure_type in {"stoploss_to_roi_high"}:
+        order = ["nearest_candidate", "best_low_stoploss_candidate", "session_best", "official_best"]
+        repair_target = "修 stoploss/ROI 风险控制"
+    elif failure_type == "worst_month_loss":
+        order = ["nearest_candidate", "best_worst_month_candidate", "best_validation_apr_candidate", "official_best"]
+        repair_target = "修 worst month 稳定性"
+    elif failure_type == "train_positive_validation_negative":
+        order = ["nearest_candidate", "best_train_candidate", "session_best", "official_best"]
+        repair_target = "修训练盈利但验证转负的过拟合"
+    elif failure_type == "low_trade_profitable":
+        order = ["nearest_candidate", "best_train_candidate", "session_best", "official_best"]
+        repair_target = "修低交易数盈利 near-miss"
+    elif failure_type == "high_frequency":
+        order = ["official_best", "best_low_stoploss_candidate", "session_best", "nearest_candidate"]
+        repair_target = "修交易频率过高"
+    elif failure_type == "zero_trade":
+        order = ["official_best", "session_best", "nearest_candidate"]
+        repair_target = "修零交易"
+    else:
+        order = ["nearest_candidate", "session_best", "official_best"]
+        repair_target = "修 official 稳定性 / 综合改进"
+    selected_source = "default_parent"
+    selected = default_parent or {}
+    for source in order:
+        candidate = parent_pool.get(source)
+        if _candidate_has_valid_file(candidate) or (source == "official_best" and isinstance(candidate, dict)):
+            selected_source = source
+            selected = candidate or selected
+            break
+    code = _load_strategy_code_from_record(selected) if _candidate_has_valid_file(selected) else _load_strategy_code_from_record(default_parent)
+    return {
+        "source": selected_source,
+        "meta": selected or default_parent or {},
+        "code": code,
+        "reason": f"failure_type={failure_type}，按受控 parent_pool 顺序选择 {selected_source}",
+        "repair_target": repair_target,
     }
 
 def _build_strategy_family_leaderboard(rows: list[dict[str, Any]], family_stats: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -2694,6 +2891,7 @@ def _pre_run_recommends_nearest_parent(review: dict[str, Any] | None) -> tuple[b
 def _select_actual_session_parent_for_run(
     *,
     explore_strategy_family: bool,
+    use_pre_run_parent_recommendation: bool,
     pre_run_ai_review: dict[str, Any] | None,
     historical_champion: dict[str, Any],
     nearest_mem: dict[str, Any] | None,
@@ -2704,8 +2902,11 @@ def _select_actual_session_parent_for_run(
     actual.setdefault("source", "historical_best")
     overwritten = False
     choice_reason = "默认使用 historical_best / 当前 champion 作为本次 session_parent。"
-    if explore_strategy_family and recommended_nearest:
-        if nearest_valid and isinstance(nearest_mem, dict):
+    recommendation_allowed = bool(explore_strategy_family or use_pre_run_parent_recommendation)
+    if recommended_nearest:
+        if not recommendation_allowed:
+            choice_reason = f"{reason}，但 use_pre_run_parent_recommendation=false 且不是 explore-strategy-family 模式，fallback 到 historical_best。"
+        elif nearest_valid and isinstance(nearest_mem, dict):
             actual = {"meta": nearest_mem, "code": _load_strategy_code_from_record(nearest_mem), "source": "nearest_candidate_session_parent"}
             overwritten = True
             choice_reason = f"{reason}，且 nearest_candidate 策略文件有效；仅覆盖本次 run 的 session_parent，不覆盖 official best。"
@@ -2716,11 +2917,225 @@ def _select_actual_session_parent_for_run(
     actual["session_parent_choice"] = {
         "pre_run_preferred_parent": preferred_parent or "未明确",
         "actual_parent": _strategy_label(actual.get("meta"), "baseline"),
+        "actual_session_parent": _strategy_label(actual.get("meta"), "baseline"),
         "reason": choice_reason,
+        "actual_session_parent_reason": choice_reason,
         "overrode_historical_best_for_session": overwritten,
+        "did_override_historical_best_for_session": overwritten,
         "nearest_candidate_file_valid": nearest_valid,
+        "use_pre_run_parent_recommendation": bool(use_pre_run_parent_recommendation),
     }
     return actual
+
+
+EARLY_STOPPING_DEFAULTS = {
+    "enabled": True,
+    "patience": 50,
+    "min_iterations_before_stop": 50,
+    "monitor": "multi_metric_progress",
+    "allow_disable_for_long_run": True,
+    "reset_on_nearest_candidate_improvement": True,
+    "reset_on_session_best_improvement": True,
+    "reset_on_stoploss_to_roi_improvement": True,
+}
+
+
+def _resolve_early_stopping_settings(runtime_goal: dict[str, Any], args: argparse.Namespace, iterations: int) -> dict[str, Any]:
+    raw = runtime_goal.get("early_stopping", {}) if isinstance(runtime_goal.get("early_stopping"), dict) else {}
+    cfg = dict(EARLY_STOPPING_DEFAULTS)
+    cfg.update(raw)
+    cli_disabled = bool(getattr(args, "disable_early_stopping", False))
+    explicit_cli_patience = getattr(args, "early_stop_patience", None)
+    explicit_goal_patience = "patience" in raw
+    if explicit_cli_patience is not None:
+        patience = _safe_int(explicit_cli_patience)
+        patience_source = "cli"
+    elif explicit_goal_patience:
+        patience = _safe_int(raw.get("patience"))
+        patience_source = "optimization_goal.json"
+    elif int(iterations) > 50:
+        patience = max(30, min(int(iterations) // 3, 80))
+        patience_source = "auto_long_run"
+    else:
+        patience = _safe_int(cfg.get("patience"))
+        patience_source = "default"
+    explicit_cli_min = getattr(args, "min_iterations_before_stop", None)
+    if explicit_cli_min is not None:
+        min_before_stop = max(0, _safe_int(explicit_cli_min))
+        min_source = "cli"
+    else:
+        min_before_stop = max(0, _safe_int(cfg.get("min_iterations_before_stop")))
+        min_source = "optimization_goal.json" if "min_iterations_before_stop" in raw else "default"
+    subordinate_disabled = cli_disabled or not bool(cfg.get("enabled", True))
+    if subordinate_disabled:
+        setattr(args, "early_stop_final_score_failures", 0)
+        setattr(args, "early_stop_duplicate_strategies", 0)
+    enabled = bool(cfg.get("enabled", True)) and not cli_disabled and patience > 0
+    allow_stop = bool(enabled and int(iterations) > min_before_stop)
+    return {
+        "enabled": enabled,
+        "disabled_by_cli": cli_disabled,
+        "patience": patience,
+        "patience_source": patience_source,
+        "min_iterations_before_stop": min_before_stop,
+        "min_iterations_before_stop_source": min_source,
+        "monitor": str(cfg.get("monitor") or "multi_metric_progress"),
+        "allow_disable_for_long_run": bool(cfg.get("allow_disable_for_long_run", True)),
+        "reset_on_nearest_candidate_improvement": bool(cfg.get("reset_on_nearest_candidate_improvement", True)),
+        "reset_on_session_best_improvement": bool(cfg.get("reset_on_session_best_improvement", True)),
+        "reset_on_stoploss_to_roi_improvement": bool(cfg.get("reset_on_stoploss_to_roi_improvement", True)),
+        "iterations": int(iterations),
+        "allow_stop": allow_stop,
+    }
+
+
+def _print_early_stopping_settings(settings: dict[str, Any]) -> None:
+    print("\n========== Early Stopping 设置 ==========")
+    print(f"是否启用：{'是' if settings.get('enabled') else '否'}")
+    print(f"patience：{settings.get('patience')}（来源：{settings.get('patience_source')}）")
+    print(f"min_iterations_before_stop：{settings.get('min_iterations_before_stop')}（来源：{settings.get('min_iterations_before_stop_source')}）")
+    print(f"monitor：{settings.get('monitor')}")
+    print(f"本次 iterations：{settings.get('iterations')}")
+    print(f"是否允许提前停止：{'是' if settings.get('allow_stop') else '否'}")
+
+
+def _new_early_stop_monitor_state(nearest_mem: dict[str, Any] | None, target_cfg: dict[str, Any], baseline_cfg: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "no_improvement_rounds": 0,
+        "last_improvement_iteration": 0,
+        "last_improvement_version": "",
+        "last_improvement_reasons": [],
+        "last_no_improvement_reasons": [],
+        "best_session_final_score": -1e18,
+        "best_nearest_score": _nearest_score_for_session(nearest_mem, target_cfg, baseline_cfg),
+        "best_valid_final_score": -1e18,
+        "best_validation_avg_profit_factor": -1e18,
+        "best_worst_validation_profit_factor": -1e18,
+        "best_stoploss_to_roi_ratio": 1e18,
+        "best_worst_month_loss": 1e18,
+        "best_valid_candidate_count": 0,
+    }
+
+
+def _format_early_stop_trigger(settings: dict[str, Any], state: dict[str, Any]) -> str:
+    reasons = state.get("last_no_improvement_reasons") or ["监控指标未超过本 run 已知最好值。"]
+    return (
+        "\n========== Early Stopping 触发 ==========\n"
+        f"连续无改进轮数：{_safe_int(state.get('no_improvement_rounds'))}\n"
+        f"最近一次改进发生在：第 {_safe_int(state.get('last_improvement_iteration'))} 轮 {state.get('last_improvement_version') or '无'}\n"
+        f"监控指标：{settings.get('monitor')}\n"
+        f"为什么判定无改进：{'；'.join(str(x) for x in reasons)}\n"
+        "如何禁用：\n"
+        "  --disable-early-stopping"
+    )
+
+
+def _record_early_stop_monitor_progress(
+    state: dict[str, Any],
+    *,
+    iteration: int,
+    version: str,
+    is_best: bool,
+    is_valid: bool,
+    final_score: float,
+    avg_validation_profit_factor: float,
+    worst_validation_profit_factor: float,
+    stoploss_to_roi_ratio: float,
+    worst_month_loss: float,
+    valid_candidate_count: int,
+    nearest_candidate_record: dict[str, Any] | None,
+    target_cfg: dict[str, Any],
+    baseline_cfg: dict[str, Any],
+    settings: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    eps = 1e-9
+    improvements: list[str] = []
+    no_improvement_reasons: list[str] = []
+    settings = settings or {}
+    improvement_flags = {
+        "official_best_updated": False,
+        "session_best_final_score_improved": False,
+        "nearest_candidate_improved": False,
+        "validation_avg_profit_factor_improved": False,
+        "worst_validation_profit_factor_improved": False,
+        "stoploss_to_roi_ratio_improved": False,
+        "worst_month_loss_reduced": False,
+        "valid_candidate_count_increased": False,
+    }
+    if is_best:
+        improvement_flags["official_best_updated"] = True
+        improvements.append("official_best_updated: official best 更新")
+    if float(final_score) > _safe_float(state.get("best_session_final_score")) + eps:
+        improvement_flags["session_best_final_score_improved"] = True
+        improvements.append(f"session_best_final_score_improved: session_best final_score 提升至 {float(final_score):.6f}")
+        state["best_session_final_score"] = float(final_score)
+    else:
+        no_improvement_reasons.append("session_best final_score 未提升")
+    if is_valid and float(final_score) > _safe_float(state.get("best_valid_final_score")) + eps:
+        improvements.append(f"best valid candidate final_score 提升至 {float(final_score):.6f}")
+        state["best_valid_final_score"] = float(final_score)
+    elif is_valid:
+        no_improvement_reasons.append("本轮有效，但未超过 best valid candidate")
+    if float(avg_validation_profit_factor) > _safe_float(state.get("best_validation_avg_profit_factor")) + eps:
+        improvement_flags["validation_avg_profit_factor_improved"] = True
+        improvements.append(f"validation_avg_profit_factor_improved: validation_avg_profit_factor 提升至 {float(avg_validation_profit_factor):.6f}")
+        state["best_validation_avg_profit_factor"] = float(avg_validation_profit_factor)
+    else:
+        no_improvement_reasons.append("validation_avg_profit_factor 未提升")
+    if float(worst_validation_profit_factor) > _safe_float(state.get("best_worst_validation_profit_factor")) + eps:
+        improvement_flags["worst_validation_profit_factor_improved"] = True
+        improvements.append(f"worst_validation_profit_factor_improved: worst_validation_profit_factor 改善至 {float(worst_validation_profit_factor):.6f}")
+        state["best_worst_validation_profit_factor"] = float(worst_validation_profit_factor)
+    else:
+        no_improvement_reasons.append("worst_validation_profit_factor 未改善")
+    if float(stoploss_to_roi_ratio) >= 0 and float(stoploss_to_roi_ratio) < _safe_float(state.get("best_stoploss_to_roi_ratio")) - eps:
+        improvement_flags["stoploss_to_roi_ratio_improved"] = True
+        improvements.append(f"stoploss_to_roi_ratio_improved: stoploss_to_roi_ratio 下降至 {float(stoploss_to_roi_ratio):.6f}")
+        state["best_stoploss_to_roi_ratio"] = float(stoploss_to_roi_ratio)
+    else:
+        no_improvement_reasons.append("stoploss_to_roi_ratio 未下降")
+    nearest_score = _nearest_score_for_session(nearest_candidate_record, target_cfg, baseline_cfg)
+    if nearest_score < tuple(state.get("best_nearest_score") or (1e18, 1e18, 1e18, 1e18, 1e18)):
+        improvement_flags["nearest_candidate_improved"] = True
+        improvements.append("nearest_candidate_improved: nearest_candidate 排名距离改善")
+        state["best_nearest_score"] = nearest_score
+    else:
+        no_improvement_reasons.append("nearest_candidate 未改善")
+    if float(worst_month_loss) >= 0 and float(worst_month_loss) < _safe_float(state.get("best_worst_month_loss")) - eps:
+        improvement_flags["worst_month_loss_reduced"] = True
+        improvements.append(f"worst_month_loss_reduced: worst month loss 降至 {float(worst_month_loss):.6f}")
+        state["best_worst_month_loss"] = float(worst_month_loss)
+    else:
+        no_improvement_reasons.append("worst_month_loss 未下降")
+    if int(valid_candidate_count) > _safe_int(state.get("best_valid_candidate_count")):
+        improvement_flags["valid_candidate_count_increased"] = True
+        improvements.append(f"valid_candidate_count_increased: 有效候选累计增至 {int(valid_candidate_count)}")
+        state["best_valid_candidate_count"] = int(valid_candidate_count)
+    else:
+        no_improvement_reasons.append("valid_candidate_count 未增加")
+
+    resettable = set()
+    if settings.get("reset_on_nearest_candidate_improvement", True):
+        resettable.add("nearest_candidate_improved")
+    if settings.get("reset_on_session_best_improvement", True):
+        resettable.add("session_best_final_score_improved")
+    if settings.get("reset_on_stoploss_to_roi_improvement", True):
+        resettable.add("stoploss_to_roi_ratio_improved")
+    full_reset = any(improvement_flags.get(k) for k in {"official_best_updated", "validation_avg_profit_factor_improved", "worst_validation_profit_factor_improved", "worst_month_loss_reduced", "valid_candidate_count_increased"}.union(resettable))
+    state["last_improvement_flags"] = improvement_flags
+
+    if improvements and full_reset:
+        state["no_improvement_rounds"] = 0
+        state["last_improvement_iteration"] = int(iteration)
+        state["last_improvement_version"] = version
+        state["last_improvement_reasons"] = improvements
+    elif improvements or is_valid:
+        state["no_improvement_rounds"] = max(0, _safe_int(state.get("no_improvement_rounds")) // 2)
+        state["last_no_improvement_reasons"] = no_improvement_reasons + ["本轮有部分改善或出现有效策略，patience 部分重置。"]
+    else:
+        state["no_improvement_rounds"] = _safe_int(state.get("no_improvement_rounds")) + 1
+        state["last_no_improvement_reasons"] = no_improvement_reasons or ["本轮无可用监控指标改善。"]
+    return {"improved": bool(improvements), "full_reset": bool(full_reset), "improvement_flags": improvement_flags, "improvements": improvements, "no_improvement_reasons": no_improvement_reasons}
 
 
 def _normalize_validation_metric(item: dict[str, Any], fallback_label: str = "validation") -> dict[str, Any]:
@@ -6855,6 +7270,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     )
     champion = _select_actual_session_parent_for_run(
         explore_strategy_family=explore_strategy_family,
+        use_pre_run_parent_recommendation=bool(runtime_goal.get("use_pre_run_parent_recommendation", False)),
         pre_run_ai_review=pre_run_ai_review,
         historical_champion=champion,
         nearest_mem=nearest_mem,
@@ -6869,6 +7285,12 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     print(f"实际父策略：{actual_parent_choice.get('actual_parent', _strategy_label(champion.get('meta'), 'baseline'))}")
     print(f"选择原因：{actual_parent_choice.get('reason', '')}")
     print(f"是否覆盖 historical_best 作为本次 session_parent：{'是' if actual_parent_choice.get('overrode_historical_best_for_session') else '否'}")
+
+    early_stopping_settings = _resolve_early_stopping_settings(runtime_goal, args, iterations)
+    _print_early_stopping_settings(early_stopping_settings)
+    target_cfg_for_early_stop = runtime_goal.get("target", {}) or {}
+    baseline_cfg_for_early_stop = runtime_goal.get("baseline", {}) or {}
+    early_stop_monitor_state = _new_early_stop_monitor_state(nearest_mem, target_cfg_for_early_stop, baseline_cfg_for_early_stop)
 
     iteration_stats: dict[str, Any] = {
         "planned_iterations": int(runtime_goal.get("max_iterations", args.iterations)),
@@ -6890,6 +7312,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         "random_sample_total_backtests": 0,
         "early_stop_triggered": False,
         "early_stop_reason": "",
+        "early_stop_settings": early_stopping_settings,
+        "early_stop_monitor_state": early_stop_monitor_state,
+        "improvement_monitor": early_stop_monitor_state,
         "early_stop_checked_counters": {
             "no_new_best": 0,
             "final_score_failures": 0,
@@ -6919,28 +7344,39 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     def _count_trailing(predicate: Any) -> int:
         return _count_trailing_in_rows(version_statuses, predicate)
 
-    def should_early_stop() -> str:
+    def should_early_stop(next_iteration: int) -> str:
         no_best_count = _count_trailing(lambda row: row.get("advisor_status") != "未执行" and not row.get("is_best"))
         final_score_failure_count = _count_trailing(lambda row: row.get("advisor_status") != "未执行" and _safe_float(row.get("final_score")) <= 0)
         duplicate_count = _count_trailing(_is_duplicate_for_codegen_switch)
+        no_improvement_count = _safe_int(early_stop_monitor_state.get("no_improvement_rounds"))
         iteration_stats["early_stop_checked_counters"] = {
             "no_new_best": no_best_count,
+            "no_monitored_improvement": no_improvement_count,
             "final_score_failures": final_score_failure_count,
             "duplicate_strategies": duplicate_count,
         }
-        if int(args.early_stop_patience) > 0 and no_best_count >= int(args.early_stop_patience):
-            return f"已连续 {int(args.early_stop_patience)} 轮没有新 best，触发 early stopping。"
-        if int(args.early_stop_final_score_failures) > 0 and final_score_failure_count >= int(args.early_stop_final_score_failures):
-            return f"已连续 {int(args.early_stop_final_score_failures)} 轮 final_score<=0，触发 early stopping。"
-        if int(args.early_stop_duplicate_strategies) > 0 and duplicate_count >= int(args.early_stop_duplicate_strategies):
-            return "连续生成重复策略，停止以避免浪费 API。"
+        iteration_stats["early_stop_monitor_state"] = early_stop_monitor_state
+        iteration_stats["improvement_monitor"] = early_stop_monitor_state
+        if not early_stopping_settings.get("allow_stop"):
+            return ""
+        if int(next_iteration) <= _safe_int(early_stopping_settings.get("min_iterations_before_stop")):
+            return ""
+        patience = _safe_int(early_stopping_settings.get("patience"))
+        if patience > 0 and no_improvement_count >= patience:
+            return _format_early_stop_trigger(early_stopping_settings, early_stop_monitor_state)
+        if _safe_int(args.early_stop_final_score_failures) > 0 and final_score_failure_count >= _safe_int(args.early_stop_final_score_failures):
+            early_stop_monitor_state["last_no_improvement_reasons"] = [f"已连续 {_safe_int(args.early_stop_final_score_failures)} 轮 final_score<=0"]
+            return _format_early_stop_trigger(early_stopping_settings, early_stop_monitor_state)
+        if _safe_int(args.early_stop_duplicate_strategies) > 0 and duplicate_count >= _safe_int(args.early_stop_duplicate_strategies):
+            early_stop_monitor_state["last_no_improvement_reasons"] = ["连续生成重复策略，停止以避免浪费 API"]
+            return _format_early_stop_trigger(early_stopping_settings, early_stop_monitor_state)
         return ""
 
     def flush_iteration_stats() -> None:
         update_iteration_global_stats(iteration_stats)
         write_json(iteration_stats_path, iteration_stats)
     for i in range(1, iterations + 1):
-        early_stop_reason = should_early_stop()
+        early_stop_reason = should_early_stop(i)
         if early_stop_reason:
             iteration_stats["early_stop_triggered"] = True
             iteration_stats["early_stop_reason"] = early_stop_reason
@@ -7170,6 +7606,11 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 print(f"第 {ver} 轮成为新 best，下一轮将以该策略作为 in_memory_champion/session_parent 参考。")
                 return
 
+            if strategy_record and not became_best:
+                current_session_best = session_state.get("session_best")
+                if not isinstance(current_session_best, dict) or _safe_float(strategy_record.get("final_score")) > _safe_float(current_session_best.get("final_score")):
+                    session_state["session_best"] = strategy_record
+                    print(f"第 {ver} 轮未成为 official best，但 session_best final_score 有改善，已加入 parent_pool。")
             candidate = nearest_candidate_record or strategy_record
             if candidate and not became_best and _is_better_session_nearest(candidate, session_state.get("session_nearest_candidate"), target_cfg, baseline_cfg):
                 session_state["session_nearest_candidate"] = candidate
@@ -7215,11 +7656,32 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         session_nearest_record = session_state.get("session_nearest_candidate")
         actual_session_parent = session_state.get("actual_session_parent") or in_memory_champion
         actual_session_parent_choice = session_state.get("actual_session_parent_choice", {}) or {}
+        current_failure_type = _infer_failure_type(last_round_summary if isinstance(last_round_summary, dict) else {}, session_nearest_record if isinstance(session_nearest_record, dict) else nearest_mem)
+        mutation_policy = _mutation_policy_for_failure_type(current_failure_type)
+        round_parent_pool = _build_round_parent_pool(
+            official_best=official_champion,
+            nearest_candidate=session_nearest_record,
+            session_best=session_best_record,
+            leaderboard=leaderboard,
+        )
+        selected_round_parent = _select_round_parent(
+            parent_pool=round_parent_pool,
+            failure_type=current_failure_type,
+            default_parent=actual_session_parent,
+        )
+        # `champion` remains the code-generation parent for this round only; official_best is kept separately in session_state.
+        champion = {"meta": selected_round_parent.get("meta") or actual_session_parent, "code": selected_round_parent.get("code", ""), "source": selected_round_parent.get("source", "parent_pool")}
+        actual_session_parent = champion.get("meta") or actual_session_parent
         session_parent_candidates = {
             "actual_session_parent": actual_session_parent,
             "historical_best": official_champion,
+            "official_best": official_champion,
             "session_best": session_best_record,
             "nearest_candidate": session_nearest_record,
+            "best_train_candidate": round_parent_pool.get("best_train_candidate"),
+            "best_validation_apr_candidate": round_parent_pool.get("best_validation_apr_candidate"),
+            "best_low_stoploss_candidate": round_parent_pool.get("best_low_stoploss_candidate"),
+            "best_worst_month_candidate": round_parent_pool.get("best_worst_month_candidate"),
             "baseline": {"strategy_class": "baseline", "train_metrics": baseline_cfg},
         }
         official_champion_name = _strategy_label(official_champion, "baseline")
@@ -7250,6 +7712,19 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         print(f"- historical_best: {_strategy_label(session_parent_candidates['historical_best'])}")
         print(f"- session_best: {_strategy_label(session_parent_candidates['session_best'])}")
         print(f"- nearest_candidate: {_strategy_label(session_parent_candidates['nearest_candidate'])}")
+        print(f"- best_train_candidate: {_strategy_label(session_parent_candidates['best_train_candidate'])}")
+        print(f"- best_validation_apr_candidate: {_strategy_label(session_parent_candidates['best_validation_apr_candidate'])}")
+        print(f"- best_low_stoploss_candidate: {_strategy_label(session_parent_candidates['best_low_stoploss_candidate'])}")
+        print(f"- best_worst_month_candidate: {_strategy_label(session_parent_candidates['best_worst_month_candidate'])}")
+        print("\n========== 本轮父策略选择 ==========")
+        print(f"parent_source: {selected_round_parent.get('source')}")
+        print(f"parent_strategy: {_strategy_label(selected_round_parent.get('meta'), 'baseline')}")
+        print(f"选择原因: {selected_round_parent.get('reason')}")
+        print(f"本轮修复目标: {selected_round_parent.get('repair_target')}")
+        print("========== mutation 选择约束 ==========")
+        print(f"failure_type: {current_failure_type}")
+        print(f"allowed_mutations: {mutation_policy.get('prefer', [])}")
+        print(f"blocked_mutations: {mutation_policy.get('avoid', [])}")
         spec_prompt = _strategy_spec_prompt(
             class_name,
             runtime_goal,
@@ -7264,7 +7739,13 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         spec_prompt += "当前 official_champion=" + _compact_prompt_json(official_champion, 5000) + "\n"
         spec_prompt += "当前 in_memory_champion=" + _compact_prompt_json(in_memory_champion, 5000) + "\n"
         spec_prompt += "本次 actual_session_parent=" + _compact_prompt_json(actual_session_parent, 5000) + "\n"
-        spec_prompt += "硬性要求：本轮 advisor 必须把 actual_session_parent 作为代码修改父策略；pre_run_ai_review 只能解释原因，不能只停留为参考。\n"
+        spec_prompt += "当前 parent_pool=" + _compact_prompt_json({k: _strategy_label(v) for k, v in round_parent_pool.items()}, 3000) + "\n"
+        spec_prompt += "本轮已选择 parent_source=" + str(selected_round_parent.get("source")) + "；parent_strategy=" + _strategy_label(selected_round_parent.get("meta"), "baseline") + "；选择原因=" + str(selected_round_parent.get("reason")) + "；本轮修复目标=" + str(selected_round_parent.get("repair_target")) + "\n"
+        spec_prompt += "硬性要求：本轮 advisor 必须把已选择 parent_strategy 作为代码修改父策略；pre_run_ai_review/near-miss 只能解释原因，不能只停留为参考。\n"
+        spec_prompt += "当前 failure_type=" + current_failure_type + "\n"
+        spec_prompt += "允许 mutation=" + _compact_prompt_json(mutation_policy.get("prefer", []), 1000) + "\n"
+        spec_prompt += "禁止 mutation=" + _compact_prompt_json(mutation_policy.get("avoid", []), 1000) + "\n"
+        spec_prompt += "本轮只修一个主要问题；mutation_spec.mutation_type 必须优先从允许 mutation 中选择，且不得使用禁止 mutation。\n"
         spec_prompt += "当前 session_best=" + _compact_prompt_json(session_best_record, 5000) + "\n"
         spec_prompt += "当前 session_nearest_candidate=" + _compact_prompt_json(session_nearest_record, 5000) + "\n"
         spec_prompt += "上一轮 last_round_summary=" + _compact_prompt_json(last_round_summary, 5000) + "\n"
@@ -7286,10 +7767,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 spec_prompt += "普通 optimize 模式提示：上一轮结构探索的 near-miss / leaderboard 显示可优先小步优化这些 strategy_family=" + _compact_prompt_json({"preferred": preferred_families, "nearest_family": nearest_family}, 2000) + "\n"
         if nearest_mem and isinstance(nearest_mem, dict) and nearest_mem.get("near_miss_type"):
             spec_prompt += (
-                f"\n上一轮 near-miss: {nearest_mem.get('source_run_id', '')}/{nearest_mem.get('source_version', '')}\n"
+                f"\n上一轮 near-miss: {nearest_mem.get('source_run_id', '')}/{nearest_mem.get('source_version', '')}/指标={_compact_prompt_json(nearest_mem.get('key_metrics', {}), 2000)}/失败原因={_compact_prompt_json(nearest_mem.get('failed_due_to', []), 1000)}；本轮只允许定向修复，不允许随机换方向。\n"
                 f"near_miss_type: {nearest_mem.get('near_miss_type')}\n"
-                f"关键指标: {_compact_prompt_json(nearest_mem.get('key_metrics', {}), 2000)}\n"
-                f"失败原因: {_compact_prompt_json(nearest_mem.get('failed_due_to', []), 1000)}\n"
                 f"推荐修复方向: {nearest_mem.get('recommended_followup_mutation', '')}\n"
                 "不得简单放宽入场或盲目调 ROI；near-miss 只能作为 session_parent/prompt 参考，不得自动覆盖 official best。\n"
             )
@@ -7388,6 +7867,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             f"actual_session_parent_strategy_code=\n{champion.get('code', '')}\n"
             "注意：本轮代码修改必须基于 actual_session_parent_strategy_code，而不是仅把 nearest_candidate / pre_run 复盘当参考。\n"
             f"mutation_spec={json.dumps(strategy_spec, ensure_ascii=False)}\n"
+            f"当前 failure_type={current_failure_type}；allowed_mutations={mutation_policy.get('prefer', [])}；blocked_mutations={mutation_policy.get('avoid', [])}；本轮只修一个主要问题。\n"
             f"当前失败摘要={previous_failure_reason or '无'}\n"
             "硬性约束：\n"
             + ("1) 当前是结构探索模式：允许不局限于 champion 小步改动，但必须吸收历史经验，避免重复已失败结构。\n" if explore_strategy_family else "1) 仅允许在 champion 基础上一次小改动，不允许完全重写。\n")
@@ -8218,6 +8698,13 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "nearest_candidate_used": session_parent_candidates.get("nearest_candidate"),
             "session_parent_choice": strategy_spec.get("session_parent_choice", "baseline"),
             "session_parent_reason": strategy_spec.get("session_parent_reason", ""),
+            "round_parent_source": selected_round_parent.get("source"),
+            "round_parent_strategy": _strategy_label(selected_round_parent.get("meta"), "baseline"),
+            "round_parent_reason": selected_round_parent.get("reason"),
+            "round_repair_target": selected_round_parent.get("repair_target"),
+            "failure_type": current_failure_type,
+            "allowed_mutations": mutation_policy.get("prefer", []),
+            "blocked_mutations": mutation_policy.get("avoid", []),
             "advisor_prompt_file": str(version_dir / "advisor_prompt.txt"),
             "codegen_prompt_file": str(version_dir / "codegen_prompt.txt"),
             "changed_items": strategy_spec.get("changes", []),
@@ -8340,6 +8827,14 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "avoid_next": "降低高频宽松入场，控制回撤与止损亏损。",
             **_extract_exit_profit_fields(train_metrics),
         }
+        round_near_miss_info = _detect_near_miss(leaderboard_entry, target_cfg)
+        if round_near_miss_info:
+            round_near_miss_info["source_run_id"] = run_id
+            round_near_miss_info["source_version"] = ver
+            leaderboard_entry.update(round_near_miss_info)
+            summary.update(round_near_miss_info)
+            write_json(summary_path, summary)
+            print(f"near-miss 已识别：{round_near_miss_info.get('near_miss_type')}，将进入 nearest_candidate 跟进候选。")
         leaderboard.append(leaderboard_entry)
         memory_items.append({
             **leaderboard_entry,
@@ -8541,6 +9036,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "family_failure_reason": family_failure_reason,
             "failure_reason": failure_reason,
         })
+        if round_near_miss_info:
+            round_strategy_record.update(round_near_miss_info)
         if is_best:
             best = round_data
             iteration_stats["new_best_update_count"] += 1
@@ -8550,6 +9047,26 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             champion = {"meta": round_strategy_record, "code": code}
             historical_best_mem = round_strategy_record
         update_session_state_after_round(summary_path=summary_path, strategy_record=round_strategy_record, became_best=is_best)
+        early_stop_progress = _record_early_stop_monitor_progress(
+            early_stop_monitor_state,
+            iteration=i,
+            version=ver,
+            is_best=bool(is_best),
+            is_valid=bool(is_valid),
+            final_score=float(final_score),
+            avg_validation_profit_factor=float(avg_validation_profit_factor),
+            worst_validation_profit_factor=_safe_float(validation_risk.get("validation_worst_profit_factor")),
+            stoploss_to_roi_ratio=_safe_float(validation_risk.get("stoploss_to_roi_ratio")),
+            worst_month_loss=abs(min(0.0, _safe_float(validation_risk.get("validation_worst_profit_pct")))),
+            valid_candidate_count=_safe_int(iteration_stats.get("valid_strategy_count")),
+            nearest_candidate_record=session_state.get("session_nearest_candidate"),
+            target_cfg=target_cfg,
+            baseline_cfg=baseline_cfg,
+            settings=early_stopping_settings,
+        )
+        iteration_stats["early_stop_monitor_state"] = early_stop_monitor_state
+        iteration_stats["improvement_monitor"] = early_stop_monitor_state
+        status["early_stop_monitor_progress"] = early_stop_progress
         print(f"8. 第 {i} 轮完成：{'有效' if is_valid else '无效'}，原因：{invalid_reason or '通过'}")
         print(f"是否成为新最佳：{'是' if is_best else '否'}")
         if not is_best:
@@ -8557,7 +9074,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             for detail in reason_detail:
                 print(f"- {detail}")
         flush_iteration_stats()
-        if zero_trade_streak >= 3:
+        if zero_trade_streak >= 3 and not bool(getattr(args, "disable_early_stopping", False)):
             print("连续 3 轮无交易，可能是 AI prompt 或策略模板过于保守，请检查生成策略代码。")
             break
 
@@ -8577,8 +9094,12 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         row.setdefault("codegen_attempt_count", len(codegen_usage.get("attempts", []) or []))
 
     leaderboard_sorted = sorted(leaderboard, key=lambda x: float(x.get("final_score", 0.0) or 0.0), reverse=True)
-    strategy_family_leaderboard = _build_strategy_family_leaderboard(leaderboard_sorted, family_stats)
-    write_json(run_dir / "strategy_family_leaderboard.json", strategy_family_leaderboard)
+    strategy_family_leaderboard = None
+    if explore_strategy_family:
+        strategy_family_leaderboard = _build_strategy_family_leaderboard(leaderboard_sorted, family_stats)
+        write_json(run_dir / "strategy_family_leaderboard.json", strategy_family_leaderboard)
+    else:
+        print("本次不是 explore-strategy-family 模式，strategy_family 统计不适用。")
     # Write run-level attribution from the best scored available version.
     attr_source = next((row for row in leaderboard_sorted if (run_dir / str(row.get("version", "")) / "pair_attribution.json").exists()), None)
     if attr_source:
@@ -8598,7 +9119,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     print("有效策略：" + ("、".join(f"{row['version']}:{row['strategy_class']}" for row in valid_rows) if valid_rows else "无"))
     print("无效策略：" + ("、".join(f"{row['version']}:{row['strategy_class']}({row.get('invalid_reason')})" for row in invalid_rows) if invalid_rows else "无"))
     print(f"当前最佳策略是否更新：{'是' if best else '否'}")
-    _print_strategy_family_leaderboard(strategy_family_leaderboard, run_dir / "strategy_family_leaderboard.json")
+    if explore_strategy_family and strategy_family_leaderboard:
+        _print_strategy_family_leaderboard(strategy_family_leaderboard, run_dir / "strategy_family_leaderboard.json")
+    else:
+        print("本次不是 explore-strategy-family 模式，strategy_family 统计不适用。")
     target_cfg = (runtime_goal.get("target", {}) or {})
     baseline_cfg = (runtime_goal.get("baseline", {}) or {})
     max_drawdown_target = _safe_float(target_cfg.get("max_drawdown_pct", 3.0))
@@ -8667,6 +9191,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 "profit_factor_delta": _safe_float(closest_failed.get("profit_factor")) - _safe_float(baseline_cfg.get("profit_factor")),
             },
         }
+        nearest_candidate["source_run_id"] = run_id
+        nearest_candidate["source_version"] = closest_failed.get("version")
         near_miss_info = _detect_near_miss(closest_failed, target_cfg)
         if near_miss_info:
             nearest_candidate.update(near_miss_info)
@@ -8693,8 +9219,13 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     for row in leaderboard_sorted:
         row["is_best"] = row["version"] == best_version
     write_json(run_dir / "leaderboard.json", {"items": leaderboard_sorted})
-    strategy_family_leaderboard = _build_strategy_family_leaderboard(leaderboard_sorted, family_stats)
-    write_json(run_dir / "strategy_family_leaderboard.json", strategy_family_leaderboard)
+    if not explore_strategy_family:
+        print("本次不是 explore-strategy-family 模式，strategy_family 统计不适用。")
+    if explore_strategy_family:
+        strategy_family_leaderboard = _build_strategy_family_leaderboard(leaderboard_sorted, family_stats)
+        write_json(run_dir / "strategy_family_leaderboard.json", strategy_family_leaderboard)
+    else:
+        strategy_family_leaderboard = {"explore_strategy_family_enabled": False, "message": "本次不是 explore-strategy-family 模式，strategy_family 统计不适用。"}
     _write_json_list_file(MEMORY_FILE, memory_items[-200:])
     _write_json_list_file(BLACKLIST_FILE, blacklist_items[-200:])
     _write_json_list_file(LESSONS_FILE, lessons_items[-200:])
@@ -8740,24 +9271,33 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         "nearest_candidate_name": _strategy_label(nearest_candidate or nearest_mem, ""),
         "nearest_candidate_path": ((nearest_candidate or nearest_mem or {}).get("strategy_file", "") if isinstance((nearest_candidate or nearest_mem), dict) else ""),
         "pre_run_recommended_parent": actual_parent_choice.get("pre_run_preferred_parent", "未明确"),
-        "actual_session_parent_name": actual_parent_choice.get("actual_parent", _strategy_label(champion.get("meta"), "baseline")),
-        "actual_session_parent_path": (champion.get("meta") or {}).get("strategy_file", "") if isinstance(champion.get("meta"), dict) else "",
-        "actual_session_parent_source": champion.get("source", ""),
+        "actual_session_parent": actual_parent_choice.get("actual_parent", _strategy_label(session_state.get("actual_session_parent"), "baseline")),
+        "actual_session_parent_name": actual_parent_choice.get("actual_parent", _strategy_label(session_state.get("actual_session_parent"), "baseline")),
+        "actual_session_parent_path": (session_state.get("actual_session_parent") or {}).get("strategy_file", "") if isinstance(session_state.get("actual_session_parent"), dict) else "",
+        "actual_session_parent_source": session_state.get("actual_session_parent_source", ""),
         "actual_session_parent_reason": actual_parent_choice.get("reason", ""),
+        "reason": actual_parent_choice.get("reason", ""),
         "did_override_historical_best_for_session": bool(actual_parent_choice.get("overrode_historical_best_for_session")),
         "final_official_champion": session_state.get("official_champion"),
         "final_in_memory_champion": session_state.get("in_memory_champion"),
         "nearest_candidate": nearest_candidate,
-        "strategy_family_leaderboard": strategy_family_leaderboard if explore_strategy_family else None,
-        "preferred_strategy_families_for_next_optimize": strategy_family_leaderboard.get("preferred_families_for_next_optimize", []) if explore_strategy_family else [],
+        "explore_strategy_family_enabled": bool(explore_strategy_family),
+        "strategy_family_leaderboard": strategy_family_leaderboard if explore_strategy_family else {"explore_strategy_family_enabled": False},
+        "preferred_strategy_families_for_next_optimize": strategy_family_leaderboard.get("preferred_families_for_next_optimize", []) if explore_strategy_family and isinstance(strategy_family_leaderboard, dict) else [],
         "session_best": session_best,
         "session_nearest_candidate": session_state.get("session_nearest_candidate"),
         "round_history": session_state.get("round_history", []),
+        "improvement_monitor": early_stop_monitor_state,
         "early_stop": {
             "triggered": bool(iteration_stats.get("early_stop_triggered")),
             "reason": iteration_stats.get("early_stop_reason", ""),
+            "settings": early_stopping_settings,
+            "monitor_state": early_stop_monitor_state,
             "counters": iteration_stats.get("early_stop_checked_counters", {}),
         },
+        "nearest_candidate_improved_without_official_best": bool(not best and (early_stop_monitor_state.get("last_improvement_flags") or {}).get("nearest_candidate_improved")),
+        "session_best_improved_without_official_best": bool(not best and (early_stop_monitor_state.get("last_improvement_flags") or {}).get("session_best_final_score_improved")),
+        "should_continue_instead_of_early_stop": bool(not iteration_stats.get("early_stop_triggered") and (not best) and (session_state.get("session_nearest_candidate") or session_state.get("session_best"))),
         "failed_mutation_types_this_run": session_state.get("failed_mutation_types_this_run", []),
         "successful_mutation_types_this_run": session_state.get("successful_mutation_types_this_run", []),
         "attempted_mutation_types_this_run": session_state.get("attempted_mutation_types_this_run", []),
@@ -8797,6 +9337,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     }
     write_json(LAST_RUN_SUMMARY_FILE, last_run_summary)
     write_json(run_dir / "last_run_summary.json", last_run_summary)
+    print("\n========== 迭代控制器结束摘要 ==========")
+    print(f"是否没有 official best 但 nearest_candidate 有改善：{'是' if last_run_summary.get('nearest_candidate_improved_without_official_best') else '否'}")
+    print(f"是否没有 official best 但 session_best 有改善：{'是' if last_run_summary.get('session_best_improved_without_official_best') else '否'}")
+    print(f"是否应该继续运行而不是早停：{'是' if last_run_summary.get('should_continue_instead_of_early_stop') else '否'}")
 
     if best:
         best_strategy_file = run_dir / best_version / "strategy.py" if best_version else Path(best["strategy_file"])
@@ -9052,7 +9596,9 @@ def main() -> None:
     parser.add_argument("--manual-git-push", action="store_true", default=False, help="生成任务包后自动 git add / commit / push")
     parser.add_argument("--manual-git-branch", default=None, help="半自动任务包 Git 分支；默认 ai-manual/<task_name>")
     parser.add_argument("--random-sample-windows", type=int, default=0, help="每个策略在正式训练/验证/holdout/best 判断后额外随机采样回测窗口数；默认 0 关闭")
-    parser.add_argument("--early-stop-patience", type=int, default=12, help="连续 N 轮没有新 best 时提前停止；默认 12，<=0 关闭")
+    parser.add_argument("--disable-early-stopping", action="store_true", help="禁用 early stopping，尽量完整跑完 --iterations 指定轮数")
+    parser.add_argument("--early-stop-patience", type=int, default=None, help="连续 N 轮监控指标无改进时提前停止；未设置时读取 goal，长跑自动放大")
+    parser.add_argument("--min-iterations-before-stop", type=int, default=None, help="至少跑满 N 轮后才允许 early stopping")
     parser.add_argument("--early-stop-final-score-failures", type=int, default=8, help="连续 N 轮 final_score<=0 时提前停止；默认 8，<=0 关闭")
     parser.add_argument("--early-stop-duplicate-strategies", type=int, default=3, help="连续 N 轮策略 fingerprint 与本次 run 已测策略高度重复时提前停止；默认 3，<=0 关闭")
     parser.add_argument("--random-sample-min-days", type=int, default=25, help="随机采样窗口最小天数，默认 25")
