@@ -101,5 +101,20 @@
     "active_pair_count": 5,
     "watch_pair_count": 5,
     "reevaluate_every_runs": 5
+  },
+  "explore_strategy_family": {
+    "enabled": true,
+    "max_families_per_run": 5,
+    "force_all_families_once": true,
+    "prefer_near_miss_followup": true,
+    "disable_family_after_high_frequency_failure": true
+  },
+  "market_intelligence": {
+    "cache_enabled": true,
+    "cache_dir": "user_data/ai_memory/market_intel_cache",
+    "force_refresh": false,
+    "cache_ttl_days": 3650,
+    "run_once_per_run": true,
+    "reuse_same_timerange": true
   }
 }
