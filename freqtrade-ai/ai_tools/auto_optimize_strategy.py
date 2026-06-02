@@ -44,6 +44,15 @@ from prompt_similarity import (
     merge_config as merge_prompt_similarity_config,
     review_prompts,
 )
+from provider_config import (
+    OPENAI_COMPATIBLE_TYPES,
+    auto_provider_pools_enabled,
+    looks_like_placeholder_secret,
+    parse_csv,
+    print_auto_provider_pool_log,
+    provider_env_prefix,
+    provider_pool_names_for_env,
+)
 
 from openai import (
     APIConnectionError,
@@ -5260,29 +5269,30 @@ def safe_ask_ai(
 
 
 def _parse_model_pool(raw: str | None) -> list[str]:
-    return [item.strip() for item in (raw or "").split(",") if item.strip()]
+    return parse_csv(raw)
 
 
 def _provider_env_prefix(provider_name: str) -> str:
-    normalized = re.sub(r"[^A-Za-z0-9]+", "_", provider_name.strip()).strip("_").upper()
-    return f"AI_PROVIDER_{normalized}"
+    return provider_env_prefix(provider_name)
 
 
 def _looks_like_placeholder_secret(value: str) -> bool:
-    lowered = value.strip().lower()
-    return not lowered or lowered in {"你的key", "your_key", "your-api-key", "你的deepseek_key", "你的glm_key"} or lowered.startswith("你的")
+    return looks_like_placeholder_secret(value)
 
 
 def _build_provider_pool_from_env(provider_pool_env: str, timeout_sec: int) -> tuple[list[dict[str, Any]], list[str]]:
     providers: list[dict[str, Any]] = []
     skipped: list[str] = []
-    for provider_name in _parse_model_pool(os.getenv(provider_pool_env)):
+    for provider_name in provider_pool_names_for_env(provider_pool_env):
         prefix = _provider_env_prefix(provider_name)
         provider_type = (os.getenv(f"{prefix}_TYPE") or "openai_compatible").strip().lower()
         base_url = (os.getenv(f"{prefix}_BASE_URL") or "").strip() or None
         api_key = (os.getenv(f"{prefix}_API_KEY") or "").strip()
+        api_key_env = (os.getenv(f"{prefix}_API_KEY_ENV") or "").strip()
+        if (not api_key or _looks_like_placeholder_secret(api_key)) and api_key_env:
+            api_key = (os.getenv(api_key_env) or "").strip()
         model = (os.getenv(f"{prefix}_MODEL") or "").strip()
-        if provider_type != "openai_compatible":
+        if provider_type not in OPENAI_COMPATIBLE_TYPES:
             skipped.append(f"{provider_name}: 不支持的 TYPE={provider_type}")
             continue
         if _looks_like_placeholder_secret(api_key) or not model or model.startswith("你的") or (base_url and str(base_url).strip().startswith("你的")):
@@ -5295,6 +5305,8 @@ def _build_provider_pool_from_env(provider_pool_env: str, timeout_sec: int) -> t
             "api_key": api_key,
             "model": model,
             "client": OpenAI(api_key=api_key, base_url=base_url, timeout=timeout_sec),
+            "api_key_source": api_key_env or f"{prefix}_API_KEY",
+            "capabilities": _parse_model_pool(os.getenv(f"{prefix}_CAPABILITIES")),
         })
     return providers, skipped
 
@@ -5314,7 +5326,7 @@ def _build_ai_role_runtime(
     provider_pool_env = str(model_cfg.get("provider_pool_env") or default_provider_pool_env_by_role.get(role_name, ""))
     provider_pool: list[dict[str, Any]] = []
     skipped_providers: list[str] = []
-    if provider_pool_env and os.getenv(provider_pool_env):
+    if provider_pool_env and (os.getenv(provider_pool_env) or auto_provider_pools_enabled()):
         provider_pool, skipped_providers = _build_provider_pool_from_env(provider_pool_env, timeout_sec)
         if provider_pool:
             return AIRoleRuntime(
@@ -7593,6 +7605,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     generator_cfg = model_config.get("code_generator", {})
     max_attempts_per_call = max(1, int(args.ai_model_max_attempts_per_call))
     switch_on_error = bool(args.ai_model_switch_on_error)
+    print_auto_provider_pool_log()
     advisor_runtime = _build_ai_role_runtime(
         advisor_cfg,
         "strategy_advisor",

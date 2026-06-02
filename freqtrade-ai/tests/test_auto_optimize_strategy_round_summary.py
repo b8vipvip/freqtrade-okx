@@ -5,7 +5,10 @@ import sys
 from pathlib import Path
 
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / "ai_tools" / "auto_optimize_strategy.py"
+AI_TOOLS_PATH = Path(__file__).resolve().parents[1] / "ai_tools"
+if str(AI_TOOLS_PATH) not in sys.path:
+    sys.path.insert(0, str(AI_TOOLS_PATH))
+MODULE_PATH = AI_TOOLS_PATH / "auto_optimize_strategy.py"
 spec = importlib.util.spec_from_file_location("auto_optimize_strategy", MODULE_PATH)
 assert spec and spec.loader
 optimizer = importlib.util.module_from_spec(spec)
@@ -385,6 +388,79 @@ def test_provider_pool_env_errors_when_only_placeholders(monkeypatch) -> None:
     else:
         raise AssertionError("placeholder provider pool should fail fast")
 
+
+
+def test_auto_provider_pool_discovers_roles_and_priorities(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("AUTO_BUILD_PROVIDER_POOLS", "true")
+    monkeypatch.delenv("FORCE_PROVIDER_POOL_MANUAL", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-openrouter")
+    monkeypatch.setenv("STRATEGY_ADVISOR_PROVIDER_POOL", "manual_should_not_win")
+
+    monkeypatch.setenv("AI_PROVIDER_OPENROUTER_SONAR_PRO_ENABLED", "true")
+    monkeypatch.setenv("AI_PROVIDER_OPENROUTER_SONAR_PRO_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("AI_PROVIDER_OPENROUTER_SONAR_PRO_API_KEY_ENV", "OPENROUTER_API_KEY")
+    monkeypatch.setenv("AI_PROVIDER_OPENROUTER_SONAR_PRO_MODEL", "perplexity/sonar-pro")
+    monkeypatch.setenv("AI_PROVIDER_OPENROUTER_SONAR_PRO_TYPE", "openai_compatible_search")
+    monkeypatch.setenv("AI_PROVIDER_OPENROUTER_SONAR_PRO_ROLE", "market_search,advisor")
+    monkeypatch.setenv("AI_PROVIDER_OPENROUTER_SONAR_PRO_PRIORITY_ADVISOR", "20")
+    monkeypatch.setenv("AI_PROVIDER_OPENROUTER_SONAR_PRO_PRIORITY_MARKET_SEARCH", "10")
+
+    monkeypatch.setenv("AI_PROVIDER_FAST_ADVISOR_ENABLED", "true")
+    monkeypatch.setenv("AI_PROVIDER_FAST_ADVISOR_BASE_URL", "https://fast.example/v1")
+    monkeypatch.setenv("AI_PROVIDER_FAST_ADVISOR_API_KEY", "sk-fast")
+    monkeypatch.setenv("AI_PROVIDER_FAST_ADVISOR_MODEL", "fast-advisor")
+    monkeypatch.setenv("AI_PROVIDER_FAST_ADVISOR_TYPE", "openai_compatible")
+    monkeypatch.setenv("AI_PROVIDER_FAST_ADVISOR_ROLE", "advisor")
+    monkeypatch.setenv("AI_PROVIDER_FAST_ADVISOR_PRIORITY_ADVISOR", "5")
+
+    runtime = optimizer._build_ai_role_runtime(
+        {"provider_pool_env": "STRATEGY_ADVISOR_PROVIDER_POOL"},
+        "strategy_advisor",
+        timeout_sec=5,
+        max_attempts_per_call=3,
+        switch_on_error=True,
+    )
+
+    assert [item["name"] for item in runtime.provider_pool] == ["fast_advisor", "openrouter_sonar_pro"]
+    assert runtime.model_pool == ["fast-advisor", "perplexity/sonar-pro"]
+    assert runtime.provider_pool[1]["api_key"] == "sk-openrouter"
+    assert runtime.provider_pool[1]["type"] == "openai_compatible_search"
+
+    optimizer.print_auto_provider_pool_log()
+    log = capsys.readouterr().out
+    assert "========== 自动组装 Provider Pool ==========" in log
+    assert "MARKET_SEARCH_PROVIDER_POOL=openrouter_sonar_pro" in log
+    assert "STRATEGY_ADVISOR_PROVIDER_POOL=fast_advisor,openrouter_sonar_pro" in log
+    assert "sk-openrouter" not in log
+
+
+def test_force_provider_pool_manual_keeps_legacy_pool(monkeypatch) -> None:
+    monkeypatch.setenv("AUTO_BUILD_PROVIDER_POOLS", "true")
+    monkeypatch.setenv("FORCE_PROVIDER_POOL_MANUAL", "true")
+    monkeypatch.setenv("STRATEGY_CODEGEN_PROVIDER_POOL", "manual_codegen")
+    monkeypatch.setenv("AI_PROVIDER_MANUAL_CODEGEN_BASE_URL", "https://manual.example/v1")
+    monkeypatch.setenv("AI_PROVIDER_MANUAL_CODEGEN_API_KEY", "sk-manual")
+    monkeypatch.setenv("AI_PROVIDER_MANUAL_CODEGEN_MODEL", "manual-model")
+    monkeypatch.setenv("AI_PROVIDER_MANUAL_CODEGEN_TYPE", "openai_compatible")
+
+    monkeypatch.setenv("AI_PROVIDER_AUTO_CODEGEN_ENABLED", "true")
+    monkeypatch.setenv("AI_PROVIDER_AUTO_CODEGEN_BASE_URL", "https://auto.example/v1")
+    monkeypatch.setenv("AI_PROVIDER_AUTO_CODEGEN_API_KEY", "sk-auto")
+    monkeypatch.setenv("AI_PROVIDER_AUTO_CODEGEN_MODEL", "auto-model")
+    monkeypatch.setenv("AI_PROVIDER_AUTO_CODEGEN_TYPE", "openai_compatible")
+    monkeypatch.setenv("AI_PROVIDER_AUTO_CODEGEN_ROLE", "codegen")
+    monkeypatch.setenv("AI_PROVIDER_AUTO_CODEGEN_PRIORITY_CODEGEN", "1")
+
+    runtime = optimizer._build_ai_role_runtime(
+        {"provider_pool_env": "STRATEGY_CODEGEN_PROVIDER_POOL"},
+        "code_generator",
+        timeout_sec=5,
+        max_attempts_per_call=3,
+        switch_on_error=True,
+    )
+
+    assert [item["name"] for item in runtime.provider_pool] == ["manual_codegen"]
+    assert runtime.model_pool == ["manual-model"]
 
 def test_pair_score_penalizes_negative_validation_stoploss_and_low_trades() -> None:
     cfg = {

@@ -6,7 +6,10 @@ import sys
 from pathlib import Path
 
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / "ai_tools" / "auto_optimize_strategy.py"
+AI_TOOLS_PATH = Path(__file__).resolve().parents[1] / "ai_tools"
+if str(AI_TOOLS_PATH) not in sys.path:
+    sys.path.insert(0, str(AI_TOOLS_PATH))
+MODULE_PATH = AI_TOOLS_PATH / "auto_optimize_strategy.py"
 spec = importlib.util.spec_from_file_location("auto_optimize_strategy_confirm", MODULE_PATH)
 assert spec and spec.loader
 optimizer = importlib.util.module_from_spec(spec)
