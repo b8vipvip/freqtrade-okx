@@ -148,5 +148,48 @@
     "reset_on_session_best_improvement": true,
     "reset_on_stoploss_to_roi_improvement": true
   },
-  "use_pre_run_parent_recommendation": true
+  "use_pre_run_parent_recommendation": true,
+  "market_intelligence": {
+    "enabled": true,
+    "search_provider_pool": [
+      "PERPLEXITY_SEARCH",
+      "OPENAI_WEB_SEARCH",
+      "TAVILY_SEARCH"
+    ],
+    "max_search_results": 12,
+    "lookback_days": 30,
+    "use_train_window_only_for_prompt": true,
+    "allow_validation_intel_for_postmortem_only": true,
+    "save_raw_sources": true,
+    "timeout_seconds": 120
+  },
+  "ai_committee": {
+    "enabled": true,
+    "roles": [
+      "macro_analyst",
+      "geopolitical_risk_analyst",
+      "crypto_market_analyst",
+      "quant_risk_manager",
+      "strategy_engineer",
+      "adversarial_reviewer",
+      "final_chairman"
+    ],
+    "final_chairman_provider": "apihost_claude_opus47",
+    "max_rounds": 2,
+    "require_structured_json": true
+  },
+  "prompt_similarity_filter": {
+    "enabled": true,
+    "threshold": 0.95,
+    "compare_fields": [
+      "market_intel_summary",
+      "committee_consensus",
+      "final_strategy_directive",
+      "mutation_spec",
+      "advisor_prompt",
+      "codegen_prompt"
+    ],
+    "retry_on_duplicate": true,
+    "max_retries": 2
+  }
 }
