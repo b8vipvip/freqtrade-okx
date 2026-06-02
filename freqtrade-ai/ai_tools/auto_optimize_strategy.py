@@ -30,6 +30,21 @@ from typing import Any
 
 import pandas as pd
 
+from ai_committee import (
+    directive_prompt_section,
+    merge_config as merge_ai_committee_config,
+    run_committee,
+)
+from market_intelligence import (
+    collect_market_intelligence,
+    merge_config as merge_market_intelligence_config,
+    summarize_for_prompt as summarize_market_intel_for_prompt,
+)
+from prompt_similarity import (
+    merge_config as merge_prompt_similarity_config,
+    review_prompts,
+)
+
 from openai import (
     APIConnectionError,
     APIStatusError,
@@ -75,6 +90,48 @@ EXPLORE_STRATEGY_FAMILY_DEFAULTS = {
     "prefer_near_miss_followup": True,
     "disable_family_after_high_frequency_failure": True,
 }
+
+
+PROMPT_REGISTRY_FILE = ROOT_DIR / "user_data" / "ai_memory" / "prompt_registry.json"
+
+
+def _json_prompt_section(title: str, payload: Any, max_chars: int = 8000) -> str:
+    if not payload:
+        return ""
+    try:
+        body = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+    except TypeError:
+        body = str(payload)
+    return f"\n\n========== {title} ==========\n" + body[:max_chars] + "\n"
+
+
+def _print_market_intel_isolation_check(train_used: bool) -> None:
+    print("========== Market Intel 防未来函数检查 ==========")
+    print(f"train_intel_used_for_prompt: {'yes' if train_used else 'no'}")
+    print("validation_intel_used_for_prompt: no")
+    print("holdout_intel_used_for_prompt: no")
+
+
+def _print_committee_decision(market_intel: dict[str, Any] | None, directive: dict[str, Any] | None) -> None:
+    directive = directive or {}
+    market_intel = market_intel or {}
+    print("========== AI 投资委员会结论 ==========")
+    print("market_regime:" + _compact_prompt_json(market_intel.get("macro_regime", {}), 2000))
+    print("crypto_regime:" + _compact_prompt_json(market_intel.get("crypto_regime", {}), 2000))
+    print("final_chairman_decision:" + str(directive.get("final_chairman_decision") or directive.get("prompt_directive") or ""))
+    print("allowed_mutations:" + _compact_prompt_json(directive.get("allowed_mutations", []), 2000))
+    print("blocked_mutations:" + _compact_prompt_json(directive.get("blocked_mutations", []), 2000))
+    print("pair_specific_rules:" + _compact_prompt_json(directive.get("pair_specific_rules", {}), 3000))
+    print("risk_constraints:" + _compact_prompt_json(directive.get("risk_constraints", []), 3000))
+
+
+def _print_prompt_similarity_review(report: dict[str, Any]) -> None:
+    print("========== Prompt 相似度审查 ==========")
+    print(f"advisor_prompt_similarity: {float(report.get('advisor_prompt_similarity', 0.0)):.4f}")
+    print(f"codegen_prompt_similarity: {float(report.get('codegen_prompt_similarity', 0.0)):.4f}")
+    print(f"similar_to_run: {report.get('similar_to_run') or ''}")
+    print(f"similar_to_version: {report.get('similar_to_version') or ''}")
+    print(f"decision: {report.get('decision') or 'continue'}")
 
 
 def _explore_strategy_family_cfg(runtime_goal: dict[str, Any]) -> dict[str, Any]:
@@ -7610,6 +7667,12 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     memory_max_items = int(memory_cfg.get("max_items", 5))
     memory_max_chars = int(memory_cfg.get("max_prompt_chars", 2500))
     avoid_similar = bool(memory_cfg.get("avoid_similar_failed_strategies", True))
+    market_intel_cfg = merge_market_intelligence_config(runtime_goal)
+    ai_committee_cfg = merge_ai_committee_config(runtime_goal)
+    prompt_similarity_cfg = merge_prompt_similarity_config(runtime_goal)
+    print("market_intelligence：" + ("开启" if market_intel_cfg.get("enabled") else "关闭"))
+    print("ai_committee：" + ("开启" if ai_committee_cfg.get("enabled") else "关闭"))
+    print("prompt_similarity_filter：" + ("开启" if prompt_similarity_cfg.get("enabled") else "关闭"))
     prev_train_trades: int | None = None
     previous_failure_reason: str | None = None
     zero_trade_streak = 0
@@ -8121,6 +8184,44 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         prompt_has_last_round = bool(last_round_summary)
         pre_run_advisor_injected = bool(pre_run_ai_review)
         pre_run_codegen_injected = bool(pre_run_ai_review and isinstance(pre_run_ai_review.get("codegen_guidance"), dict))
+        active_pairs_for_intel = [str(p) for p in runtime_goal.get("runtime_active_pairs") or runtime_goal.get("pairs") or [] if str(p).strip()]
+        market_intel: dict[str, Any] = {}
+        market_intel_summary = ""
+        committee_result: dict[str, Any] = {}
+        final_strategy_directive: dict[str, Any] = {}
+        committee_prompt_section = ""
+        if market_intel_cfg.get("enabled"):
+            market_intel = collect_market_intelligence(
+                run_dir=run_dir,
+                train_timerange=train.timerange,
+                validation_timeranges=[p.timerange for p in validations],
+                active_pairs=active_pairs_for_intel,
+                timeframe=timeframe,
+                failure_type=current_failure_type,
+                pair_attribution=session_nearest_record.get("pair_attribution", {}) if isinstance(session_nearest_record, dict) else {},
+                last_run_summary=last_round_summary if isinstance(last_round_summary, dict) else {},
+                config=market_intel_cfg,
+            )
+            market_intel_summary = summarize_market_intel_for_prompt(market_intel)
+            _print_market_intel_isolation_check(True)
+        else:
+            _print_market_intel_isolation_check(False)
+        if ai_committee_cfg.get("enabled"):
+            committee_result = run_committee(
+                run_dir=run_dir,
+                market_intel=market_intel,
+                pair_attribution=session_nearest_record.get("pair_attribution", {}) if isinstance(session_nearest_record, dict) else {},
+                last_run_summary=last_round_summary if isinstance(last_round_summary, dict) else {},
+                nearest_candidate=session_nearest_record if isinstance(session_nearest_record, dict) else {},
+                historical_best=official_champion if isinstance(official_champion, dict) else {},
+                current_goal=runtime_goal,
+                active_pairs=active_pairs_for_intel,
+                failure_type=current_failure_type,
+                config=ai_committee_cfg,
+            )
+            final_strategy_directive = committee_result.get("final_strategy_directive", {}) if isinstance(committee_result, dict) else {}
+            committee_prompt_section = directive_prompt_section(market_intel, final_strategy_directive)
+            _print_committee_decision(market_intel, final_strategy_directive)
         print("========== 本轮迭代上下文 ==========")
         print(f"当前轮：{ver}")
         print(f"上一轮结果：{_round_summary_label(last_round_summary)}")
@@ -8214,6 +8315,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         spec_prompt += "\n跨 run strategy_lessons=" + _compact_prompt_json(lessons_items[-memory_max_items:], 4000) + "\n"
         spec_prompt += "\n跨 run strategy_blacklist=" + _compact_prompt_json(blacklist_items[-memory_max_items:], 4000) + "\n"
         spec_prompt += _format_pre_run_review_for_advisor(pre_run_ai_review)
+        if market_intel_summary:
+            spec_prompt += "\n\n========== Market Intel 训练区间摘要（禁止作为 live signal；验证/holdout 未注入）==========\n" + market_intel_summary + "\n"
+        if committee_prompt_section:
+            spec_prompt += committee_prompt_section
         spec_prompt += f"\nchampion_strategy_class={_strategy_label(actual_session_parent, 'baseline')}\n"
         spec_prompt += f"actual_session_parent_strategy_class={_strategy_label(actual_session_parent, 'baseline')}\n"
         spec_prompt += _v045_small_step_prompt_section({"meta": official_champion}, runtime_goal)
@@ -8306,6 +8411,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             f"actual_session_parent_strategy_code=\n{champion.get('code', '')}\n"
             "注意：本轮代码修改必须基于 actual_session_parent_strategy_code，而不是仅把 nearest_candidate / pre_run 复盘当参考。\n"
             f"mutation_spec={json.dumps(strategy_spec, ensure_ascii=False)}\n"
+            + ("AI 投资委员会 codegen_requirements=" + json.dumps(final_strategy_directive.get("codegen_requirements", []), ensure_ascii=False) + "\n" if final_strategy_directive else "")
+            + ("AI 投资委员会 risk_constraints=" + json.dumps(final_strategy_directive.get("risk_constraints", []), ensure_ascii=False) + "\n" if final_strategy_directive else "")
+            + ("AI 投资委员会 pair_specific_rules=" + json.dumps(final_strategy_directive.get("pair_specific_rules", {}), ensure_ascii=False) + "\n" if final_strategy_directive else "")
+            + "重要：不得把新闻/搜索结果写成策略代码规则；只能用可回测的 candle/volume/volatility/regime proxy。validation_intel 和 holdout_intel 未注入且禁止使用。\n"
             f"当前 failure_type={current_failure_type}；allowed_mutations={mutation_policy.get('prefer', [])}；blocked_mutations={mutation_policy.get('avoid', [])}；本轮只修一个主要问题。\n"
             f"当前失败摘要={previous_failure_reason or '无'}\n"
             "硬性约束：\n"
@@ -8358,6 +8467,69 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 "【强制去重】上一轮失败是 duplicate_strategy，不是 zero_trade；本次必须更换代码结构，改变 entry_conditions / indicators / populate_entry_trend，禁止 widen_entry_controlled。\n"
                 + prompt
             )
+        prompt_review_report: dict[str, Any] = {}
+        if prompt_similarity_cfg.get("enabled"):
+            max_prompt_retries = int(prompt_similarity_cfg.get("max_retries", 2) or 2)
+            for prompt_retry in range(max_prompt_retries + 1):
+                prompt_review_report = review_prompts(
+                    run_dir=run_dir,
+                    registry_path=PROMPT_REGISTRY_FILE,
+                    fields={
+                        "market_intel_summary": market_intel_summary,
+                        "committee_consensus": committee_result.get("committee_consensus", []) if isinstance(committee_result, dict) else [],
+                        "final_strategy_directive": final_strategy_directive,
+                        "mutation_spec": strategy_spec,
+                        "advisor_prompt": spec_prompt,
+                        "codegen_prompt": prompt,
+                    },
+                    config=prompt_similarity_cfg,
+                    run_id=run_id,
+                    version=ver,
+                    retry_index=prompt_retry,
+                    save=True,
+                )
+                _print_prompt_similarity_review(prompt_review_report)
+                if prompt_review_report.get("decision") != "retry":
+                    break
+                retry_hint = (
+                    f"prompt similarity duplicate on {prompt_review_report.get('similar_field')} "
+                    f"similar_to={prompt_review_report.get('similar_to_run')}/{prompt_review_report.get('similar_to_version')}; "
+                    "change directive family/indicator mix/pair-specific thresholds materially before codegen"
+                )
+                committee_result = run_committee(
+                    run_dir=run_dir,
+                    market_intel=market_intel,
+                    pair_attribution=session_nearest_record.get("pair_attribution", {}) if isinstance(session_nearest_record, dict) else {},
+                    last_run_summary=last_round_summary if isinstance(last_round_summary, dict) else {},
+                    nearest_candidate=session_nearest_record if isinstance(session_nearest_record, dict) else {},
+                    historical_best=official_champion if isinstance(official_champion, dict) else {},
+                    current_goal=runtime_goal,
+                    active_pairs=active_pairs_for_intel,
+                    failure_type=current_failure_type,
+                    config=ai_committee_cfg,
+                    retry_hint=retry_hint,
+                )
+                final_strategy_directive = committee_result.get("final_strategy_directive", {}) if isinstance(committee_result, dict) else {}
+                prompt += "\n\n========== Prompt 相似度 retry 后主席差异化 directive ==========\n" + json.dumps(final_strategy_directive, ensure_ascii=False, indent=2) + "\n"
+            if prompt_review_report.get("decision") == "skip":
+                previous_failure_reason = "prompt_duplicate"
+                failure_reason = "prompt_duplicate"
+                invalid_reason = "prompt_duplicate"
+                round_state["failure_type"] = "prompt_duplicate"
+                status["invalid_reason"] = invalid_reason
+                status["failure_type"] = "prompt_duplicate"
+                iteration_stats["invalid_strategy_count"] += 1
+                (version_dir / "codegen_prompt.txt").write_text(prompt, encoding="utf-8")
+                summary_path = write_iteration_summary()
+                update_session_state_after_round(summary_path=summary_path)
+                leaderboard.append(enrich_leaderboard_entry({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": invalid_reason, "failure_reason": failure_reason, "failure_type": "prompt_duplicate"}))
+                print("本轮停止：prompt_duplicate，不调用 codegen；该失败不按 zero_trade 处理。")
+                print(f"8. 第 {i} 轮完成：无效，原因：{invalid_reason}")
+                flush_iteration_stats()
+                continue
+        else:
+            prompt_review_report = {"advisor_prompt_similarity": 0.0, "codegen_prompt_similarity": 0.0, "decision": "continue"}
+            _print_prompt_similarity_review(prompt_review_report)
         (version_dir / "codegen_prompt.txt").write_text(prompt, encoding="utf-8")
         print("3. 正在调用代码生成模型池生成 Freqtrade 策略代码……")
         response_text = ""
