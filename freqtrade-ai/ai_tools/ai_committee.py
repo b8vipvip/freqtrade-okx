@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from provider_config import auto_provider_pools_enabled, provider_pool_names_for_env
+
 DEFAULT_AI_COMMITTEE_CONFIG: dict[str, Any] = {
     "enabled": False,
     "roles": [
@@ -50,7 +52,16 @@ def merge_config(goal: dict[str, Any] | None) -> dict[str, Any]:
         cfg["enabled"] = env_enabled.strip().lower() in {"1", "true", "yes", "y", "on"}
     if os.getenv("AI_COMMITTEE_ROLES"):
         cfg["roles"] = [r.strip() for r in os.getenv("AI_COMMITTEE_ROLES", "").split(",") if r.strip()]
-    if os.getenv("AI_COMMITTEE_FINAL_CHAIRMAN_PROVIDER"):
+    auto_chairman_pool = provider_pool_names_for_env("AI_COMMITTEE_FINAL_CHAIRMAN_PROVIDER_POOL") if auto_provider_pools_enabled() else []
+    if auto_chairman_pool:
+        cfg["final_chairman_provider_pool"] = auto_chairman_pool
+        cfg["final_chairman_provider"] = auto_chairman_pool[0]
+    elif os.getenv("AI_COMMITTEE_FINAL_CHAIRMAN_PROVIDER_POOL"):
+        pool = [p.strip() for p in os.getenv("AI_COMMITTEE_FINAL_CHAIRMAN_PROVIDER_POOL", "").split(",") if p.strip()]
+        cfg["final_chairman_provider_pool"] = pool
+        if pool:
+            cfg["final_chairman_provider"] = pool[0]
+    elif os.getenv("AI_COMMITTEE_FINAL_CHAIRMAN_PROVIDER"):
         cfg["final_chairman_provider"] = os.getenv("AI_COMMITTEE_FINAL_CHAIRMAN_PROVIDER")
     if os.getenv("AI_COMMITTEE_MAX_ROUNDS"):
         cfg["max_rounds"] = int(os.getenv("AI_COMMITTEE_MAX_ROUNDS", "2") or 2)

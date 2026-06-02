@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any
 from urllib import parse, request
 
+from provider_config import auto_provider_pools_enabled, provider_pool_names_for_env
+
 DEFAULT_MARKET_INTELLIGENCE_CONFIG: dict[str, Any] = {
     "enabled": False,
     "search_provider_pool": ["PERPLEXITY_SEARCH", "OPENAI_WEB_SEARCH", "TAVILY_SEARCH"],
@@ -54,8 +56,13 @@ def merge_config(goal: dict[str, Any] | None) -> dict[str, Any]:
     env_enabled = os.getenv("MARKET_INTELLIGENCE_ENABLED")
     if env_enabled is not None:
         cfg["enabled"] = env_enabled.strip().lower() in {"1", "true", "yes", "y", "on"}
-    if os.getenv("MARKET_INTELLIGENCE_PROVIDER_POOL"):
+    auto_market_pool = provider_pool_names_for_env("MARKET_SEARCH_PROVIDER_POOL") if auto_provider_pools_enabled() else []
+    if auto_market_pool:
+        cfg["search_provider_pool"] = auto_market_pool
+    elif os.getenv("MARKET_INTELLIGENCE_PROVIDER_POOL"):
         cfg["search_provider_pool"] = [p.strip() for p in os.getenv("MARKET_INTELLIGENCE_PROVIDER_POOL", "").split(",") if p.strip()]
+    elif os.getenv("MARKET_SEARCH_PROVIDER_POOL"):
+        cfg["search_provider_pool"] = [p.strip() for p in os.getenv("MARKET_SEARCH_PROVIDER_POOL", "").split(",") if p.strip()]
     if os.getenv("MARKET_INTELLIGENCE_MAX_SEARCH_RESULTS"):
         cfg["max_search_results"] = int(os.getenv("MARKET_INTELLIGENCE_MAX_SEARCH_RESULTS", "12") or 12)
     if os.getenv("MARKET_INTELLIGENCE_TIMEOUT_SECONDS"):
