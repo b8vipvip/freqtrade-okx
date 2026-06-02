@@ -87,6 +87,10 @@ def merge_config(goal: dict[str, Any] | None) -> dict[str, Any]:
         cfg["search_provider_pool"] = [p.strip() for p in os.getenv("MARKET_INTELLIGENCE_PROVIDER_POOL", "").split(",") if p.strip()]
     elif os.getenv("MARKET_SEARCH_PROVIDER_POOL"):
         cfg["search_provider_pool"] = [p.strip() for p in os.getenv("MARKET_SEARCH_PROVIDER_POOL", "").split(",") if p.strip()]
+    pool = [str(p).strip() for p in cfg.get("search_provider_pool", []) if str(p).strip()]
+    if _openrouter_sonar_pro_configured() and "OPENROUTER_SONAR_PRO" not in [p.upper() for p in pool]:
+        pool.append("OPENROUTER_SONAR_PRO")
+        cfg["search_provider_pool"] = pool
     if os.getenv("MARKET_INTELLIGENCE_MAX_SEARCH_RESULTS"):
         cfg["max_search_results"] = int(os.getenv("MARKET_INTELLIGENCE_MAX_SEARCH_RESULTS", "12") or 12)
     if os.getenv("MARKET_INTELLIGENCE_TIMEOUT_SECONDS"):
@@ -111,6 +115,11 @@ def merge_config(goal: dict[str, Any] | None) -> dict[str, Any]:
             cfg[cfg_key] = raw_env
     return cfg
 
+
+
+def _openrouter_sonar_pro_configured() -> bool:
+    prefix = "AI_PROVIDER_OPENROUTER_SONAR_PRO"
+    return bool((os.getenv(f"{prefix}_MODEL") or "").strip() and ((os.getenv(f"{prefix}_API_KEY") or "").strip() or (os.getenv(f"{prefix}_API_KEY_ENV") or "").strip()))
 
 def _pair_symbols(active_pairs: list[str]) -> list[str]:
     symbols: list[str] = []
@@ -247,6 +256,8 @@ def _openai_compatible_search(query: str, cfg: dict[str, Any], train_timerange: 
     pool = provider_pool_names_for_env("MARKET_SEARCH_PROVIDER_POOL")
     if not pool:
         pool = [str(p).strip() for p in cfg.get("search_provider_pool", []) if str(p).strip()]
+    if _openrouter_sonar_pro_configured() and "OPENROUTER_SONAR_PRO" not in [p.upper() for p in pool]:
+        pool.append("OPENROUTER_SONAR_PRO")
     print(f"market_intelligence provider_pool={pool}")
     for provider_name in pool:
         provider = load_provider_config(provider_name, default_timeout=int(cfg.get("timeout_seconds", 120)))
@@ -337,6 +348,8 @@ def _cache_dir(cfg: dict[str, Any]) -> Path:
 
 def _provider_cache_identity(cfg: dict[str, Any]) -> dict[str, Any]:
     pool = provider_pool_names_for_env("MARKET_SEARCH_PROVIDER_POOL") or [str(p).strip() for p in cfg.get("search_provider_pool", []) if str(p).strip()]
+    if _openrouter_sonar_pro_configured() and "OPENROUTER_SONAR_PRO" not in [p.upper() for p in pool]:
+        pool.append("OPENROUTER_SONAR_PRO")
     identities = []
     for name in pool:
         provider = load_provider_config(name, default_timeout=int(cfg.get("timeout_seconds", 120)))
@@ -406,6 +419,8 @@ def collect_market_intelligence(
     cache_path = _cache_dir(cfg) / f"{cache_key}.json"
     if bool(cfg.get("run_once_per_run", True)) and run_cache_key in _RUN_LEVEL_MARKET_INTEL_CACHE and not bool(cfg.get("force_refresh", False)):
         print(f"market_intelligence cache_hit scope=run key={cache_key}")
+        print(f"market_intelligence cache_path={cache_path}")
+        print("market_intelligence skip_live_search=true")
         cached = _RUN_LEVEL_MARKET_INTEL_CACHE[run_cache_key]
         raw_sources = list(cached.get("raw_sources", []))
         intel = dict(cached.get("market_intel", {}))
@@ -416,6 +431,8 @@ def collect_market_intelligence(
         cached_payload = _read_market_cache(cache_path, int(cfg.get("cache_ttl_days", 3650) or 3650))
         if cached_payload:
             print(f"market_intelligence cache_hit scope=disk key={cache_key} path={cache_path}")
+            print(f"market_intelligence cache_path={cache_path}")
+            print("market_intelligence skip_live_search=true")
             raw_sources = list(cached_payload.get("raw_sources", []))
             intel = dict(cached_payload.get("market_intel", {}))
             _RUN_LEVEL_MARKET_INTEL_CACHE[run_cache_key] = {"raw_sources": raw_sources, "market_intel": intel}
@@ -423,6 +440,7 @@ def collect_market_intelligence(
             (out_dir / "market_intel.json").write_text(json.dumps(intel, ensure_ascii=False, indent=2), encoding="utf-8")
             return intel
     print(f"market_intelligence cache_miss key={cache_key}")
+    print("market_intelligence skip_live_search=false")
     max_total = max(1, int(cfg.get("max_search_results", 12)))
     raw_sources: list[dict[str, Any]] = []
     deadline = time.time() + max(5, int(cfg.get("timeout_seconds", 120)))

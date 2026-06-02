@@ -211,6 +211,14 @@ def _initial_family_stats() -> dict[str, dict[str, Any]]:
     return {
         family: {
             "generated": 0,
+            "attempted": 0,
+            "advisor_success": 0,
+            "committee_success": 0,
+            "codegen_candidate_generated": 0,
+            "reviewer_rejected": 0,
+            "prompt_duplicate": 0,
+            "final_generated": 0,
+            "train_backtested": 0,
             "valid": 0,
             "loss_streak": 0,
             "near_miss": False,
@@ -239,6 +247,14 @@ def _initial_family_stats() -> dict[str, dict[str, Any]]:
 def _family_stats_default() -> dict[str, Any]:
     return {
         "generated": 0,
+        "attempted": 0,
+        "advisor_success": 0,
+        "committee_success": 0,
+        "codegen_candidate_generated": 0,
+        "reviewer_rejected": 0,
+        "prompt_duplicate": 0,
+        "final_generated": 0,
+        "train_backtested": 0,
         "valid": 0,
         "loss_streak": 0,
         "near_miss": False,
@@ -362,6 +378,17 @@ def _is_trailing_failure(train_metrics: dict[str, Any] | None) -> bool:
     return moving_stop_profit_abs < 0 and abs(moving_stop_profit_abs) > max(0.0, roi_profit_abs) * 0.5
 
 
+
+def _bump_strategy_family_stat(family_stats: dict[str, dict[str, Any]], family: str, key: str, amount: int = 1) -> None:
+    family = _normalize_strategy_family(family)
+    if not family:
+        return
+    stats = family_stats.setdefault(family, _family_stats_default())
+    for default_key, value in _family_stats_default().items():
+        stats.setdefault(default_key, value)
+    stats[key] = int(stats.get(key, 0) or 0) + int(amount)
+
+
 def _update_strategy_family_stats(
     family_stats: dict[str, dict[str, Any]],
     family: str,
@@ -383,6 +410,7 @@ def _update_strategy_family_stats(
     for key, value in _family_stats_default().items():
         stats.setdefault(key, value)
     stats["generated"] = int(stats.get("generated", 0)) + 1
+    stats["train_backtested"] = int(stats.get("train_backtested", 0)) + 1
     if is_valid:
         stats["valid"] = int(stats.get("valid", 0)) + 1
     scores = list(stats.get("final_scores", []) or [])
@@ -772,6 +800,14 @@ def _build_strategy_family_leaderboard(rows: list[dict[str, Any]], family_stats:
         family_rows = [r for r in rows if _normalize_strategy_family(r.get("strategy_family")) == family]
         stats = (family_stats or {}).get(family, {})
         generated = len(family_rows) or _safe_int(stats.get("generated"))
+        attempted = _safe_int(stats.get("attempted")) or generated
+        advisor_success = _safe_int(stats.get("advisor_success"))
+        committee_success = _safe_int(stats.get("committee_success"))
+        codegen_candidate_generated = _safe_int(stats.get("codegen_candidate_generated"))
+        reviewer_rejected = _safe_int(stats.get("reviewer_rejected"))
+        prompt_duplicate = _safe_int(stats.get("prompt_duplicate"))
+        final_generated = _safe_int(stats.get("final_generated")) or generated
+        train_backtested = _safe_int(stats.get("train_backtested")) or len([r for r in family_rows if r.get("train_backtest_status") or r.get("train_metrics")])
         valid_rows = [r for r in family_rows if bool(r.get("is_valid"))]
         near_rows = [r for r in family_rows if bool(r.get("near_miss")) or bool(r.get("low_trade_profitable_near_miss")) or bool(r.get("near_miss_type"))]
         hf = sum(1 for r in family_rows if bool(r.get("high_frequency_failure"))) or _safe_int(stats.get("high_frequency_failure_count"))
@@ -806,6 +842,20 @@ def _build_strategy_family_leaderboard(rows: list[dict[str, Any]], family_stats:
         if stable_followup and not valid_rows: reason_parts.append("交易数相对稳定且无 runtime/high-frequency，可作为 follow-up 修复")
         if not reason_parts: reason_parts.append("按真实 round/summary 聚合")
         data = {
+            "attempted": attempted,
+            "advisor_success": advisor_success,
+            "committee_success": committee_success,
+            "codegen_candidate_generated": codegen_candidate_generated,
+            "reviewer_rejected": reviewer_rejected,
+            "prompt_duplicate": prompt_duplicate,
+            "final_generated": final_generated,
+            "train_backtested": train_backtested,
+            "generated": generated,
+            "valid": len(valid_rows),
+            "near_miss": len(near_rows) or _safe_int(stats.get("near_miss_count")),
+            "high_freq": hf,
+            "zero_trade": zero,
+            "runtime_error": runtime,
             "generated_count": generated,
             "valid_count": len(valid_rows),
             "near_miss_count": len(near_rows) or _safe_int(stats.get("near_miss_count")),
@@ -833,14 +883,17 @@ def _build_strategy_family_leaderboard(rows: list[dict[str, Any]], family_stats:
 def _print_strategy_family_leaderboard(leaderboard: dict[str, Any], path: Path) -> None:
     print("\n========== strategy_family_leaderboard ==========")
     print(f"strategy_family_leaderboard.json：{path}")
-    print("family | generated | valid | near_miss | high_freq | zero_trade | runtime_error | avg_score | action | reason")
+    print("family | attempted | advisor | committee | candidates | reviewer_rejected | prompt_duplicate | final_generated | train_backtested | valid | near_miss | high_freq | zero_trade | runtime_error | avg_score | action | reason")
     families = leaderboard.get("families", {}) if isinstance(leaderboard, dict) else {}
     if not families:
         print("无 strategy_family 统计。")
     for family, item in families.items():
         print(
-            f"{family} | {_safe_int(item.get('generated_count'))} | {_safe_int(item.get('valid_count'))} | "
-            f"{_safe_int(item.get('near_miss_count'))} | {_safe_int(item.get('high_frequency_failure_count'))} | "
+            f"{family} | {_safe_int(item.get('attempted'))} | {_safe_int(item.get('advisor_success'))} | "
+            f"{_safe_int(item.get('committee_success'))} | {_safe_int(item.get('codegen_candidate_generated'))} | "
+            f"{_safe_int(item.get('reviewer_rejected'))} | {_safe_int(item.get('prompt_duplicate'))} | "
+            f"{_safe_int(item.get('final_generated'))} | {_safe_int(item.get('train_backtested'))} | "
+            f"{_safe_int(item.get('valid_count'))} | {_safe_int(item.get('near_miss_count'))} | {_safe_int(item.get('high_frequency_failure_count'))} | "
             f"{_safe_int(item.get('zero_trade_failure_count'))} | {_safe_int(item.get('runtime_error_failure_count'))} | "
             f"{_safe_float(item.get('avg_final_score')):.4f} | {item.get('recommended_action', '')} | {item.get('recommendation_reason', '')}"
         )
@@ -7331,6 +7384,9 @@ def run_manual_ai_backtest(runtime_goal: dict[str, Any], args: argparse.Namespac
         "advisor_success_count": 0,
         "codegen_success_count": 0,
         "ai_codegen_call_success_count": 0,
+        "codegen_candidate_generated_count": 0,
+        "codegen_candidate_accepted_count": 0,
+        "codegen_reviewer_rejected_count": 0,
         "accepted_codegen_candidate_count": 0,
         "final_codegen_success_count": 0,
         "generated_versions_count": 1,
@@ -7863,6 +7919,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         "advisor_success_count": 0,
         "codegen_success_count": 0,
         "ai_codegen_call_success_count": 0,
+        "codegen_candidate_generated_count": 0,
+        "codegen_candidate_accepted_count": 0,
+        "codegen_reviewer_rejected_count": 0,
         "accepted_codegen_candidate_count": 0,
         "final_codegen_success_count": 0,
         "generated_versions_count": 0,
@@ -8005,6 +8064,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         planned_strategy_family = _select_strategy_family_for_round(family_stats, last_planned_strategy_family, explore_family_cfg) if explore_strategy_family else ""
         selected_strategy_family = planned_strategy_family if explore_strategy_family else ""
         if explore_strategy_family:
+            _bump_strategy_family_stat(family_stats, selected_strategy_family, "attempted")
             _print_explore_strategy_family_runtime_state(explore_strategy_family, explore_family_cfg, family_stats, selected_strategy_family)
         family_score = 0.0
         family_failure_reason = ""
@@ -8360,6 +8420,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 ai_state=ai_runtime_state,
             )
             final_strategy_directive = committee_result.get("final_strategy_directive", {}) if isinstance(committee_result, dict) else {}
+            if explore_strategy_family:
+                _bump_strategy_family_stat(family_stats, selected_strategy_family or planned_strategy_family, "committee_success")
             committee_prompt_section = directive_prompt_section(market_intel, final_strategy_directive)
             _print_committee_decision(market_intel, final_strategy_directive)
         print("========== 本轮迭代上下文 ==========")
@@ -8486,6 +8548,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             print("策略顾问模型返回完成。")
             status["advisor_status"] = "成功"
             iteration_stats["advisor_success_count"] += 1
+            if explore_strategy_family:
+                _bump_strategy_family_stat(family_stats, selected_strategy_family or planned_strategy_family, "advisor_success")
             delay_sec = max(0.0, float(args.advisor_to_codegen_delay_seconds))
             if delay_sec > 0:
                 print(f"策略顾问模型完成，将等待 {int(delay_sec)} 秒后调用代码生成模型，避免中转站请求过快。")
@@ -8686,6 +8750,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 status["invalid_reason"] = invalid_reason
                 status["failure_type"] = "prompt_duplicate"
                 iteration_stats["invalid_strategy_count"] += 1
+                if explore_strategy_family:
+                    _bump_strategy_family_stat(family_stats, selected_strategy_family, "prompt_duplicate")
                 (version_dir / "codegen_prompt.txt").write_text(prompt, encoding="utf-8")
                 summary_path = write_iteration_summary()
                 update_session_state_after_round(summary_path=summary_path)
@@ -8732,6 +8798,21 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                     "save": True,
                 },
             )
+            codegen_candidates_meta = committee_codegen_result.get("candidates", []) if isinstance(committee_codegen_result, dict) else []
+            ai_success = sum(1 for c in codegen_candidates_meta if not ((c.get("metadata") or {}).get("error")))
+            candidate_generated = sum(1 for c in codegen_candidates_meta if str(c.get("code") or "").strip())
+            candidate_accepted = sum(1 for c in codegen_candidates_meta if not ((c.get("metadata") or {}).get("prompt_duplicate")) and not (((c.get("metadata") or {}).get("lightweight_check") or {}).get("hard_errors")))
+            reviewer_rejected = max(0, len(codegen_candidates_meta) - (1 if committee_codegen_result.get("status") == "selected" else 0))
+            iteration_stats["ai_codegen_call_success_count"] += ai_success
+            iteration_stats["codegen_candidate_generated_count"] += candidate_generated
+            iteration_stats["codegen_candidate_accepted_count"] += candidate_accepted
+            iteration_stats["accepted_codegen_candidate_count"] = iteration_stats["codegen_candidate_accepted_count"]
+            iteration_stats["codegen_reviewer_rejected_count"] += reviewer_rejected
+            if explore_strategy_family:
+                _bump_strategy_family_stat(family_stats, selected_strategy_family, "codegen_candidate_generated", candidate_generated)
+                _bump_strategy_family_stat(family_stats, selected_strategy_family, "reviewer_rejected", reviewer_rejected)
+                if committee_codegen_result.get("status") == "prompt_duplicate":
+                    _bump_strategy_family_stat(family_stats, selected_strategy_family, "prompt_duplicate")
             if committee_codegen_result.get("status") == "prompt_duplicate":
                 previous_failure_reason = "prompt_duplicate"
                 failure_reason = "prompt_duplicate"
@@ -8753,13 +8834,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 iteration_stats["invalid_strategy_count"] += 1
                 summary_path = write_iteration_summary()
                 update_session_state_after_round(summary_path=summary_path)
-                leaderboard.append({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": invalid_reason})
+                leaderboard.append(enrich_leaderboard_entry({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": invalid_reason}))
                 print("本轮停止：codegen reviewer 认为所有候选不合格。")
                 flush_iteration_stats()
                 continue
-            codegen_candidates_meta = committee_codegen_result.get("candidates", []) if isinstance(committee_codegen_result, dict) else []
-            iteration_stats["ai_codegen_call_success_count"] += sum(1 for c in codegen_candidates_meta if not ((c.get("metadata") or {}).get("error")))
-            iteration_stats["accepted_codegen_candidate_count"] += sum(1 for c in codegen_candidates_meta if not ((c.get("metadata") or {}).get("prompt_duplicate")))
             code = str(committee_codegen_result.get("selected_code") or "")
             selected_candidate = str(committee_codegen_result.get("selected_candidate") or "")
             response_text = code
@@ -8780,13 +8858,15 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                     (version_dir / "codegen.raw.txt").write_text(response_text, encoding="utf-8")
                 summary_path = write_iteration_summary()
                 update_session_state_after_round(summary_path=summary_path)
-                leaderboard.append({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": invalid_reason})
+                leaderboard.append(enrich_leaderboard_entry({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": invalid_reason}))
                 continue
             (version_dir / "codegen.raw.txt").write_text(response_text, encoding="utf-8")
             code = extract_python_code(response_text)
         status["codegen_status"] = "成功"
         iteration_stats["codegen_success_count"] += 1
         iteration_stats["final_codegen_success_count"] += 1
+        if explore_strategy_family:
+            _bump_strategy_family_stat(family_stats, selected_strategy_family, "final_generated")
         features = extract_strategy_features(code)
         strategy_fingerprint = build_strategy_fingerprint(features)
         signature = strategy_fingerprint["hash"]
@@ -10609,7 +10689,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     print(f"策略顾问成功次数：{iteration_stats.get('advisor_success_count')}")
     print(f"代码生成成功次数：{iteration_stats.get('codegen_success_count')}")
     print(f"AI codegen 调用成功次数：{iteration_stats.get('ai_codegen_call_success_count')}")
-    print(f"已接受 codegen candidate 数：{iteration_stats.get('accepted_codegen_candidate_count')}")
+    print(f"成功提取 codegen candidate strategy.py 数：{iteration_stats.get('codegen_candidate_generated_count')}")
+    print(f"已接受 codegen candidate 数：{iteration_stats.get('codegen_candidate_accepted_count')}")
+    print(f"reviewer 拒绝 candidate 数：{iteration_stats.get('codegen_reviewer_rejected_count')}")
     print(f"最终 codegen 成功次数：{iteration_stats.get('final_codegen_success_count')}")
     print(f"实际生成策略版本数：{iteration_stats.get('generated_versions_count')}")
     print(f"训练回测版本数：{iteration_stats.get('train_backtest_count')}")
