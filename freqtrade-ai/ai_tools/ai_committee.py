@@ -117,26 +117,36 @@ def _build_directive(ctx: dict[str, Any], role_outputs: list[dict[str, Any]], re
             pair_rules[pair] = {"entry_threshold": "stricter", "reason": "risk-first committee prioritizes lower BTC stoploss exposure"}
         elif pair == "OP/USDT":
             pair_rules[pair] = {"entry_threshold": "much_stricter", "max_trade_share": "reduced", "reason": "OP high-frequency stoploss exposure must be capped"}
+    failure_type = str(ctx.get("failure_type") or "")
+    too_few_recovery = failure_type in {"too_few_trades", "training_trade_count_below_min", "zero_trade"}
+    allowed_mutations = ["pair_specific_filter", "add_entry_filter", "tighten_entry_trigger", "reduce_trade_frequency", "cooldown_or_protection"]
+    blocked_mutations = ["adjust_roi_only", "replace_stoploss_with_trailing", "remove_risk_filter", "increase_trade_frequency", "news_keyword_rule"]
+    if too_few_recovery:
+        allowed_mutations = ["controlled_widen_entry", "widen_entry_controlled", "remove_overstrict_pair_filter", "pair_specific_filter"]
+        blocked_mutations = ["add_more_global_filters", "tighten_entry_trigger", "add_entry_filter", "reduce_trade_frequency", "adjust_roi_only", "replace_stoploss_with_trailing", "news_keyword_rule"]
     return {
         "preferred_parent": "nearest_candidate",
-        "failure_focus": _failure_focus(str(ctx.get("failure_type") or "")),
+        "failure_focus": _failure_focus(failure_type),
         "strategy_family": "trend_following_regime_filter" if not retry_hint else "trend_following_regime_filter_diversified",
-        "allowed_mutations": ["pair_specific_filter", "add_entry_filter", "tighten_entry_trigger", "reduce_trade_frequency", "cooldown_or_protection"],
-        "blocked_mutations": ["adjust_roi_only", "replace_stoploss_with_trailing", "remove_risk_filter", "increase_trade_frequency", "news_keyword_rule"],
+        "allowed_mutations": allowed_mutations,
+        "blocked_mutations": blocked_mutations,
+        "too_few_trades_recovery_mode": too_few_recovery,
         "pair_specific_rules": pair_rules,
         "trade_count_target": {"min": 20, "ideal_min": 25, "ideal_max": 45, "max": 60},
         "risk_constraints": ["reduce stoploss_to_roi_ratio", "do not increase OP high frequency trades", "do not remove risk filters", "validation intel may only become abstract postmortem metrics"],
         "codegen_requirements": [
             "populate_entry_trend must include pair-specific BTC/OP thresholds when those pairs are active",
-            "populate_indicators must calculate regime/choppy/volatility filters",
+            "populate_indicators may calculate regime/choppy/volatility filters only when mutation_spec includes estimated_trade_count_guard",
+            "risk-reducing does not mean no-trade; any mutation must satisfy min_trades >= 20 and target total trades 20~60 (ideal 25~45)",
+            "BTC/OP may be tightened, but SOL/BNB/DOGE opportunities must be preserved",
             "must not be equivalent to previous strategy",
             "do not implement news-based rules or external API calls",
         ] + ([f"diversification_retry_hint: {retry_hint}"] if retry_hint else []),
         "prompt_directive": (
             "Use a value-investing-inspired, risk-first committee style: first avoid large losses, do not trade merely for count, "
-            "control BTC/OP stoploss exposure, never use validation/holdout news as generation input, and only express market intel as backtestable candle/volume/volatility proxies."
+            "control BTC/OP stoploss exposure without pushing global training trades below 20, never use validation/holdout news as generation input, and only express market intel as backtestable candle/volume/volatility proxies."
         ),
-        "final_chairman_decision": "Proceed only if the mutation is materially different, risk-reducing, and implementable in Freqtrade without news/live external data.",
+        "final_chairman_decision": "Proceed only if the mutation is materially different, risk-reducing, implementable in Freqtrade without news/live external data, and preserves min_trades >= 20; risk-reducing does not mean no-trade.",
         "do_not_impersonate": "This is not Warren Buffett advice and must not claim to be from Buffett.",
     }
 

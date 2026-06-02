@@ -8,17 +8,32 @@ used as a candle-level live signal inside generated Freqtrade strategies.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
 import re
+import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib import parse, request
 
-from provider_config import auto_provider_pools_enabled, provider_pool_names_for_env
+from dotenv import load_dotenv
+from openai import OpenAI
+
+from provider_config import (
+    OPENAI_COMPATIBLE_TYPES,
+    auto_provider_pools_enabled,
+    load_provider_config,
+    looks_like_placeholder_secret,
+    provider_pool_names_for_env,
+)
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+load_dotenv(ROOT_DIR / ".env")
 
 DEFAULT_MARKET_INTELLIGENCE_CONFIG: dict[str, Any] = {
     "enabled": False,
@@ -79,16 +94,36 @@ def _pair_symbols(active_pairs: list[str]) -> list[str]:
     return symbols
 
 
-def _fallback_sources(query: str, train_timerange: str) -> list[dict[str, Any]]:
+def _failure_summary(failures: list[dict[str, Any]]) -> str:
+    if not failures:
+        return "no live search providers configured"
+    parts = []
+    for item in failures:
+        parts.append(
+            f"{item.get('provider')} model={item.get('model') or '<missing>'} "
+            f"base_url={item.get('base_url') or '<missing>'} "
+            f"error={item.get('exception_type')}: {item.get('error_summary')}"
+        )
+    return " | ".join(parts)[:4000]
+
+
+def _fallback_sources(query: str, train_timerange: str, failures: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     digest = hashlib.sha256(f"{query}|{train_timerange}".encode("utf-8")).hexdigest()[:12]
+    failure_text = _failure_summary(failures or [])
+    print(f"market_intelligence offline_fallback query={query!r}; provider_failures={failure_text}")
     return [{
         "provider": "offline_fallback",
+        "model": "",
         "query": query,
         "title": f"Offline market-intel placeholder for {query}",
         "url": f"offline://market-intel/{digest}",
         "published_at": "",
+        "content": "",
+        "sources": [],
+        "provider_failures": failures or [],
         "snippet": (
-            "No configured live search API returned data. Treat this as a conservative offline placeholder: "
+            "All configured live search providers failed. Failure reasons: "
+            f"{failure_text}. Treat this as a conservative offline placeholder: "
             "prefer robust risk filters, avoid news-specific rules, and do not use validation/holdout news in prompts."
         ),
     }]
@@ -121,11 +156,126 @@ def _duckduckgo_search(query: str, timeout: int, max_results: int) -> list[dict[
     return out[:max_results]
 
 
+def _http_body_summary(exc: Exception) -> str:
+    body = getattr(exc, "body", None)
+    if body is None:
+        response = getattr(exc, "response", None)
+        if response is not None:
+            try:
+                body = response.text
+            except Exception:  # noqa: BLE001 - best-effort error logging only.
+                body = None
+    if isinstance(body, (dict, list)):
+        text = json.dumps(body, ensure_ascii=False)
+    else:
+        text = str(body or "")
+    return text.replace("\n", " ")[:1000]
+
+
+def _provider_failure(provider: dict[str, Any], exc: Exception, *, prefix: str = "") -> dict[str, Any]:
+    failure = {
+        "provider": provider.get("id") or provider.get("name") or "",
+        "model": provider.get("model") or "",
+        "base_url": provider.get("base_url") or "",
+        "exception_type": type(exc).__name__,
+        "http_status": getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None),
+        "http_body_summary": _http_body_summary(exc),
+        "error_summary": (prefix + str(exc)).replace("\n", " ")[:1000],
+    }
+    print(
+        "market_intelligence live_search_failed "
+        f"provider={failure['provider']} model={failure['model']} base_url={failure['base_url']} "
+        f"exception={failure['exception_type']} http_status={failure['http_status']} "
+        f"http_body={failure['http_body_summary']} error={failure['error_summary']}"
+    )
+    return failure
+
+
+def _extract_response_sources(message: Any) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+    annotations = getattr(message, "annotations", None) or []
+    for ann in annotations:
+        url_citation = getattr(ann, "url_citation", None)
+        if url_citation is None and isinstance(ann, dict):
+            url_citation = ann.get("url_citation")
+        if url_citation:
+            if isinstance(url_citation, dict):
+                sources.append({"title": url_citation.get("title", ""), "url": url_citation.get("url", "")})
+            else:
+                sources.append({"title": getattr(url_citation, "title", ""), "url": getattr(url_citation, "url", "")})
+    return sources
+
+
+def _search_prompt(query: str, train_timerange: str) -> str:
+    return (
+        "Search the web for current crypto/macroeconomic information relevant to offline Freqtrade strategy design. "
+        "Return concise bullet points with source names/URLs when available. "
+        "Do not provide trading signals. "
+        f"Training timerange context: {train_timerange}. Query: {query}"
+    )
+
+
+def _openai_compatible_search(query: str, cfg: dict[str, Any], train_timerange: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    failures: list[dict[str, Any]] = []
+    pool = provider_pool_names_for_env("MARKET_SEARCH_PROVIDER_POOL")
+    if not pool:
+        pool = [str(p).strip() for p in cfg.get("search_provider_pool", []) if str(p).strip()]
+    print(f"market_intelligence provider_pool={pool}")
+    for provider_name in pool:
+        provider = load_provider_config(provider_name, default_timeout=int(cfg.get("timeout_seconds", 120)))
+        provider_id = str(provider.get("id") or provider_name)
+        model = str(provider.get("model") or "")
+        base_url = str(provider.get("base_url") or "")
+        provider_type = str(provider.get("type") or "openai_compatible").lower()
+        if provider_type not in OPENAI_COMPATIBLE_TYPES:
+            failures.append(_provider_failure(provider, RuntimeError(f"unsupported provider TYPE={provider_type}")))
+            continue
+        if not model or not provider.get("api_key") or looks_like_placeholder_secret(str(provider.get("api_key") or "")):
+            failures.append(_provider_failure(provider, RuntimeError("missing API_KEY or MODEL")))
+            continue
+        try:
+            print(f"market_intelligence live_search_call provider={provider_id} model={model} base_url={base_url}")
+            client = OpenAI(api_key=str(provider["api_key"]), base_url=base_url or None, timeout=float(provider.get("timeout") or cfg.get("timeout_seconds", 120)))
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "You are a web-search market intelligence assistant. Cite source URLs when available."},
+                    {"role": "user", "content": _search_prompt(query, train_timerange)},
+                ],
+                temperature=0.2,
+            )
+            message = response.choices[0].message
+            content = str(getattr(message, "content", "") or "").strip()
+            sources = _extract_response_sources(message)
+            if not content and not sources:
+                raise RuntimeError("empty live search response")
+            print(f"market_intelligence live_search_success provider={provider_id} model={model} base_url={base_url} content_chars={len(content)} sources={len(sources)}")
+            return ([{
+                "provider": provider_id,
+                "model": model,
+                "base_url": base_url,
+                "query": query,
+                "title": f"Live market intelligence: {query}",
+                "url": sources[0].get("url", "") if sources else "",
+                "published_at": "",
+                "content": content,
+                "sources": sources,
+                "snippet": content[:800],
+            }], failures)
+        except Exception as exc:  # noqa: BLE001 - try next configured provider and audit reason.
+            failures.append(_provider_failure(provider, exc))
+    return [], failures
+
+
 def _search(query: str, cfg: dict[str, Any], train_timerange: str) -> list[dict[str, Any]]:
-    # In this environment API keys may be absent.  Use a bounded public fallback,
-    # then a transparent offline placeholder so the pipeline remains auditable.
-    results = _duckduckgo_search(query, int(cfg.get("timeout_seconds", 120)), int(cfg.get("max_search_results", 12)))
-    return results or _fallback_sources(query, train_timerange)
+    live_results, failures = _openai_compatible_search(query, cfg, train_timerange)
+    if live_results:
+        return live_results
+    if bool(cfg.get("allow_public_search_fallback", False)):
+        results = _duckduckgo_search(query, int(cfg.get("timeout_seconds", 120)), int(cfg.get("max_search_results", 12)))
+        if results:
+            return results
+    return _fallback_sources(query, train_timerange, failures)
 
 
 def _classify_regimes(sources: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -239,3 +389,46 @@ def summarize_for_prompt(intel: dict[str, Any] | None, max_chars: int = 5000) ->
         "lookahead_warning": intel.get("lookahead_warning"),
     }
     return json.dumps(safe, ensure_ascii=False, sort_keys=True)[:max_chars]
+
+
+def _goal_pairs(goal: dict[str, Any]) -> list[str]:
+    pairs = goal.get("runtime_active_pairs") or goal.get("pairs") or goal.get("active_pairs") or []
+    return [str(p) for p in pairs if str(p).strip()] or ["BTC/USDT", "OP/USDT", "SOL/USDT", "BNB/USDT", "DOGE/USDT"]
+
+
+def _main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Market intelligence live-search tester")
+    parser.add_argument("--test-search", action="store_true", help="Only test live search and write market_intel artifacts; do not run backtests")
+    parser.add_argument("--goal", default=str(ROOT_DIR / "ai_tools" / "optimization_goal.json"), help="Path to optimization_goal.json")
+    parser.add_argument("--run-dir", default="", help="Optional output run directory")
+    args = parser.parse_args(argv)
+    if not args.test_search:
+        parser.error("Only --test-search is supported by this standalone command")
+    goal_path = Path(args.goal)
+    goal = json.loads(goal_path.read_text(encoding="utf-8")) if goal_path.exists() else {}
+    cfg = merge_config(goal)
+    cfg["enabled"] = True
+    test_root = ROOT_DIR / "user_data" / "backtest_results"
+    test_root.mkdir(parents=True, exist_ok=True)
+    run_dir = Path(args.run_dir) if args.run_dir else Path(tempfile.mkdtemp(prefix="market_intel_test_", dir=str(test_root)))
+    train_timerange = str((goal.get("train_period") or {}).get("timerange") or goal.get("timerange") or "")
+    validation_timeranges = [str(v.get("timerange")) for v in goal.get("validation_periods", []) if isinstance(v, dict) and v.get("timerange")]
+    intel = collect_market_intelligence(
+        run_dir=run_dir,
+        train_timerange=train_timerange,
+        validation_timeranges=validation_timeranges,
+        active_pairs=_goal_pairs(goal),
+        timeframe=str(goal.get("timeframe") or "5m"),
+        failure_type="test_search",
+        pair_attribution={},
+        last_run_summary={},
+        config=cfg,
+    )
+    print(f"market_intelligence test_search output_dir={run_dir / 'market_intel'}")
+    providers = sorted({str(s.get("provider")) for s in (json.loads((run_dir / "market_intel" / "raw_sources.json").read_text(encoding="utf-8")) if (run_dir / "market_intel" / "raw_sources.json").exists() else [])})
+    print(f"market_intelligence test_search providers={providers}")
+    return 0 if any(p != "offline_fallback" for p in providers) else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main(sys.argv[1:]))
