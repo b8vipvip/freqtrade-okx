@@ -31,9 +31,15 @@ from typing import Any
 import pandas as pd
 
 from ai_committee import (
+    RECOVERY_ALLOWED,
+    RECOVERY_BLOCKED,
     directive_prompt_section,
     merge_config as merge_ai_committee_config,
     run_committee,
+)
+from codegen_committee import (
+    merge_config as merge_codegen_committee_config,
+    run_codegen_committee,
 )
 from market_intelligence import (
     collect_market_intelligence,
@@ -7635,6 +7641,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         max_attempts_per_call,
         switch_on_error,
     )
+    os.environ.setdefault("AI_COMMITTEE_FINAL_CHAIRMAN_PROVIDER_POOL", os.getenv("AI_COMMITTEE_FINAL_CHAIRMAN_PROVIDER", "GS88_GPT55"))
+    os.environ.setdefault("CODEGEN_REVIEWER_PROVIDER_POOL", "GS88_GPT55,GS88_GPT54,GS88_CODEX_AUTO_REVIEW,OPENROUTER_GPT53C")
     code_repair_runtime = AIRoleRuntime(
         role="code_generator",
         client=code_runtime.client,
@@ -7644,6 +7652,40 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         max_attempts_per_call=code_runtime.max_attempts_per_call,
         provider_pool=list(code_runtime.provider_pool),
     )
+    committee_analyst_runtime = None
+    committee_chairman_runtime = None
+    code_reviewer_runtime = None
+    try:
+        committee_analyst_runtime = _build_ai_role_runtime(
+            {"provider_pool_env": "AI_COMMITTEE_ANALYST_PROVIDER_POOL", "model_pool_env": "CLAUDE_MODEL_POOL", "model_env": "CLAUDE_MODEL", "api_key_env": "CLAUDE_API_KEY", "base_url_env": "CLAUDE_BASE_URL", "default_model": "gpt-5.5"},
+            "strategy_advisor",
+            int(os.getenv("AI_COMMITTEE_ROLE_TIMEOUT_SECONDS", str(args.ai_timeout)) or args.ai_timeout),
+            max_attempts_per_call,
+            True,
+        )
+    except Exception as exc:
+        print(f"AI committee analyst provider pool 初始化失败，将使用 offline conservative committee：{exc}")
+    try:
+        committee_chairman_runtime = _build_ai_role_runtime(
+            {"provider_pool_env": "AI_COMMITTEE_FINAL_CHAIRMAN_PROVIDER_POOL", "model_pool_env": "CLAUDE_MODEL_POOL", "model_env": "CLAUDE_MODEL", "api_key_env": "CLAUDE_API_KEY", "base_url_env": "CLAUDE_BASE_URL", "default_model": os.getenv("AI_COMMITTEE_FINAL_CHAIRMAN_PROVIDER", "GS88_GPT55")},
+            "strategy_advisor",
+            int(os.getenv("AI_COMMITTEE_ROLE_TIMEOUT_SECONDS", str(args.ai_timeout)) or args.ai_timeout),
+            max_attempts_per_call,
+            True,
+        )
+    except Exception as exc:
+        print(f"AI committee chairman provider 初始化失败，将使用 offline chairman：{exc}")
+    try:
+        code_reviewer_runtime = _build_ai_role_runtime(
+            {"provider_pool_env": "CODEGEN_REVIEWER_PROVIDER_POOL", "model_pool_env": "OPENAI_MODEL_POOL", "model_env": "OPENAI_MODEL", "api_key_env": "OPENAI_API_KEY", "base_url_env": "OPENAI_BASE_URL", "default_model": "gpt-5.5"},
+            "code_generator",
+            int(os.getenv("CODEGEN_COMMITTEE_TIMEOUT_SECONDS", str(args.ai_timeout)) or args.ai_timeout),
+            max_attempts_per_call,
+            True,
+        )
+    except Exception as exc:
+        print(f"codegen reviewer provider pool 初始化失败，将复用 STRATEGY_CODEGEN_PROVIDER_POOL/offline review：{exc}")
+        code_reviewer_runtime = code_runtime
     _print_ai_model_pool_config(advisor_runtime, code_runtime, float(args.ai_call_cooldown_seconds))
     print_effective_pair_selection_log(runtime_goal)
 
@@ -7698,9 +7740,11 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     market_intel_cfg = merge_market_intelligence_config(runtime_goal)
     ai_committee_cfg = merge_ai_committee_config(runtime_goal)
     prompt_similarity_cfg = merge_prompt_similarity_config(runtime_goal)
+    codegen_committee_cfg = merge_codegen_committee_config(runtime_goal)
     print("market_intelligence：" + ("开启" if market_intel_cfg.get("enabled") else "关闭"))
     print("ai_committee：" + ("开启" if ai_committee_cfg.get("enabled") else "关闭"))
     print("prompt_similarity_filter：" + ("开启" if prompt_similarity_cfg.get("enabled") else "关闭"))
+    print("codegen_committee：" + ("开启" if codegen_committee_cfg.get("enabled") else "关闭"))
     prev_train_trades: int | None = None
     previous_failure_reason: str | None = None
     zero_trade_streak = 0
@@ -8246,6 +8290,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 active_pairs=active_pairs_for_intel,
                 failure_type=current_failure_type,
                 config=ai_committee_cfg,
+                analyst_runtime=committee_analyst_runtime,
+                chairman_runtime=committee_chairman_runtime,
+                ask_ai_func=safe_ask_ai,
+                ai_state=ai_runtime_state,
             )
             final_strategy_directive = committee_result.get("final_strategy_directive", {}) if isinstance(committee_result, dict) else {}
             committee_prompt_section = directive_prompt_section(market_intel, final_strategy_directive)
@@ -8290,8 +8338,11 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         print(f"failure_type: {current_failure_type}")
         print(f"allowed_mutations: {mutation_policy.get('prefer', [])}")
         print(f"blocked_mutations: {mutation_policy.get('avoid', [])}")
-        too_few_trades_recovery_mode = current_failure_type in {"too_few_trades", "training_trade_count_below_min", "zero_trade"}
-        print(f"too_few_trades recovery mode: {'yes' if too_few_trades_recovery_mode else 'no'}")
+        too_few_trades_recovery_mode = (os.getenv("TOO_FEW_TRADES_RECOVERY_ENABLED", "true").strip().lower() in {"1", "true", "yes", "y", "on"}) and current_failure_type in {"too_few_trades", "training_trade_count_below_min", "zero_or_near_zero_trade", "zero_trade"}
+        print(f"too_few_trades_recovery: {'yes' if too_few_trades_recovery_mode else 'no'}")
+        print(f"previous_trade_count: {prev_train_trades if prev_train_trades is not None else 'unknown'}")
+        print("recovery_allowed_mutations:" + json.dumps(RECOVERY_ALLOWED, ensure_ascii=False))
+        print("recovery_blocked_mutations:" + json.dumps(RECOVERY_BLOCKED, ensure_ascii=False))
         spec_prompt = _strategy_spec_prompt(
             class_name,
             runtime_goal,
@@ -8314,8 +8365,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             spec_prompt += "硬性澄清：上一轮失败是 duplicate_strategy，不是 zero_trade；除非上一轮真实回测 total_trades=0，否则禁止写成 zero_trade，禁止选择 widen_entry_controlled。必须强制更换 codegen provider，并要求改变 entry_conditions / indicators / populate_entry_trend。\n"
         spec_prompt += "pair_attribution 定向要求：允许收紧 BTC/USDT、OP/USDT entry threshold；OP 不允许高频入场；但不得导致全局训练交易数低于 20。SOL/BNB/DOGE 必须保留交易机会，不允许所有 pair 被过滤到几乎无交易。下一轮优先尝试 pair_specific_entry_threshold for BTC/OP、avoid_choppy_market_filter、stoploss_to_roi_ratio reduction。禁止 remove_risk_filter、adjust_roi_only、replace_stoploss_with_trailing，禁止让 OP 交易数暴涨。\n"
         spec_prompt += "mutation_spec 若新增 regime/choppy/volatility filter，必须包含 estimated_trade_count_guard 字段，说明预计总交易数范围、min_trades=20、是否可能低于下限、以及如何保留 SOL/BNB/DOGE 机会。\n"
-        if current_failure_type in {"too_few_trades", "training_trade_count_below_min"}:
-            spec_prompt += "too_few_trades recovery mode：上一轮交易数低于下限；下一轮 allowed_mutations 必须包含 controlled_widen_entry，blocked_mutations 必须包含 add_more_global_filters；advisor 必须优先轻微放宽/移除过严条件，而不是继续加过滤。\n"
+        if too_few_trades_recovery_mode:
+            spec_prompt += "too_few_trades recovery mode：上一轮交易数过低，不允许继续收紧全局过滤；只能对 BTC/OP 保持更严格；必须恢复 SOL/BNB/DOGE 交易机会；目标交易数 20~60，理想 25~45。allowed_mutations 必须包含 controlled_widen_entry/relax_global_filter/pair_specific_restore_non_bad_pairs/reduce_overstrict_regime_filter；blocked_mutations 必须包含 add_more_global_filters/tighten_all_pairs/reduce_trade_frequency/add_choppy_filter_without_trade_guard。\n"
         spec_prompt += "允许 mutation=" + _compact_prompt_json(mutation_policy.get("prefer", []), 1000) + "\n"
         spec_prompt += "禁止 mutation=" + _compact_prompt_json(mutation_policy.get("avoid", []), 1000) + "\n"
         spec_prompt += "本轮只修一个主要问题；mutation_spec.mutation_type 必须优先从允许 mutation 中选择，且不得使用禁止 mutation。\n"
@@ -8458,7 +8509,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             + ("AI 投资委员会 risk_constraints=" + json.dumps(final_strategy_directive.get("risk_constraints", []), ensure_ascii=False) + "\n" if final_strategy_directive else "")
             + ("AI 投资委员会 pair_specific_rules=" + json.dumps(final_strategy_directive.get("pair_specific_rules", {}), ensure_ascii=False) + "\n" if final_strategy_directive else "")
             + "重要：不得把新闻/搜索结果写成策略代码规则；只能用可回测的 candle/volume/volatility/regime proxy。validation_intel 和 holdout_intel 未注入且禁止使用。\n"
-            f"当前 failure_type={current_failure_type}；allowed_mutations={mutation_policy.get('prefer', [])}；blocked_mutations={mutation_policy.get('avoid', [])}；too_few_trades_recovery_mode={'yes' if current_failure_type in {'too_few_trades', 'training_trade_count_below_min', 'zero_trade'} else 'no'}；本轮只修一个主要问题。\n"
+            f"当前 failure_type={current_failure_type}；allowed_mutations={mutation_policy.get('prefer', [])}；blocked_mutations={mutation_policy.get('avoid', [])}；too_few_trades_recovery_mode={'yes' if too_few_trades_recovery_mode else 'no'}；本轮只修一个主要问题。\n"
             f"当前失败摘要={previous_failure_reason or '无'}\n"
             "硬性约束：\n"
             + ("1) 当前是结构探索模式：允许不局限于 champion 小步改动，但必须吸收历史经验，避免重复已失败结构。\n" if explore_strategy_family else "1) 仅允许在 champion 基础上一次小改动，不允许完全重写。\n")
@@ -8502,6 +8553,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "- 避免把入场条件写成几乎永远不触发的苛刻组合；不允许把所有 pair 都过滤到几乎无交易。\n"
             "- 目标交易数必须保持 20~60，理想 25~45；risk-reducing 不等于 no-trade，任何 mutation 都必须满足 min_trades >= 20。\n"
             "- 如果 BTC/OP 收紧，应保留 SOL/BNB/DOGE 的交易机会，不能用全局过滤误伤所有币种。\n"
+            + ("- TOO_FEW_TRADES_RECOVERY：如果实现 regime/choppy filter，必须有 pair-specific bypass 或 less strict path，避免所有 pair 无交易；不允许所有 entry 条件都是 AND 严格叠加导致仅 1 笔交易；必须保留至少 3 个 pair 可能触发 entry。\n" if too_few_trades_recovery_mode else "")
         )
         prompt += _format_pre_run_review_for_codegen(pre_run_ai_review)
         prompt += _format_prompt_guidance_section(
@@ -8555,10 +8607,14 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                     failure_type=current_failure_type,
                     config=ai_committee_cfg,
                     retry_hint=retry_hint,
+                    analyst_runtime=committee_analyst_runtime,
+                    chairman_runtime=committee_chairman_runtime,
+                    ask_ai_func=safe_ask_ai,
+                    ai_state=ai_runtime_state,
                 )
                 final_strategy_directive = committee_result.get("final_strategy_directive", {}) if isinstance(committee_result, dict) else {}
                 prompt += "\n\n========== Prompt 相似度 retry 后主席差异化 directive ==========\n" + json.dumps(final_strategy_directive, ensure_ascii=False, indent=2) + "\n"
-            if prompt_review_report.get("decision") == "skip":
+            if prompt_review_report.get("decision") == "skip" and not codegen_committee_cfg.get("enabled"):
                 previous_failure_reason = "prompt_duplicate"
                 failure_reason = "prompt_duplicate"
                 invalid_reason = "prompt_duplicate"
@@ -8579,27 +8635,90 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             _print_prompt_similarity_review(prompt_review_report)
         (version_dir / "codegen_prompt.txt").write_text(prompt, encoding="utf-8")
         print("3. 正在调用代码生成模型池生成 Freqtrade 策略代码……")
+        print(f"codegen committee 是否开启: {'yes' if codegen_committee_cfg.get('enabled') else 'no'}")
         response_text = ""
-        try:
-            response_text = safe_ask_ai(
-                code_runtime,
-                [{"role": "user", "content": prompt}],
-                state=ai_runtime_state,
+        if codegen_committee_cfg.get("enabled"):
+            committee_codegen_result = run_codegen_committee(
+                version_dir=version_dir,
+                base_prompt=prompt,
+                class_name=class_name,
+                mutation_spec=strategy_spec,
+                final_strategy_directive=final_strategy_directive,
+                parent_strategy_summary=champion.get("meta", {}),
+                parent_code=champion.get("code", ""),
+                code_runtime=code_runtime,
+                reviewer_runtime=code_reviewer_runtime,
+                ask_ai=safe_ask_ai,
+                ai_state=ai_runtime_state,
+                config=codegen_committee_cfg,
+                prompt_review_func=(review_prompts if prompt_similarity_cfg.get("enabled") else None),
+                prompt_review_kwargs={
+                    "run_dir": run_dir,
+                    "registry_path": PROMPT_REGISTRY_FILE,
+                    "fields": {
+                        "market_intel_summary": market_intel_summary,
+                        "committee_consensus": committee_result.get("committee_consensus", []) if isinstance(committee_result, dict) else [],
+                        "final_strategy_directive": final_strategy_directive,
+                        "advisor_prompt": spec_prompt,
+                    },
+                    "config": prompt_similarity_cfg,
+                    "run_id": run_id,
+                    "version": ver,
+                    "retry_index": 0,
+                    "save": True,
+                },
             )
-        except AIRequestFailed as exc:
-            previous_failure_reason = f"代码生成模型调用失败：{str(exc)}"
-            invalid_reason = previous_failure_reason
-            print("本轮停止：代码生成模型多次失败，跳过本轮回测。")
-            if response_text:
-                (version_dir / "codegen.raw.txt").write_text(response_text, encoding="utf-8")
-            summary_path = write_iteration_summary()
-            update_session_state_after_round(summary_path=summary_path)
-            leaderboard.append({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": invalid_reason})
-            continue
-        (version_dir / "codegen.raw.txt").write_text(response_text, encoding="utf-8")
+            if committee_codegen_result.get("status") == "prompt_duplicate":
+                previous_failure_reason = "prompt_duplicate"
+                failure_reason = "prompt_duplicate"
+                invalid_reason = "prompt_duplicate"
+                round_state["failure_type"] = "prompt_duplicate"
+                status["invalid_reason"] = invalid_reason
+                status["failure_type"] = "prompt_duplicate"
+                iteration_stats["invalid_strategy_count"] += 1
+                summary_path = write_iteration_summary()
+                update_session_state_after_round(summary_path=summary_path)
+                leaderboard.append(enrich_leaderboard_entry({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": invalid_reason, "failure_reason": failure_reason, "failure_type": "prompt_duplicate"}))
+                print("本轮停止：三个 codegen candidate 均 prompt_duplicate，不调用回测。")
+                flush_iteration_stats()
+                continue
+            if committee_codegen_result.get("status") != "selected":
+                previous_failure_reason = "codegen_reviewer_all_rejected"
+                invalid_reason = previous_failure_reason
+                status["invalid_reason"] = invalid_reason
+                iteration_stats["invalid_strategy_count"] += 1
+                summary_path = write_iteration_summary()
+                update_session_state_after_round(summary_path=summary_path)
+                leaderboard.append({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": invalid_reason})
+                print("本轮停止：codegen reviewer 认为所有候选不合格。")
+                flush_iteration_stats()
+                continue
+            code = str(committee_codegen_result.get("selected_code") or "")
+            selected_candidate = str(committee_codegen_result.get("selected_candidate") or "")
+            response_text = code
+            (version_dir / "codegen.raw.txt").write_text(code, encoding="utf-8")
+            print(f"最终进入回测的 candidate: {selected_candidate}")
+        else:
+            try:
+                response_text = safe_ask_ai(
+                    code_runtime,
+                    [{"role": "user", "content": prompt}],
+                    state=ai_runtime_state,
+                )
+            except AIRequestFailed as exc:
+                previous_failure_reason = f"代码生成模型调用失败：{str(exc)}"
+                invalid_reason = previous_failure_reason
+                print("本轮停止：代码生成模型多次失败，跳过本轮回测。")
+                if response_text:
+                    (version_dir / "codegen.raw.txt").write_text(response_text, encoding="utf-8")
+                summary_path = write_iteration_summary()
+                update_session_state_after_round(summary_path=summary_path)
+                leaderboard.append({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": invalid_reason})
+                continue
+            (version_dir / "codegen.raw.txt").write_text(response_text, encoding="utf-8")
+            code = extract_python_code(response_text)
         status["codegen_status"] = "成功"
         iteration_stats["codegen_success_count"] += 1
-        code = extract_python_code(response_text)
         features = extract_strategy_features(code)
         strategy_fingerprint = build_strategy_fingerprint(features)
         signature = strategy_fingerprint["hash"]
