@@ -122,6 +122,35 @@ def _guard(reason: str = "保持训练交易数 20~60，理想 25~45。") -> dic
     return {"min_trades": 20, "ideal_min_trades": 25, "ideal_max_trades": 45, "max_trades": 60, "will_reduce_below_min": False, "reason": reason}
 
 
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if isinstance(value, dict):
+            value = value.get("value", default)
+        if isinstance(value, list):
+            value = value[0] if value else default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _safe_string_list(value: Any) -> list[str]:
+    """Normalize model-provided scalar/list/dict values into hashable strings."""
+    if value is None:
+        return []
+    if isinstance(value, (str, int, float, bool)):
+        return [str(value)]
+    if isinstance(value, dict):
+        return [json.dumps(value, ensure_ascii=False, sort_keys=True)]
+    if isinstance(value, (list, tuple, set)):
+        out: list[str] = []
+        for item in value:
+            out.extend(_safe_string_list(item))
+        return out
+    return [str(value)]
+
+
 def _normalize_role_output(data: dict[str, Any], role: str, provider: str = "offline", model: str = "offline") -> dict[str, Any]:
     spec = ROLE_SPECS.get(role, {})
     out = {
@@ -130,14 +159,14 @@ def _normalize_role_output(data: dict[str, Any], role: str, provider: str = "off
         "provider": data.get("provider") or provider,
         "model": data.get("model") or model,
         "summary": str(data.get("summary") or data.get("main_view") or spec.get("focus") or ""),
-        "key_risks": list(data.get("key_risks") or data.get("risks") or []),
-        "key_opportunities": list(data.get("key_opportunities") or []),
+        "key_risks": _safe_string_list(data.get("key_risks") or data.get("risks") or []),
+        "key_opportunities": _safe_string_list(data.get("key_opportunities") or []),
         "pair_specific_view": data.get("pair_specific_view") if isinstance(data.get("pair_specific_view"), dict) else dict(PAIR_VIEW_TEMPLATE),
-        "allowed_mutations": list(data.get("allowed_mutations") or data.get("recommended_strategy_constraints") or []),
-        "blocked_mutations": sorted(set(list(data.get("blocked_mutations") or data.get("blocked_ideas") or []) + HARD_BLOCKED_MUTATIONS)),
+        "allowed_mutations": _safe_string_list(data.get("allowed_mutations") or data.get("recommended_strategy_constraints") or []),
+        "blocked_mutations": sorted(set(_safe_string_list(data.get("blocked_mutations") or data.get("blocked_ideas") or []) + HARD_BLOCKED_MUTATIONS)),
         "estimated_trade_count_guard": data.get("estimated_trade_count_guard") if isinstance(data.get("estimated_trade_count_guard"), dict) else _guard(),
-        "risk_constraints": list(data.get("risk_constraints") or []),
-        "confidence": float(data.get("confidence", 0.62) or 0.62),
+        "risk_constraints": _safe_string_list(data.get("risk_constraints") or []),
+        "confidence": _safe_float(data.get("confidence", 0.62), 0.62),
     }
     for pair in PAIR_VIEW_TEMPLATE:
         out["pair_specific_view"].setdefault(pair, {})
@@ -170,27 +199,36 @@ def _offline_role_output(role: str, ctx: dict[str, Any]) -> dict[str, Any]:
 
 
 def _json_from_text(text: str) -> dict[str, Any]:
-    try:
-        data = json.loads((text or "").strip())
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        pass
-    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text or "", flags=re.DOTALL | re.IGNORECASE)
-    if m:
-        data = json.loads(m.group(1))
-        if isinstance(data, dict):
-            return data
+    raw = text or ""
+    text = raw.strip()
+    attempts: list[str] = [text]
+    attempts.extend(re.findall(r"```(?:json)?\s*(.*?)\s*```", raw, flags=re.DOTALL | re.IGNORECASE))
+    first = raw.find("{")
+    last = raw.rfind("}")
+    if first >= 0 and last > first:
+        attempts.append(raw[first:last + 1])
     decoder = json.JSONDecoder()
-    for idx, ch in enumerate(text or ""):
-        if ch == "{":
+    errors: list[str] = []
+    for candidate in attempts:
+        candidate = (candidate or "").strip()
+        if not candidate:
+            continue
+        try:
+            data = json.loads(candidate)
+            if isinstance(data, dict):
+                return data
+        except Exception as exc:  # noqa: BLE001
+            errors.append(str(exc))
+        for idx, ch in enumerate(candidate):
+            if ch != "{":
+                continue
             try:
-                data, _ = decoder.raw_decode(text[idx:])
+                data, _ = decoder.raw_decode(candidate[idx:])
                 if isinstance(data, dict):
                     return data
-            except Exception:
-                continue
-    raise ValueError("role output is not a JSON object")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(str(exc))
+    raise ValueError("role output is not a JSON object; " + "; ".join(errors[-3:]))
 
 
 def _clone_runtime(runtime: Any, offset: int, timeout_seconds: int) -> Any:
@@ -229,19 +267,41 @@ def _role_prompt(role: str, ctx: dict[str, Any]) -> str:
 def _run_live_role(role: str, ctx: dict[str, Any], runtime: Any, ask_ai: Callable[..., str], state: dict[str, Any], offset: int, timeout_seconds: int) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     role_runtime = _clone_runtime(runtime, offset, timeout_seconds)
     started = time.time()
-    try:
-        raw = ask_ai(role_runtime, [{"role": "user", "content": _role_prompt(role, ctx)}], state=state)
-        parsed = _json_from_text(raw)
-        provider = getattr(role_runtime, "used_provider", "") or ""
-        model = getattr(role_runtime, "used_model", "") or ""
-        output = _normalize_role_output(parsed, role=role, provider=provider, model=model)
-        output["elapsed_seconds"] = round(time.time() - started, 3)
-        print(f"committee role {role}: provider={provider}, model={model}, elapsed={output['elapsed_seconds']}s")
-        return output, None
-    except Exception as exc:  # noqa: BLE001 - failed roles are audited, not fatal
-        failure = {"role": role, "error": str(exc), "elapsed_seconds": round(time.time() - started, 3), "attempts": getattr(role_runtime, "attempts", [])}
-        print(f"committee role {role} failed: {failure['error']}")
-        return None, failure
+    raw = ""
+    provider = ""
+    model = ""
+    last_error = ""
+    for attempt in range(2):
+        try:
+            prompt = _role_prompt(role, ctx)
+            if attempt:
+                prompt = "上一轮输出无法解析。请重试：只输出 JSON，不要解释，不要 Markdown。\n" + prompt
+            raw = ask_ai(role_runtime, [{"role": "user", "content": prompt}], state=state)
+            provider = getattr(role_runtime, "used_provider", "") or ""
+            model = getattr(role_runtime, "used_model", "") or ""
+            parsed = _json_from_text(raw)
+            output = _normalize_role_output(parsed, role=role, provider=provider, model=model)
+            output["elapsed_seconds"] = round(time.time() - started, 3)
+            output["parse_retry_used"] = bool(attempt)
+            print(f"committee role {role}: provider={provider}, model={model}, elapsed={output['elapsed_seconds']}s parse_retry={attempt}")
+            return output, None
+        except Exception as exc:  # noqa: BLE001 - failed roles are audited, not fatal
+            provider = getattr(role_runtime, "used_provider", "") or provider
+            model = getattr(role_runtime, "used_model", "") or model
+            last_error = str(exc)
+            print(f"committee role {role} failed attempt={attempt + 1}: provider={provider}, model={model}, error={last_error}, raw_excerpt={(raw or '')[:300]!r}")
+            if attempt == 0:
+                continue
+    failure = {
+        "role": role,
+        "provider": provider,
+        "model": model,
+        "error": last_error,
+        "elapsed_seconds": round(time.time() - started, 3),
+        "attempts": getattr(role_runtime, "attempts", []),
+        "raw_excerpt": (raw or "")[:1200],
+    }
+    return None, failure
 
 
 def _build_directive(ctx: dict[str, Any], role_outputs: list[dict[str, Any]], failed_roles: list[dict[str, Any]], chairman_meta: dict[str, Any] | None = None, retry_hint: str = "") -> dict[str, Any]:

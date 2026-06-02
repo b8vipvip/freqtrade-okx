@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import ast
 import os
 import re
 import time
@@ -149,15 +150,30 @@ def lightweight_check(code: str, class_name: str, mutation_spec: dict[str, Any] 
     checks = {
         "has_complete_python_code": bool(stripped and "class " in stripped and "populate_entry_trend" in stripped),
         "contains_correct_class_name": bool(re.search(rf"class\s+{re.escape(class_name)}\s*\(", stripped)),
+        "inherits_istrategy": bool(re.search(r"class\s+\w+\s*\([^)]*IStrategy[^)]*\)", stripped)),
         "has_populate_indicators": "def populate_indicators" in stripped,
         "has_populate_entry_trend": "def populate_entry_trend" in stripped,
         "has_populate_exit_trend": "def populate_exit_trend" in stripped,
         "obvious_syntax_truncation": stripped.count("(") != stripped.count(")") or stripped.count("[") != stripped.count("]") or stripped.endswith((",", ".", "and", "or")),
+        "python_ast_parse_ok": False,
         "forbidden_bollinger_middle_direct_read": any(p in stripped for p in FORBIDDEN_BOLLINGER_PATTERNS),
+        "forbidden_replace_stoploss_with_trailing": "replace_stoploss_with_trailing" in stripped.lower(),
+        "forbidden_remove_stoploss": bool(re.search(r"stoploss\s*=\s*(None|0|0\.0)", stripped)) or "remove_stoploss" in stripped.lower(),
+        "forbidden_remove_risk_filter": "remove_risk_filter" in stripped.lower(),
+        "forbidden_news_keyword_rule": "news_keyword_rule" in stripped.lower() or bool(re.search(r"news|headline|keyword", stripped, flags=re.IGNORECASE)),
         "only_changed_class_comments_or_names": False,
         "obviously_missing_mutation_spec": False,
         "possible_no_trade_filter": False,
     }
+    syntax_error = ""
+    if stripped:
+        try:
+            ast.parse(stripped)
+            checks["python_ast_parse_ok"] = True
+        except SyntaxError as exc:
+            syntax_error = f"SyntaxError: {exc.msg} line={exc.lineno} offset={exc.offset}"
+        except Exception as exc:  # noqa: BLE001
+            syntax_error = f"parse_error: {exc}"
     if parent_code:
         def scrub(x: str) -> str:
             x = re.sub(r"class\s+\w+", "class X", x)
@@ -173,18 +189,36 @@ def lightweight_check(code: str, class_name: str, mutation_spec: dict[str, Any] 
     entry_match = re.search(r"def\s+populate_entry_trend\s*\(.*?\):(?P<body>.*?)(?:\n\s*def\s+|\nclass\s+|\Z)", stripped, flags=re.DOTALL)
     entry_body = entry_match.group("body") if entry_match else ""
     checks["possible_no_trade_filter"] = entry_body.count(" & ") + entry_body.count(" and ") >= 10 or all(pair in entry_body for pair in ["BTC/USDT", "OP/USDT", "SOL/USDT", "BNB/USDT", "DOGE/USDT"])
-    passed = (
-        checks["has_complete_python_code"]
-        and checks["contains_correct_class_name"]
-        and checks["has_populate_indicators"]
-        and checks["has_populate_entry_trend"]
-        and checks["has_populate_exit_trend"]
-        and not checks["obvious_syntax_truncation"]
-        and not checks["forbidden_bollinger_middle_direct_read"]
-        and not checks["only_changed_class_comments_or_names"]
-        and not checks["obviously_missing_mutation_spec"]
-    )
-    return {"passed": passed, "checks": checks}
+    hard_errors: list[str] = []
+    if not checks["has_complete_python_code"]:
+        hard_errors.append("missing_complete_python_strategy_class")
+    if not checks["contains_correct_class_name"]:
+        hard_errors.append("missing_expected_strategy_class")
+    if not checks["inherits_istrategy"]:
+        hard_errors.append("strategy_class_not_inheriting_IStrategy")
+    for fn_key, fn_name in [
+        ("has_populate_indicators", "populate_indicators"),
+        ("has_populate_entry_trend", "populate_entry_trend"),
+        ("has_populate_exit_trend", "populate_exit_trend"),
+    ]:
+        if not checks[fn_key]:
+            hard_errors.append(f"missing_{fn_name}")
+    if checks["obvious_syntax_truncation"] or not checks["python_ast_parse_ok"]:
+        hard_errors.append(syntax_error or "obvious_syntax_error_or_truncation")
+    if checks["forbidden_bollinger_middle_direct_read"]:
+        hard_errors.append("forbidden_bollinger_middle_direct_read")
+    for key in ["forbidden_replace_stoploss_with_trailing", "forbidden_remove_stoploss", "forbidden_remove_risk_filter", "forbidden_news_keyword_rule"]:
+        if checks[key]:
+            hard_errors.append(key)
+    if checks["only_changed_class_comments_or_names"]:
+        hard_errors.append("duplicate_strategy_only_changed_class_comments_or_names")
+    if checks["obviously_missing_mutation_spec"]:
+        hard_errors.append("obviously_missing_mutation_spec")
+    soft_warnings: list[str] = []
+    if checks["possible_no_trade_filter"]:
+        soft_warnings.append("possible_low_trade_or_overstrict_filter")
+    passed = not hard_errors
+    return {"passed": passed, "checks": checks, "hard_errors": hard_errors, "soft_warnings": soft_warnings}
 
 
 
@@ -292,23 +326,74 @@ def _run_one_candidate(
     return {"candidate": candidate, "role": role_cfg["role"], "code": code, "raw_response": raw, "metadata": metadata, "prompt": prompt}
 
 
-def offline_review(candidates: list[dict[str, Any]]) -> dict[str, Any]:
-    ranking = []
+def _coerce_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (str, int, float, bool)):
+        return [str(value)]
+    if isinstance(value, dict):
+        return [json.dumps(value, ensure_ascii=False, sort_keys=True)]
+    if isinstance(value, list):
+        return [_coerce_string_list(item)[0] for item in value if _coerce_string_list(item)]
+    return [str(value)]
+
+
+def _reviewer_decision_with_hard_gate(ai_decision: dict[str, Any], candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    ranking: list[dict[str, Any]] = []
     for item in candidates:
-        meta = item.get("metadata", {})
-        checks = ((meta.get("lightweight_check") or {}).get("checks") or {})
-        score = 50
-        if (meta.get("lightweight_check") or {}).get("passed"):
-            score += 30
-        score -= 20 if checks.get("possible_no_trade_filter") else 0
+        meta = item.get("metadata", {}) or {}
+        lw = meta.get("lightweight_check", {}) or {}
+        hard_errors = _coerce_string_list(lw.get("hard_errors"))
+        soft_warnings = _coerce_string_list(lw.get("soft_warnings"))
+        checks = lw.get("checks", {}) or {}
+        score = 100
+        score -= 1000 if hard_errors else 0
+        score -= 15 * len(soft_warnings)
         score -= 25 if meta.get("error") else 0
-        ranking.append({"candidate": item.get("candidate"), "score": score, "pros": ["lightweight checks passed"] if score >= 80 else [], "cons": [k for k, v in checks.items() if v is False or k.startswith("obvious") and v]})
-    ranking.sort(key=lambda x: x.get("score", 0), reverse=True)
-    selected = str((ranking[0] or {}).get("candidate") or "candidate_A") if ranking else "candidate_A"
+        score -= 10 if checks.get("possible_no_trade_filter") else 0
+        ai_rank = next((r for r in ai_decision.get("ranking", []) if isinstance(r, dict) and str(r.get("candidate")) == str(item.get("candidate"))), {}) if isinstance(ai_decision.get("ranking"), list) else {}
+        if ai_rank:
+            try:
+                score += max(-20, min(20, int(float(ai_rank.get("score", 0))) - 50))
+            except Exception:
+                pass
+        ranking.append({
+            "candidate": item.get("candidate"),
+            "score": score,
+            "hard_errors": hard_errors,
+            "soft_warnings": soft_warnings,
+            "ai_reviewer_notes": ai_rank,
+            "provider": meta.get("provider", ""),
+            "model": meta.get("model", ""),
+        })
+    ranking.sort(key=lambda x: x.get("score", -9999), reverse=True)
+    selectable = [r for r in ranking if not r.get("hard_errors")]
+    if selectable:
+        selected = str(selectable[0].get("candidate") or "")
+        return {
+            **ai_decision,
+            "selected_candidate": selected,
+            "ranking": ranking,
+            "rejected_candidates": [r.get("candidate") for r in ranking if r.get("candidate") != selected],
+            "selected_candidate_had_hard_errors": False,
+            "all_rejected": False,
+            "selection_reason": ai_decision.get("selection_reason") or "hard-gated reviewer selected least-bad non-hard-error candidate for syntax/backtest",
+            "hard_gate_policy": "Only hard errors can block backtest; soft warnings cannot reject all candidates.",
+        }
     return {
-        "selected_candidate": selected,
+        **ai_decision,
+        "selected_candidate": None,
         "ranking": ranking,
-        "rejected_candidates": [r.get("candidate") for r in ranking[1:]],
+        "rejected_candidates": [r.get("candidate") for r in ranking],
+        "all_rejected": True,
+        "all_rejected_reason": "all candidates have hard_errors",
+        "selection_reason": ai_decision.get("selection_reason") or "all candidates have hard_errors; retry allowed once",
+        "hard_gate_policy": "Only hard errors can block backtest; retry only when every candidate has hard errors.",
+    }
+
+
+def offline_review(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    return _reviewer_decision_with_hard_gate({
         "compliance_check": {
             "implements_mutation_spec": True,
             "not_duplicate": True,
@@ -317,9 +402,9 @@ def offline_review(candidates: list[dict[str, Any]]) -> dict[str, Any]:
             "does_not_remove_risk_filters": True,
             "does_not_replace_stoploss_with_trailing": True,
         },
-        "selection_reason": "offline reviewer selected the highest lightweight-check score",
         "required_minor_patch": None,
-    }
+        "selection_reason": "offline hard-gated reviewer selected highest lightweight-check score",
+    }, candidates)
 
 
 def run_codegen_committee(
@@ -405,7 +490,8 @@ def run_codegen_committee(
             review_prompt = (
                 "你是 AI code reviewer。读取 mutation_spec、final_strategy_directive、父策略摘要、候选代码和轻量检查结果，选择唯一最佳候选。只输出 JSON。\n"
                 "必须输出字段：selected_candidate, ranking, rejected_candidates, compliance_check, selection_reason, required_minor_patch。\n"
-                "如果所有候选都不合格，selected_candidate 必须为 null，并在 rejected_candidates/selection_reason 说明原因。\n"
+                "重要审核政策：只有硬错误才能拒绝候选进入回测。硬错误仅包括：无完整 Python strategy class、语法明显错误、缺 populate_indicators/populate_entry_trend/populate_exit_trend、未继承 IStrategy、明显没有实现 mutation_spec、明显违反 forbidden rule（replace_stoploss_with_trailing/remove_stoploss/remove_risk_filter/news_keyword_rule）、明显 duplicate strategy。\n"
+                "参数可能不优、交易数可能偏低、风险可能偏高均为 soft_warnings，不得因此 all reject；必须从非硬错误候选中选择 least-bad candidate。只有全部候选都有 hard_errors 时 selected_candidate 才能为 null。\n"
                 f"mutation_spec={json.dumps(mutation_spec, ensure_ascii=False)}\n"
                 f"final_strategy_directive={json.dumps(final_strategy_directive or {}, ensure_ascii=False)}\n"
                 f"parent_strategy_summary={json.dumps(parent_strategy_summary or {}, ensure_ascii=False)[:6000]}\n"
@@ -415,19 +501,22 @@ def run_codegen_committee(
             review_start = time.time()
             try:
                 raw_decision = ask_ai(review_runtime, [{"role": "user", "content": review_prompt}], state=ai_state)
-                decision = extract_json_object(raw_decision)
-                (version_dir / "code_review.raw.txt").write_text(raw_decision, encoding="utf-8")
+                ai_decision = extract_json_object(raw_decision)
+                decision = _reviewer_decision_with_hard_gate(ai_decision, results)
+                (version_dir / "codegen_review.raw.txt").write_text(raw_decision, encoding="utf-8")
             except Exception as exc:  # noqa: BLE001
                 decision["reviewer_error"] = str(exc)
             decision["reviewer_provider"] = getattr(review_runtime, "used_provider", "")
             decision["reviewer_model"] = getattr(review_runtime, "used_model", "")
             decision["reviewer_elapsed_seconds"] = round(time.time() - review_start, 3)
             print(f"reviewer provider/model/elapsed: {decision.get('reviewer_provider')}/{decision.get('reviewer_model')}/{decision.get('reviewer_elapsed_seconds')}s")
+        for rank in decision.get("ranking", []) or []:
+            print(f"codegen_review candidate={rank.get('candidate')} score={rank.get('score')} hard_errors={rank.get('hard_errors', [])} soft_warnings={rank.get('soft_warnings', [])}")
         selected = decision.get("selected_candidate")
         valid_names = {str(item.get("candidate")) for item in results}
         if selected in valid_names:
             selected_item = next(item for item in results if item.get("candidate") == selected)
-            _write_json(version_dir / "code_review_decision.json", decision)
+            _write_json(version_dir / "codegen_review_decision.json", decision)
             print(f"selected_candidate: {selected}")
             print(f"selection_reason: {decision.get('selection_reason') or ''}")
             print(f"codegen retry triggered: {'yes' if retry_triggered else 'no'}")
@@ -435,8 +524,10 @@ def run_codegen_committee(
         if attempt == 0:
             retry_triggered = True
             retry_hint = str(decision.get("selection_reason") or decision.get("rejected_candidates") or "all candidates rejected")
-            print("codegen reviewer rejected all candidates; retrying once with rejection reasons.")
+            print(f"codegen reviewer all_rejected: {decision.get('all_rejected_reason') or decision.get('selection_reason') or decision.get('rejected_candidates')}")
+            print("codegen reviewer rejected all candidates with hard_errors; retrying once with rejection reasons.")
             continue
-        _write_json(version_dir / "code_review_decision.json", decision)
+        _write_json(version_dir / "codegen_review_decision.json", decision)
+        print(f"codegen reviewer all_rejected final: {decision.get('all_rejected_reason') or decision.get('selection_reason') or decision.get('rejected_candidates')}")
         return {"status": "all_rejected", "decision": decision, "candidates": all_results, "retry_triggered": retry_triggered}
     return {"status": "all_rejected", "candidates": all_results, "retry_triggered": retry_triggered}
