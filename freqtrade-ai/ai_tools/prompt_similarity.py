@@ -14,7 +14,7 @@ from typing import Any
 DEFAULT_PROMPT_SIMILARITY_CONFIG: dict[str, Any] = {
     "enabled": False,
     "threshold": 0.95,
-    "compare_fields": ["market_intel_summary", "committee_consensus", "final_strategy_directive", "mutation_spec", "advisor_prompt", "codegen_prompt"],
+    "compare_fields": ["market_intel_summary", "committee_consensus", "final_strategy_directive", "mutation_spec", "normalized_mutation_intent", "codegen_prompt_fingerprint"],
     "retry_on_duplicate": True,
     "max_retries": 2,
 }
@@ -64,8 +64,38 @@ def fingerprint_value(value: Any) -> dict[str, Any]:
     return {"hash": hashlib.sha256(norm.encode("utf-8")).hexdigest(), "normalized_text": norm, "tokens": tokens, "token_count": len(tokens)}
 
 
+
+def normalized_mutation_intent(fields: dict[str, Any]) -> dict[str, Any]:
+    spec = fields.get("mutation_spec") if isinstance(fields, dict) else {}
+    directive = fields.get("final_strategy_directive") if isinstance(fields, dict) else {}
+    if not isinstance(spec, dict):
+        spec = {}
+    if not isinstance(directive, dict):
+        directive = {}
+    return {
+        "mutation_type": spec.get("mutation_type") or directive.get("mutation_type") or "",
+        "indicators_to_add": spec.get("indicators_to_add") or spec.get("indicator_changes") or directive.get("indicators_to_add") or [],
+        "entry_conditions_to_change": spec.get("entry_conditions_to_change") or spec.get("entry_changes") or directive.get("entry_conditions_to_change") or [],
+        "pair_specific_rules": spec.get("pair_specific_rules") or directive.get("pair_specific_rules") or {},
+        "estimated_trade_count_guard": spec.get("estimated_trade_count_guard") or directive.get("estimated_trade_count_guard") or {},
+    }
+
+
+def _codegen_prompt_fingerprint(fields: dict[str, Any]) -> dict[str, Any]:
+    spec = fields.get("mutation_spec") if isinstance(fields, dict) else {}
+    directive = fields.get("final_strategy_directive") if isinstance(fields, dict) else {}
+    return {
+        "mutation_intent": normalized_mutation_intent(fields),
+        "codegen_requirements": directive.get("codegen_requirements", []) if isinstance(directive, dict) else [],
+        "risk_constraints": directive.get("risk_constraints", []) if isinstance(directive, dict) else [],
+        "spec_hash_basis": spec if isinstance(spec, dict) else {},
+    }
+
 def build_fingerprints(fields: dict[str, Any], compare_fields: list[str]) -> dict[str, Any]:
-    return {name: fingerprint_value(fields.get(name, "")) for name in compare_fields}
+    expanded = dict(fields or {})
+    expanded["normalized_mutation_intent"] = normalized_mutation_intent(expanded)
+    expanded["codegen_prompt_fingerprint"] = _codegen_prompt_fingerprint(expanded)
+    return {name: fingerprint_value(expanded.get(name, "")) for name in compare_fields}
 
 
 def _load_registry(path: Path) -> list[dict[str, Any]]:
@@ -121,7 +151,7 @@ def review_prompts(
         if str(item.get("run_id", "")) == str(run_id) and str(item.get("version", "")) == str(version):
             continue
         prev = item.get("fingerprints", {}) if isinstance(item, dict) else {}
-        for field, target in [("advisor_prompt", "advisor"), ("codegen_prompt", "codegen")]:
+        for field, target in [("normalized_mutation_intent", "advisor"), ("codegen_prompt_fingerprint", "codegen")]:
             cur = fps.get(field, {})
             old = prev.get(field, {}) if isinstance(prev, dict) else {}
             score = 1.0 if cur.get("hash") == old.get("hash") and cur.get("hash") else jaccard(set(cur.get("tokens", [])), set(old.get("tokens", [])))

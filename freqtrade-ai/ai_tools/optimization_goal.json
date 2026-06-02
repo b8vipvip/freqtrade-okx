@@ -161,7 +161,13 @@
     "use_train_window_only_for_prompt": true,
     "allow_validation_intel_for_postmortem_only": true,
     "save_raw_sources": true,
-    "timeout_seconds": 120
+    "timeout_seconds": 120,
+    "cache_enabled": true,
+    "cache_dir": "user_data/ai_memory/market_intel_cache",
+    "force_refresh": false,
+    "cache_ttl_days": 3650,
+    "run_once_per_run": true,
+    "reuse_same_timerange": true
   },
   "ai_committee": {
     "enabled": true,
@@ -186,10 +192,17 @@
       "committee_consensus",
       "final_strategy_directive",
       "mutation_spec",
-      "advisor_prompt",
-      "codegen_prompt"
+      "normalized_mutation_intent",
+      "codegen_prompt_fingerprint"
     ],
     "retry_on_duplicate": true,
     "max_retries": 2
+  },
+  "explore_strategy_family": {
+    "enabled": true,
+    "max_families_per_run": 5,
+    "force_all_families_once": true,
+    "prefer_near_miss_followup": true,
+    "disable_family_after_high_frequency_failure": true
   }
 }

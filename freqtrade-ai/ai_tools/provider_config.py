@@ -29,6 +29,8 @@ ROLE_TO_PRIORITY_SUFFIX: dict[str, str] = {
 POOL_ENV_TO_ROLE: dict[str, str] = {pool_env: role for role, pool_env in ROLE_TO_POOL_ENV.items()}
 POOL_ENV_TO_ROLE["AI_COMMITTEE_FINAL_CHAIRMAN_PROVIDER"] = "chairman"
 
+REMOVED_PROVIDER_IDS = {"TOSKAXY_GPT55", "TOSKAXY_GPT54"}
+
 OPENAI_COMPATIBLE_TYPES = {
     "openai_compatible",
     "openai_compatible_online",
@@ -61,7 +63,7 @@ def provider_env_prefix(provider_name: str) -> str:
 
 
 def parse_csv(raw: str | None) -> list[str]:
-    return [item.strip() for item in (raw or "").split(",") if item.strip()]
+    return [item.strip() for item in (raw or "").split(",") if item.strip() and re.sub(r"[^A-Za-z0-9]+", "_", item.strip()).strip("_").upper() not in REMOVED_PROVIDER_IDS]
 
 
 def looks_like_placeholder_secret(value: str) -> bool:
@@ -116,7 +118,7 @@ def discover_enabled_providers() -> list[dict[str, Any]]:
     providers: list[dict[str, Any]] = []
     for env_name in sorted(os.environ):
         provider_id = _provider_id_from_enabled_env(env_name)
-        if not provider_id:
+        if not provider_id or provider_id in REMOVED_PROVIDER_IDS:
             continue
         prefix = f"AI_PROVIDER_{provider_id}"
         if not env_flag(f"{prefix}_ENABLED", False):
@@ -152,6 +154,8 @@ def load_provider_config(provider_name: str, *, default_timeout: int | str = 120
     provider id for audit logs.
     """
     provider_id = re.sub(r"[^A-Za-z0-9]+", "_", provider_name.strip()).strip("_").upper()
+    if provider_id in REMOVED_PROVIDER_IDS:
+        return {"id": provider_id, "name": provider_name.strip(), "prefix": f"AI_PROVIDER_{provider_id}", "type": "removed", "base_url": "", "api_key": "", "api_key_source": "removed", "model": "", "timeout": float(default_timeout or 120), "timeout_source": "removed"}
     prefix = f"AI_PROVIDER_{provider_id}"
     api_key, api_key_source = _provider_api_key(prefix)
     timeout_raw = (os.getenv(f"{prefix}_TIMEOUT") or str(default_timeout) or "120").strip()

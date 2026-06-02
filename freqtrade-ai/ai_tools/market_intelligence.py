@@ -44,7 +44,16 @@ DEFAULT_MARKET_INTELLIGENCE_CONFIG: dict[str, Any] = {
     "allow_validation_intel_for_postmortem_only": True,
     "save_raw_sources": True,
     "timeout_seconds": 120,
+    "cache_enabled": True,
+    "cache_dir": "user_data/ai_memory/market_intel_cache",
+    "force_refresh": False,
+    "cache_ttl_days": 3650,
+    "run_once_per_run": True,
+    "reuse_same_timerange": True,
+    "prompt_schema_version": "market_intel_v2",
 }
+
+_RUN_LEVEL_MARKET_INTEL_CACHE: dict[str, dict[str, Any]] = {}
 
 SEARCH_TOPICS = [
     "BTC ETH crypto market trend",
@@ -82,6 +91,24 @@ def merge_config(goal: dict[str, Any] | None) -> dict[str, Any]:
         cfg["max_search_results"] = int(os.getenv("MARKET_INTELLIGENCE_MAX_SEARCH_RESULTS", "12") or 12)
     if os.getenv("MARKET_INTELLIGENCE_TIMEOUT_SECONDS"):
         cfg["timeout_seconds"] = int(os.getenv("MARKET_INTELLIGENCE_TIMEOUT_SECONDS", "120") or 120)
+    env_map = {
+        "MARKET_INTEL_CACHE_ENABLED": ("cache_enabled", "bool"),
+        "MARKET_INTEL_CACHE_DIR": ("cache_dir", "str"),
+        "MARKET_INTEL_FORCE_REFRESH": ("force_refresh", "bool"),
+        "MARKET_INTEL_CACHE_TTL_DAYS": ("cache_ttl_days", "int"),
+        "MARKET_INTEL_RUN_ONCE_PER_RUN": ("run_once_per_run", "bool"),
+        "MARKET_INTEL_REUSE_SAME_TIMERANGE": ("reuse_same_timerange", "bool"),
+    }
+    for env_name, (cfg_key, kind) in env_map.items():
+        raw_env = os.getenv(env_name)
+        if raw_env is None:
+            continue
+        if kind == "bool":
+            cfg[cfg_key] = raw_env.strip().lower() in {"1", "true", "yes", "y", "on"}
+        elif kind == "int":
+            cfg[cfg_key] = int(raw_env or cfg.get(cfg_key) or 0)
+        else:
+            cfg[cfg_key] = raw_env
     return cfg
 
 
@@ -298,6 +325,60 @@ def _classify_regimes(sources: list[dict[str, Any]]) -> tuple[dict[str, Any], di
     )
 
 
+
+def _normalize_query(query: str) -> str:
+    return re.sub(r"\s+", " ", (query or "").strip().lower())
+
+
+def _cache_dir(cfg: dict[str, Any]) -> Path:
+    raw = Path(str(cfg.get("cache_dir") or "user_data/ai_memory/market_intel_cache"))
+    return raw if raw.is_absolute() else ROOT_DIR / raw
+
+
+def _provider_cache_identity(cfg: dict[str, Any]) -> dict[str, Any]:
+    pool = provider_pool_names_for_env("MARKET_SEARCH_PROVIDER_POOL") or [str(p).strip() for p in cfg.get("search_provider_pool", []) if str(p).strip()]
+    identities = []
+    for name in pool:
+        provider = load_provider_config(name, default_timeout=int(cfg.get("timeout_seconds", 120)))
+        identities.append({"provider_id": str(provider.get("id") or name), "model": str(provider.get("model") or "")})
+    return {"pool": identities, "primary_provider_id": (identities[0].get("provider_id") if identities else ""), "primary_model": (identities[0].get("model") if identities else "")}
+
+
+def _market_intel_cache_key(cfg: dict[str, Any], queries: list[str], train_timerange: str, active_pairs: list[str]) -> tuple[str, dict[str, Any]]:
+    provider_identity = _provider_cache_identity(cfg)
+    metadata = {
+        "provider_id": provider_identity.get("primary_provider_id", ""),
+        "model": provider_identity.get("primary_model", ""),
+        "provider_pool": provider_identity.get("pool", []),
+        "normalized_query": [_normalize_query(q) for q in queries],
+        "train_timerange": train_timerange,
+        "active_pairs": sorted(active_pairs),
+        "lookback_days": int(cfg.get("lookback_days", 30) or 30),
+        "market_intel_prompt_schema_version": str(cfg.get("prompt_schema_version") or "market_intel_v2"),
+    }
+    digest = hashlib.sha256(json.dumps(metadata, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+    return digest, metadata
+
+
+def _read_market_cache(cache_path: Path, ttl_days: int) -> dict[str, Any] | None:
+    if not cache_path.exists():
+        return None
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        created = datetime.fromisoformat(str(payload.get("metadata", {}).get("cached_at", "")).replace("Z", "+00:00"))
+        if (datetime.now(timezone.utc) - created).days > ttl_days:
+            return None
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def _write_market_cache(cache_path: Path, payload: dict[str, Any]) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cache_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(cache_path)
+
 def collect_market_intelligence(
     *,
     run_dir: Path,
@@ -320,6 +401,28 @@ def collect_market_intelligence(
     for symbol in _pair_symbols(active_pairs):
         if symbol in {"BTC", "OP", "SOL", "BNB", "DOGE", "ETH"}:
             queries.append(f"{symbol} crypto news market {train_timerange}")
+    cache_key, cache_metadata = _market_intel_cache_key(cfg, queries, train_timerange, active_pairs)
+    run_cache_key = cache_key if bool(cfg.get("reuse_same_timerange", True)) else f"{cache_key}:{run_dir}"
+    cache_path = _cache_dir(cfg) / f"{cache_key}.json"
+    if bool(cfg.get("run_once_per_run", True)) and run_cache_key in _RUN_LEVEL_MARKET_INTEL_CACHE and not bool(cfg.get("force_refresh", False)):
+        print(f"market_intelligence cache_hit scope=run key={cache_key}")
+        cached = _RUN_LEVEL_MARKET_INTEL_CACHE[run_cache_key]
+        raw_sources = list(cached.get("raw_sources", []))
+        intel = dict(cached.get("market_intel", {}))
+        (out_dir / "raw_sources.json").write_text(json.dumps(raw_sources, ensure_ascii=False, indent=2), encoding="utf-8")
+        (out_dir / "market_intel.json").write_text(json.dumps(intel, ensure_ascii=False, indent=2), encoding="utf-8")
+        return intel
+    if bool(cfg.get("cache_enabled", True)) and not bool(cfg.get("force_refresh", False)):
+        cached_payload = _read_market_cache(cache_path, int(cfg.get("cache_ttl_days", 3650) or 3650))
+        if cached_payload:
+            print(f"market_intelligence cache_hit scope=disk key={cache_key} path={cache_path}")
+            raw_sources = list(cached_payload.get("raw_sources", []))
+            intel = dict(cached_payload.get("market_intel", {}))
+            _RUN_LEVEL_MARKET_INTEL_CACHE[run_cache_key] = {"raw_sources": raw_sources, "market_intel": intel}
+            (out_dir / "raw_sources.json").write_text(json.dumps(raw_sources, ensure_ascii=False, indent=2), encoding="utf-8")
+            (out_dir / "market_intel.json").write_text(json.dumps(intel, ensure_ascii=False, indent=2), encoding="utf-8")
+            return intel
+    print(f"market_intelligence cache_miss key={cache_key}")
     max_total = max(1, int(cfg.get("max_search_results", 12)))
     raw_sources: list[dict[str, Any]] = []
     deadline = time.time() + max(5, int(cfg.get("timeout_seconds", 120)))
@@ -372,6 +475,11 @@ def collect_market_intelligence(
     md.extend(["", "## Raw Sources"])
     md.extend(f"- [{s.get('title')}]({s.get('url')}) — {s.get('snippet')}" for s in raw_sources)
     (out_dir / "market_intel.md").write_text("\n".join(md) + "\n", encoding="utf-8")
+    cache_payload = {"metadata": {**cache_metadata, "cache_key": cache_key, "cached_at": _utc_now()}, "raw_response": raw_sources, "raw_sources": raw_sources, "sources": raw_sources, "summary": {"macro_regime": macro, "crypto_regime": crypto}, "market_intel": intel}
+    _RUN_LEVEL_MARKET_INTEL_CACHE[run_cache_key] = {"raw_sources": raw_sources, "market_intel": intel}
+    if bool(cfg.get("cache_enabled", True)):
+        _write_market_cache(cache_path, cache_payload)
+        print(f"market_intelligence cache_write key={cache_key} path={cache_path}")
     return intel
 
 
@@ -399,11 +507,12 @@ def _goal_pairs(goal: dict[str, Any]) -> list[str]:
 def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Market intelligence live-search tester")
     parser.add_argument("--test-search", action="store_true", help="Only test live search and write market_intel artifacts; do not run backtests")
+    parser.add_argument("--test-cache", action="store_true", help="Test market intelligence local cache by collecting twice and expecting the second call to hit cache")
     parser.add_argument("--goal", default=str(ROOT_DIR / "ai_tools" / "optimization_goal.json"), help="Path to optimization_goal.json")
     parser.add_argument("--run-dir", default="", help="Optional output run directory")
     args = parser.parse_args(argv)
-    if not args.test_search:
-        parser.error("Only --test-search is supported by this standalone command")
+    if not (args.test_search or args.test_cache):
+        parser.error("Use --test-search or --test-cache")
     goal_path = Path(args.goal)
     goal = json.loads(goal_path.read_text(encoding="utf-8")) if goal_path.exists() else {}
     cfg = merge_config(goal)
@@ -424,9 +533,27 @@ def _main(argv: list[str] | None = None) -> int:
         last_run_summary={},
         config=cfg,
     )
+    if args.test_cache:
+        intel2 = collect_market_intelligence(
+            run_dir=run_dir,
+            train_timerange=train_timerange,
+            validation_timeranges=validation_timeranges,
+            active_pairs=_goal_pairs(goal),
+            timeframe=str(goal.get("timeframe") or "5m"),
+            failure_type="test_cache_second_call",
+            pair_attribution={},
+            last_run_summary={},
+            config=cfg,
+        )
+        if summarize_for_prompt(intel) != summarize_for_prompt(intel2):
+            print("market_intelligence test_cache mismatch")
+            return 3
     print(f"market_intelligence test_search output_dir={run_dir / 'market_intel'}")
     providers = sorted({str(s.get("provider")) for s in (json.loads((run_dir / "market_intel" / "raw_sources.json").read_text(encoding="utf-8")) if (run_dir / "market_intel" / "raw_sources.json").exists() else [])})
     print(f"market_intelligence test_search providers={providers}")
+    if args.test_cache:
+        print("market_intelligence test_cache ok")
+        return 0
     return 0 if any(p != "offline_fallback" for p in providers) else 2
 
 

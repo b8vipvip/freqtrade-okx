@@ -58,6 +58,7 @@ from provider_config import (
     print_auto_provider_pool_log,
     provider_env_prefix,
     provider_pool_names_for_env,
+    REMOVED_PROVIDER_IDS,
 )
 
 from openai import (
@@ -160,6 +161,34 @@ def _explore_strategy_family_cfg(runtime_goal: dict[str, Any]) -> dict[str, Any]
     cfg["prefer_near_miss_followup"] = bool(cfg.get("prefer_near_miss_followup", True))
     cfg["disable_family_after_high_frequency_failure"] = bool(cfg.get("disable_family_after_high_frequency_failure", True))
     return cfg
+
+
+def _explore_strategy_family_enabled(runtime_goal: dict[str, Any], args: Any | None = None) -> bool:
+    cli_enabled = bool(getattr(args, "explore_strategy_family", False)) if args is not None else False
+    raw = runtime_goal.get("explore_strategy_family", False)
+    if isinstance(raw, dict):
+        goal_enabled = bool(raw.get("enabled", True))
+    else:
+        goal_enabled = bool(raw)
+    legacy_goal_hint = str(runtime_goal.get("optimization_goal") or runtime_goal.get("goal") or runtime_goal.get("mode") or "").strip().lower()
+    expected = "explore-strategy-family" in legacy_goal_hint or "explore_strategy_family" in legacy_goal_hint
+    enabled = bool(cli_enabled or goal_enabled)
+    if expected and not enabled:
+        print("WARNING: 用户命令/goal 期望 explore-strategy-family，但 explore_strategy_family 未启用；请使用 --explore-strategy-family 或在 optimization_goal.json 设置 explore_strategy_family.enabled=true。")
+    return enabled
+
+
+def _print_explore_strategy_family_runtime_state(enabled: bool, cfg: dict[str, Any], family_stats: dict[str, dict[str, Any]], current_family: str = "", reason: str = "") -> None:
+    if not enabled:
+        print("explore_strategy_family: disabled")
+        return
+    plan = {"families": STRATEGY_FAMILIES, "max_families_per_run": cfg.get("max_families_per_run"), "force_all_families_once": cfg.get("force_all_families_once"), "prefer_near_miss_followup": cfg.get("prefer_near_miss_followup")}
+    print("explore_strategy_family: enabled")
+    print(f"strategy_family_count: {len(STRATEGY_FAMILIES)}")
+    print(f"current_family: {current_family or 'pending'}")
+    print("family_exploration_plan: " + _compact_prompt_json(plan, 2000))
+    if reason:
+        print(f"strategy_family_block_reason: {reason}")
 
 
 def _normalize_strategy_family(value: Any) -> str:
@@ -5127,6 +5156,23 @@ def _create_chat_completion_with_hard_timeout(client: OpenAI, *, model: str, mes
     return payload
 
 
+BAD_PROVIDER_SESSION_BLACKLIST: set[str] = set()
+
+
+def _is_model_not_found_error(message: str, status_code: int | None = None) -> bool:
+    text = (message or "").lower()
+    return "model_not_found" in text or "model not found" in text or "does not exist" in text or status_code == 404
+
+
+def _blacklist_bad_provider_for_session(role_runtime: AIRoleRuntime, provider_name: str, model: str, reason: str) -> None:
+    key = f"{provider_name}/{model}"
+    BAD_PROVIDER_SESSION_BLACKLIST.add(key)
+    before = len(role_runtime.provider_pool or [])
+    role_runtime.provider_pool = [p for p in (role_runtime.provider_pool or []) if f"{p.get('name')}/{p.get('model')}" != key]
+    role_runtime.model_pool = [str(p.get("model") or "") for p in role_runtime.provider_pool if p.get("model")] or [m for m in role_runtime.model_pool if m != model]
+    print(f"bad_provider_session_blacklist add provider={provider_name} model={model} reason={reason}; removed_from_current_pool={before - len(role_runtime.provider_pool or [])}")
+
+
 def safe_ask_ai(
     role_runtime: AIRoleRuntime,
     messages: list[dict[str, str]],
@@ -5157,6 +5203,10 @@ def safe_ask_ai(
         client = provider.get("client") or role_runtime.client
         next_model = str(next_provider.get("model") or model)
         next_provider_name = str(next_provider.get("name") or "legacy_env")
+        if f"{provider_name}/{model}" in BAD_PROVIDER_SESSION_BLACKLIST:
+            role_runtime.attempts.append({"provider": provider_name, "model": model, "status": "blacklisted", "error": "bad_provider_session_blacklist"})
+            print(f"跳过本次 run 已拉黑 provider/model：{provider_name}/{model}")
+            continue
         now = time.time()
         last_call = float(state.get("last_ai_call_time", 0.0) or 0.0)
         cooldown = max(0.0, float(state.get("ai_call_cooldown_seconds", 0.0) or 0.0))
@@ -5226,8 +5276,10 @@ def safe_ask_ai(
                 error_message, status_code = _format_ai_error(exc)
                 last_error_message = error_message or exc.__class__.__name__
                 last_status_code = status_code
+                if _is_model_not_found_error(last_error_message, status_code):
+                    _blacklist_bad_provider_for_session(role_runtime, provider_name, model, "model_not_found")
                 tos_block = _is_403_provider_tos_block(last_error_message, status_code)
-                retriable = tos_block or _is_retriable_ai_error(last_error_message, status_code, exc)
+                retriable = tos_block or _is_retriable_ai_error(last_error_message, status_code, exc) or _is_model_not_found_error(last_error_message, status_code)
                 role_runtime.attempts.append({
                     "provider": provider_name,
                     "model": model,
@@ -5303,6 +5355,9 @@ def _build_provider_pool_from_env(provider_pool_env: str, timeout_sec: int) -> t
     providers: list[dict[str, Any]] = []
     skipped: list[str] = []
     for provider_name in provider_pool_names_for_env(provider_pool_env):
+        if _provider_env_prefix(provider_name).replace("AI_PROVIDER_", "") in REMOVED_PROVIDER_IDS:
+            skipped.append(f"{provider_name}: provider removed from pool")
+            continue
         prefix = _provider_env_prefix(provider_name)
         provider_type = (os.getenv(f"{prefix}_TYPE") or "openai_compatible").strip().lower()
         base_url = (os.getenv(f"{prefix}_BASE_URL") or "").strip() or None
@@ -7275,6 +7330,9 @@ def run_manual_ai_backtest(runtime_goal: dict[str, Any], args: argparse.Namespac
         "planned_iterations": 1,
         "advisor_success_count": 0,
         "codegen_success_count": 0,
+        "ai_codegen_call_success_count": 0,
+        "accepted_codegen_candidate_count": 0,
+        "final_codegen_success_count": 0,
         "generated_versions_count": 1,
         "train_backtest_count": 0,
         "validation_backtest_count": 0,
@@ -7751,13 +7809,14 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     consecutive_system_backtest_failures = 0
     recent_system_backtest_failures: list[dict[str, Any]] = []
     system_failure_stop = False
-    explore_strategy_family = bool(getattr(args, "explore_strategy_family", False) or runtime_goal.get("explore_strategy_family", False))
+    explore_strategy_family = _explore_strategy_family_enabled(runtime_goal, args)
     explore_family_cfg = _explore_strategy_family_cfg(runtime_goal)
     family_stats = _initial_family_stats()
     last_planned_strategy_family = ""
     if explore_strategy_family:
         print("策略结构探索模式：已启用。将按 near-miss 与 family 降权动态选择，不再默认强制尝试所有 family。")
         print("explore_strategy_family 调度参数：" + _compact_prompt_json(explore_family_cfg, 1000))
+    _print_explore_strategy_family_runtime_state(explore_strategy_family, explore_family_cfg, family_stats)
     leaderboard: list[dict[str, Any]] = []
     best_summary_path: Path | None = None
     stop_on_ai_error = bool(runtime_goal.get("stop_on_ai_error", False))
@@ -7803,6 +7862,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         "planned_iterations": int(runtime_goal.get("max_iterations", args.iterations)),
         "advisor_success_count": 0,
         "codegen_success_count": 0,
+        "ai_codegen_call_success_count": 0,
+        "accepted_codegen_candidate_count": 0,
+        "final_codegen_success_count": 0,
         "generated_versions_count": 0,
         "train_backtest_count": 0,
         "validation_backtest_count": 0,
@@ -7942,6 +8004,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         mutation_type = ""
         planned_strategy_family = _select_strategy_family_for_round(family_stats, last_planned_strategy_family, explore_family_cfg) if explore_strategy_family else ""
         selected_strategy_family = planned_strategy_family if explore_strategy_family else ""
+        if explore_strategy_family:
+            _print_explore_strategy_family_runtime_state(explore_strategy_family, explore_family_cfg, family_stats, selected_strategy_family)
         family_score = 0.0
         family_failure_reason = ""
         high_frequency_failure = False
@@ -8693,6 +8757,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 print("本轮停止：codegen reviewer 认为所有候选不合格。")
                 flush_iteration_stats()
                 continue
+            codegen_candidates_meta = committee_codegen_result.get("candidates", []) if isinstance(committee_codegen_result, dict) else []
+            iteration_stats["ai_codegen_call_success_count"] += sum(1 for c in codegen_candidates_meta if not ((c.get("metadata") or {}).get("error")))
+            iteration_stats["accepted_codegen_candidate_count"] += sum(1 for c in codegen_candidates_meta if not ((c.get("metadata") or {}).get("prompt_duplicate")))
             code = str(committee_codegen_result.get("selected_code") or "")
             selected_candidate = str(committee_codegen_result.get("selected_candidate") or "")
             response_text = code
@@ -8719,6 +8786,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             code = extract_python_code(response_text)
         status["codegen_status"] = "成功"
         iteration_stats["codegen_success_count"] += 1
+        iteration_stats["final_codegen_success_count"] += 1
         features = extract_strategy_features(code)
         strategy_fingerprint = build_strategy_fingerprint(features)
         signature = strategy_fingerprint["hash"]
@@ -10209,8 +10277,11 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     print("有效策略：" + ("、".join(f"{row['version']}:{row['strategy_class']}" for row in valid_rows) if valid_rows else "无"))
     print("无效策略：" + ("、".join(f"{row['version']}:{row['strategy_class']}({row.get('invalid_reason')})" for row in invalid_rows) if invalid_rows else "无"))
     print(f"当前最佳策略是否更新：{'是' if best else '否'}")
-    if explore_strategy_family and strategy_family_leaderboard:
-        _print_strategy_family_leaderboard(strategy_family_leaderboard, run_dir / "strategy_family_leaderboard.json")
+    if explore_strategy_family:
+        if strategy_family_leaderboard:
+            _print_strategy_family_leaderboard(strategy_family_leaderboard, run_dir / "strategy_family_leaderboard.json")
+        else:
+            _print_explore_strategy_family_runtime_state(True, explore_family_cfg, family_stats, reason="本轮未进入回测，可能被 prompt_duplicate 阻断。")
     else:
         print("本次不是 explore-strategy-family 模式，strategy_family 统计不适用。")
     target_cfg = (runtime_goal.get("target", {}) or {})
@@ -10537,6 +10608,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     print(f"计划迭代轮数：{iteration_stats.get('planned_iterations')}")
     print(f"策略顾问成功次数：{iteration_stats.get('advisor_success_count')}")
     print(f"代码生成成功次数：{iteration_stats.get('codegen_success_count')}")
+    print(f"AI codegen 调用成功次数：{iteration_stats.get('ai_codegen_call_success_count')}")
+    print(f"已接受 codegen candidate 数：{iteration_stats.get('accepted_codegen_candidate_count')}")
+    print(f"最终 codegen 成功次数：{iteration_stats.get('final_codegen_success_count')}")
     print(f"实际生成策略版本数：{iteration_stats.get('generated_versions_count')}")
     print(f"训练回测版本数：{iteration_stats.get('train_backtest_count')}")
     print(f"验证回测版本数：{iteration_stats.get('validation_backtest_count')}")
@@ -10765,7 +10839,7 @@ def main() -> None:
         if args.mode == "optimize":
             apply_pairs_file_override(runtime_goal, args, run_dir)
             apply_auto_trade_count_target(runtime_goal)
-            if bool(getattr(args, "explore_strategy_family", False) or runtime_goal.get("explore_strategy_family", False)):
+            if _explore_strategy_family_enabled(runtime_goal, args):
                 _apply_explore_strategy_family_trade_targets(runtime_goal)
                 print(
                     "策略结构探索交易数硬约束："

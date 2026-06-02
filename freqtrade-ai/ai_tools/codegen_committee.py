@@ -187,6 +187,55 @@ def lightweight_check(code: str, class_name: str, mutation_spec: dict[str, Any] 
     return {"passed": passed, "checks": checks}
 
 
+
+def _function_body(code: str, function_name: str) -> str:
+    match = re.search(rf"def\s+{re.escape(function_name)}\s*\(.*?\):(?P<body>.*?)(?:\n\s*def\s+|\nclass\s+|\Z)", code or "", flags=re.DOTALL)
+    body = match.group("body") if match else ""
+    body = re.sub(r"#.*", "", body)
+    body = re.sub(r"\s+", " ", body).strip().lower()
+    return body
+
+
+def _code_similarity(a: str, b: str) -> float:
+    ta = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", (a or "").lower()))
+    tb = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", (b or "").lower()))
+    if not ta and not tb:
+        return 1.0
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def _candidate_duplicate_report(item: dict[str, Any], accepted: list[dict[str, Any]], parent_code: str, mutation_spec: dict[str, Any]) -> dict[str, Any]:
+    code = str(item.get("code") or "")
+    code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest() if code else ""
+    parent_hash = hashlib.sha256((parent_code or "").encode("utf-8")).hexdigest() if parent_code else ""
+    ind_body = _function_body(code, "populate_indicators")
+    entry_body = _function_body(code, "populate_entry_trend")
+    parent_ind = _function_body(parent_code, "populate_indicators")
+    parent_entry = _function_body(parent_code, "populate_entry_trend")
+    reasons: list[str] = []
+    if code_hash and code_hash == parent_hash:
+        reasons.append("generated_code_hash_matches_parent")
+    if parent_code and _code_similarity(code, parent_code) >= 0.995:
+        reasons.append("generated_code_ast_similarity_matches_parent")
+    if parent_ind and ind_body == parent_ind and parent_entry and entry_body == parent_entry:
+        reasons.append("populate_indicators_and_entry_trend_unchanged")
+    for prev in accepted:
+        prev_code = str(prev.get("code") or "")
+        if code_hash and code_hash == hashlib.sha256(prev_code.encode("utf-8")).hexdigest():
+            reasons.append(f"generated_code_hash_matches_{prev.get('candidate')}")
+            break
+        if _code_similarity(code, prev_code) >= 0.995:
+            reasons.append(f"generated_code_similarity_matches_{prev.get('candidate')}")
+            break
+    spec_text = json.dumps(mutation_spec or {}, ensure_ascii=False).lower()
+    code_text = code.lower()
+    spec_tokens = {tok for tok in re.findall(r"[a-zA-Z_]{4,}", spec_text) if tok not in {"mutation_type", "reason", "true", "false", "null"}}
+    if spec_tokens and not any(tok in code_text for tok in list(spec_tokens)[:80]):
+        reasons.append("mutation_spec_implementation_diff_missing")
+    return {"is_duplicate": bool(reasons), "reasons": reasons, "code_hash": code_hash, "populate_indicators_hash": hashlib.sha256(ind_body.encode()).hexdigest(), "populate_entry_trend_hash": hashlib.sha256(entry_body.encode()).hexdigest()}
+
 def _write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -324,24 +373,32 @@ def run_codegen_committee(
             for fut in as_completed(futures):
                 results.append(fut.result())
         results.sort(key=lambda x: x.get("candidate", ""))
-        # Per-candidate prompt similarity: reject only duplicate candidates.
+        # Per-candidate duplicate review: code/diff evidence has priority; prompt fingerprint is audit-only.
         if prompt_review_func:
             survivors = []
             for item in results:
                 kwargs = dict(prompt_review_kwargs or {})
                 fields = dict(kwargs.pop("fields", {}) or {})
-                fields["codegen_prompt"] = item.get("prompt", "")
                 fields["mutation_spec"] = mutation_spec
                 report = prompt_review_func(fields=fields, version=f"{kwargs.pop('version')}_{item.get('candidate')}", **kwargs)
+                duplicate_report = _candidate_duplicate_report(item, survivors, parent_code, mutation_spec)
                 item["metadata"]["prompt_similarity_report"] = report
-                item["metadata"]["prompt_duplicate"] = bool(report.get("prompt_duplicate") or report.get("decision") in {"retry", "skip"})
+                item["metadata"]["code_duplicate_report"] = duplicate_report
+                item["metadata"]["prompt_duplicate"] = bool(duplicate_report.get("is_duplicate"))
+                item["metadata"]["prompt_fingerprint_audit_only"] = bool(report.get("prompt_duplicate") or report.get("decision") in {"retry", "skip"})
                 _write_json(version_dir / "codegen_candidates" / str(item.get("candidate")) / "metadata.json", item["metadata"])
                 if not item["metadata"].get("prompt_duplicate"):
                     survivors.append(item)
             if survivors:
                 results = survivors
             else:
-                return {"status": "prompt_duplicate", "all_candidates_prompt_duplicate": True, "candidates": all_results + results}
+                all_results.extend(results)
+                if attempt == 0:
+                    retry_triggered = True
+                    retry_hint = "All candidates were code-duplicate/prompt_duplicate. Regenerate with a different implementation path: change indicators, populate_indicators, populate_entry_trend and pair-specific thresholds; do not reuse shared template-only changes."
+                    print("all codegen candidates duplicate; regenerating once with different implementation path requirement.")
+                    continue
+                return {"status": "prompt_duplicate", "all_candidates_prompt_duplicate": True, "candidates": all_results, "retry_triggered": retry_triggered}
         all_results.extend(results)
         decision = offline_review(results)
         if cfg.get("reviewer_enabled") and reviewer_runtime is not None:
