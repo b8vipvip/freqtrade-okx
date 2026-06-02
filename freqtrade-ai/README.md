@@ -26,7 +26,7 @@ cp user_data/config.example.json user_data/config.json
 ```
 
 ## 6. 修改 `.env`
-填写 OpenAI API Key 与路径配置。
+填写 OpenAI / OpenRouter / 中转站 API Key 与路径配置。默认推荐开启 `AUTO_BUILD_PROVIDER_POOLS=true`，再通过每个 `AI_PROVIDER_<ID>_ENABLED`、`AI_PROVIDER_<ID>_ROLE`、`AI_PROVIDER_<ID>_PRIORITY_*` 自动组装市场搜索、AI 委员会、策略顾问、代码生成和最终主席 provider 池；如需继续使用旧的手写池，设置 `FORCE_PROVIDER_POOL_MANUAL=true`。多个同平台 provider 可使用 `AI_PROVIDER_<ID>_API_KEY_ENV=OPENROUTER_API_KEY` 复用同一个密钥变量，启动日志只打印池名称，不打印 API Key 明文。
 
 ## 7. 修改 `user_data/config.json`，填入 OKX API
 由于 Freqtrade 的 `config.json` 通常不会自动读取 `.env` 里的 OKX 字段，建议手动填写：

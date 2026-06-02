@@ -190,21 +190,37 @@ OPENAI_MODEL=gpt-5.5
 | `AI_MODEL_SWITCH_ON_ERROR` | AI 调用失败时是否自动切换模型/provider |
 | `AI_MODEL_MAX_ATTEMPTS_PER_CALL` | 单次 AI 调用最多尝试次数 |
 | `AI_MODEL_TIMEOUT_SECONDS` | AI 请求超时时间 |
-| `STRATEGY_ADVISOR_PROVIDER_POOL` | 策略顾问角色 provider 池 |
-| `STRATEGY_CODEGEN_PROVIDER_POOL` | 代码生成/修复角色 provider 池 |
+| `AUTO_BUILD_PROVIDER_POOLS` | 是否扫描已启用 provider 并按角色/优先级自动组装所有 provider 池 |
+| `FORCE_PROVIDER_POOL_MANUAL` | 是否强制使用旧的手写 `*_PROVIDER_POOL` 配置 |
+| `MARKET_SEARCH_PROVIDER_POOL` | 旧配置：市场搜索角色 provider 池 |
+| `AI_COMMITTEE_ANALYST_PROVIDER_POOL` | 旧配置：AI 委员会分析员 provider 池 |
+| `STRATEGY_ADVISOR_PROVIDER_POOL` | 旧配置：策略顾问角色 provider 池 |
+| `STRATEGY_CODEGEN_PROVIDER_POOL` | 旧配置：代码生成/修复角色 provider 池 |
+| `AI_COMMITTEE_FINAL_CHAIRMAN_PROVIDER_POOL` | 旧配置：AI 委员会最终主席 provider 池 |
 
-Provider 池变量命名规则：
+Provider 自动发现变量命名规则：
 
 ```env
-STRATEGY_ADVISOR_PROVIDER_POOL=apihost_claude_opus47,deepseek_official
+AUTO_BUILD_PROVIDER_POOLS=true
+FORCE_PROVIDER_POOL_MANUAL=false
+OPENROUTER_API_KEY=你的OpenRouter_API_Key
 
-AI_PROVIDER_APIHOST_CLAUDE_OPUS47_BASE_URL=https://example.com/v1
-AI_PROVIDER_APIHOST_CLAUDE_OPUS47_API_KEY=你的key
-AI_PROVIDER_APIHOST_CLAUDE_OPUS47_MODEL=claude-opus-4-7
-AI_PROVIDER_APIHOST_CLAUDE_OPUS47_TYPE=openai_compatible
+AI_PROVIDER_OPENROUTER_SONAR_PRO_ENABLED=true
+AI_PROVIDER_OPENROUTER_SONAR_PRO_BASE_URL=https://openrouter.ai/api/v1
+AI_PROVIDER_OPENROUTER_SONAR_PRO_API_KEY_ENV=OPENROUTER_API_KEY
+AI_PROVIDER_OPENROUTER_SONAR_PRO_MODEL=perplexity/sonar-pro
+AI_PROVIDER_OPENROUTER_SONAR_PRO_TYPE=openai_compatible_search
+AI_PROVIDER_OPENROUTER_SONAR_PRO_ROLE=market_search,committee,advisor
+AI_PROVIDER_OPENROUTER_SONAR_PRO_PRIORITY_MARKET_SEARCH=10
+AI_PROVIDER_OPENROUTER_SONAR_PRO_PRIORITY_COMMITTEE=20
+AI_PROVIDER_OPENROUTER_SONAR_PRO_PRIORITY_ADVISOR=30
 ```
 
-脚本会将 provider 名称转换成大写并替换非字母数字字符，再加上 `AI_PROVIDER_` 前缀。
+当 `AUTO_BUILD_PROVIDER_POOLS=true` 且 `FORCE_PROVIDER_POOL_MANUAL=false` 时，脚本会扫描所有 `AI_PROVIDER_<ID>_ENABLED=true` 的 provider，读取 `AI_PROVIDER_<ID>_ROLE` 中的 `market_search`、`committee`、`advisor`、`codegen`、`chairman` 角色，并按照对应的 `AI_PROVIDER_<ID>_PRIORITY_*` 从小到大自动生成 `MARKET_SEARCH_PROVIDER_POOL`、`AI_COMMITTEE_ANALYST_PROVIDER_POOL`、`STRATEGY_ADVISOR_PROVIDER_POOL`、`STRATEGY_CODEGEN_PROVIDER_POOL`、`AI_COMMITTEE_FINAL_CHAIRMAN_PROVIDER_POOL`。启动日志会打印自动生成的池名称，但不会打印 API Key 明文。
+
+`AI_PROVIDER_<ID>_API_KEY_ENV` 可让多个 provider 复用同一个密钥变量，例如多个 OpenRouter 模型都指向 `OPENROUTER_API_KEY`。如果需要完全回到旧的手写池，把 `FORCE_PROVIDER_POOL_MANUAL=true` 即可。
+
+脚本会将 provider 名称转换成大写并替换非字母数字字符，再加上 `AI_PROVIDER_` 前缀；自动发现时输出的 provider 名称为 `<ID>` 的小写形式，例如 `AI_PROVIDER_OPENROUTER_SONAR_PRO_*` 会进入池为 `openrouter_sonar_pro`。
 
 ### `ai_tools/model_config.json`
 
