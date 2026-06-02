@@ -132,6 +132,7 @@ def _print_committee_decision(market_intel: dict[str, Any] | None, directive: di
     print("blocked_mutations:" + _compact_prompt_json(directive.get("blocked_mutations", []), 2000))
     print("pair_specific_rules:" + _compact_prompt_json(directive.get("pair_specific_rules", {}), 3000))
     print("risk_constraints:" + _compact_prompt_json(directive.get("risk_constraints", []), 3000))
+    print(f"too_few_trades recovery mode: {'yes' if directive.get('too_few_trades_recovery_mode') else 'no'}")
 
 
 def _print_prompt_similarity_review(report: dict[str, Any]) -> None:
@@ -518,8 +519,16 @@ FAILURE_TYPE_TO_MUTATION_MAP: dict[str, dict[str, list[str]]] = {
         "avoid": ["adjust_roi_only", "remove_risk_filter"],
     },
     "zero_trade": {
-        "prefer": ["widen_entry_controlled"],
-        "avoid": ["tighten_entry_trigger"],
+        "prefer": ["widen_entry_controlled", "controlled_widen_entry"],
+        "avoid": ["tighten_entry_trigger", "add_more_global_filters"],
+    },
+    "too_few_trades": {
+        "prefer": ["controlled_widen_entry", "widen_entry_controlled", "remove_overstrict_pair_filter"],
+        "avoid": ["add_more_global_filters", "tighten_entry_trigger", "add_entry_filter", "reduce_trade_frequency"],
+    },
+    "training_trade_count_below_min": {
+        "prefer": ["controlled_widen_entry", "widen_entry_controlled", "remove_overstrict_pair_filter"],
+        "avoid": ["add_more_global_filters", "tighten_entry_trigger", "add_entry_filter", "reduce_trade_frequency"],
     },
     "high_frequency": {
         "prefer": ["reduce_trade_frequency", "add_cooldown", "stricter_adx"],
@@ -578,6 +587,10 @@ def _infer_failure_type(summary: dict[str, Any] | None, nearest: dict[str, Any] 
         return "worst_month_loss"
     if _safe_float(train.get("profit_total_pct", data.get("train_profit_pct"))) > 0 and _safe_float(data.get("validation_avg_profit_pct")) < 0:
         return "train_positive_validation_negative"
+    if data.get("training_trade_count_below_min") or "training_trade_count_below_min" in failure_blob:
+        return "training_trade_count_below_min"
+    if data.get("too_few_trades") or "too_few_trades" in failure_blob:
+        return "too_few_trades"
     if data.get("trade_under_min") or data.get("low_trade_failure"):
         return "low_trade_profitable"
     return "general_improvement"
@@ -5416,7 +5429,9 @@ def _strategy_spec_prompt(
         f"last_failure={previous_failure_reason or '无'}\n"
         "必须只选择一个 mutation_type，允许值：add_entry_filter,tighten_entry_trigger,remove_bad_entry_condition,pair_specific_filter,tag_specific_filter,adjust_roi,adjust_stoploss,reduce_trade_frequency,disable_or_adjust_trailing,tighten_volume_filter,cooldown_or_protection。\n"
         "JSON 必须包含: mutation_type,reason,expected_effect,changes,do_not_change。\n"
-        f"硬约束：本轮训练区间总交易数目标是 {min_trades}~{max_trades}（不是单币种）。低于 {min_trades_grace_floor} 会直接跳过验证；{min_trades_grace_floor}~{min_trades - 1} 会继续验证但仅作候选参考。超过 {max_trades} 不能成为 best，超过 {int(max_trades * 1.5)} 会直接跳过验证。\n"
+        f"硬约束：本轮训练区间全局总交易数目标必须保持 20~60，理想 25~45；运行目标是 {min_trades}~{max_trades}（不是单币种）。低于 {min_trades_grace_floor} 会直接跳过验证；{min_trades_grace_floor}~{min_trades - 1} 会继续验证但仅作候选参考。超过 {max_trades} 不能成为 best，超过 {int(max_trades * 1.5)} 会直接跳过验证。\n"
+        "允许收紧 BTC/USDT 和 OP/USDT，但不得导致全局训练交易数低于 20；如果 BTC/OP 收紧，必须保留 SOL/BNB/DOGE 的交易机会，不能把所有 pair 过滤到几乎无交易。\n"
+        "如果 mutation_spec 新增 regime/choppy/volatility filter，JSON 必须包含 estimated_trade_count_guard，至少说明 estimated_total_trades_range、min_trades=20、may_reduce_trades_below_min、pair_opportunity_plan。\n"
         f"{_auto_trade_count_target_prompt_note(runtime_goal)}"
         "重点：减少固定止损吞噬 ROI，不是增加交易数量。禁止/不推荐：increase_trade_frequency,loosen_entry,enable_trailing,replace_stoploss_with_trailing,adjust_stoploss_only,widen_stoploss、盲目 remove_bad_entry_condition。优先：add_regime_filter、avoid_choppy_market_filter、volatility contraction filter、pair_specific_filter、tag_specific_filter。"
         "trailing 规则：禁止完全用 trailing 替代固定止损；trailing 只能在盈利达到 positive offset 后启用；当前重点不是用 trailing 替代 stoploss，而是减少低质量入场和控制亏损单数量。"
@@ -5431,7 +5446,7 @@ def _strategy_spec_prompt(
             f"\n允许的 strategy_family={json.dumps(STRATEGY_FAMILIES, ensure_ascii=False)}"
             "\n允许为 market regime filter / choppy market filter / volatility contraction filter 重构指标和 entry 条件，但不要随机切换到高频 breakout_momentum。"
             "\n必须保留 Freqtrade IStrategy 策略格式、现货 long-only、不做空、不杠杆、不马丁格尔、不外部 API、use_exit_signal=False 等风控安全边界。"
-            "\n探索模式交易数硬约束：本次交易数目标 min_trades=20，ideal_min_trades=25，ideal_max_trades=45，max_trades=60。任何 strategy_family 生成的入场逻辑都必须围绕 25~45 笔设计；禁止生成明显高频策略；如果预计交易数会超过 60，不要输出该方案。"
+            "\n探索模式交易数硬约束：本次交易数目标 min_trades=20，ideal_min_trades=25，ideal_max_trades=45，max_trades=60。任何 strategy_family 生成的入场逻辑都必须围绕 25~45 笔设计；禁止生成明显高频策略；如果预计交易数低于 20 或超过 60，不要输出该方案。"
             "\n如果当前 family 统计中 pending_low_trade_profitable_near_miss=true 或 last_low_trade_near_miss 非空，下一轮必须优先轻微放宽该 near-miss 的入场条件，把交易数提升到 20~25，不要直接跳到完全不同 family。"
             "\nbreakout_momentum 和 strict_risk_filter 对频率错误更敏感：如果它们曾明显超出 max_trades，必须显著收紧触发事件、冷却、成交量/趋势过滤，避免再次高频。"
             "\ntrailing 限制：不要建议 replace_stoploss_with_trailing；禁止完全用 trailing 替代固定止损；trailing 只能在盈利达到 positive offset 后启用；当前重点不是用 trailing 替代 stoploss，而是减少低质量入场和控制亏损单数量。"
@@ -8275,6 +8290,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         print(f"failure_type: {current_failure_type}")
         print(f"allowed_mutations: {mutation_policy.get('prefer', [])}")
         print(f"blocked_mutations: {mutation_policy.get('avoid', [])}")
+        too_few_trades_recovery_mode = current_failure_type in {"too_few_trades", "training_trade_count_below_min", "zero_trade"}
+        print(f"too_few_trades recovery mode: {'yes' if too_few_trades_recovery_mode else 'no'}")
         spec_prompt = _strategy_spec_prompt(
             class_name,
             runtime_goal,
@@ -8295,7 +8312,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         spec_prompt += "当前 failure_type=" + current_failure_type + "\n"
         if current_failure_type == "duplicate_strategy":
             spec_prompt += "硬性澄清：上一轮失败是 duplicate_strategy，不是 zero_trade；除非上一轮真实回测 total_trades=0，否则禁止写成 zero_trade，禁止选择 widen_entry_controlled。必须强制更换 codegen provider，并要求改变 entry_conditions / indicators / populate_entry_trend。\n"
-        spec_prompt += "pair_attribution 定向要求：BTC/USDT、OP/USDT 需要更严格 entry threshold；OP 不允许高频入场；SOL/BNB/DOGE 可以保持相对宽松，但 DOGE 样本少，不能过拟合。下一轮优先尝试 pair_specific_entry_threshold for BTC/OP、avoid_choppy_market_filter、stoploss_to_roi_ratio reduction。禁止 remove_risk_filter、adjust_roi_only、replace_stoploss_with_trailing，禁止让 OP 交易数暴涨。\n"
+        spec_prompt += "pair_attribution 定向要求：允许收紧 BTC/USDT、OP/USDT entry threshold；OP 不允许高频入场；但不得导致全局训练交易数低于 20。SOL/BNB/DOGE 必须保留交易机会，不允许所有 pair 被过滤到几乎无交易。下一轮优先尝试 pair_specific_entry_threshold for BTC/OP、avoid_choppy_market_filter、stoploss_to_roi_ratio reduction。禁止 remove_risk_filter、adjust_roi_only、replace_stoploss_with_trailing，禁止让 OP 交易数暴涨。\n"
+        spec_prompt += "mutation_spec 若新增 regime/choppy/volatility filter，必须包含 estimated_trade_count_guard 字段，说明预计总交易数范围、min_trades=20、是否可能低于下限、以及如何保留 SOL/BNB/DOGE 机会。\n"
+        if current_failure_type in {"too_few_trades", "training_trade_count_below_min"}:
+            spec_prompt += "too_few_trades recovery mode：上一轮交易数低于下限；下一轮 allowed_mutations 必须包含 controlled_widen_entry，blocked_mutations 必须包含 add_more_global_filters；advisor 必须优先轻微放宽/移除过严条件，而不是继续加过滤。\n"
         spec_prompt += "允许 mutation=" + _compact_prompt_json(mutation_policy.get("prefer", []), 1000) + "\n"
         spec_prompt += "禁止 mutation=" + _compact_prompt_json(mutation_policy.get("avoid", []), 1000) + "\n"
         spec_prompt += "本轮只修一个主要问题；mutation_spec.mutation_type 必须优先从允许 mutation 中选择，且不得使用禁止 mutation。\n"
@@ -8402,6 +8422,16 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 )
                 strategy_spec["strategy_family"] = planned_strategy_family
             selected_strategy_family = _normalize_strategy_family(strategy_spec.get("strategy_family")) or planned_strategy_family
+        estimated_trade_count_guard = strategy_spec.get("estimated_trade_count_guard", {}) if isinstance(strategy_spec, dict) else {}
+        guard_text = _compact_prompt_json(estimated_trade_count_guard, 2000) if estimated_trade_count_guard else "未提供"
+        may_reduce_below_min = False
+        if isinstance(estimated_trade_count_guard, dict):
+            may_reduce_below_min = bool(estimated_trade_count_guard.get("may_reduce_trades_below_min") or estimated_trade_count_guard.get("may_reduce_below_min"))
+            est_min = estimated_trade_count_guard.get("estimated_min_trades") or estimated_trade_count_guard.get("min_estimated_trades")
+            if est_min is not None and _safe_int(est_min) < 20:
+                may_reduce_below_min = True
+        print(f"estimated_trade_count_guard: {guard_text}")
+        print(f"whether mutation may reduce trades below min: {'yes' if may_reduce_below_min else 'no'}")
         write_json(version_dir / "mutation_spec.json", strategy_spec)
         print(f"2. mutation_spec 已保存：{version_dir / 'mutation_spec.json'}")
         if explore_strategy_family:
@@ -8428,12 +8458,14 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             + ("AI 投资委员会 risk_constraints=" + json.dumps(final_strategy_directive.get("risk_constraints", []), ensure_ascii=False) + "\n" if final_strategy_directive else "")
             + ("AI 投资委员会 pair_specific_rules=" + json.dumps(final_strategy_directive.get("pair_specific_rules", {}), ensure_ascii=False) + "\n" if final_strategy_directive else "")
             + "重要：不得把新闻/搜索结果写成策略代码规则；只能用可回测的 candle/volume/volatility/regime proxy。validation_intel 和 holdout_intel 未注入且禁止使用。\n"
-            f"当前 failure_type={current_failure_type}；allowed_mutations={mutation_policy.get('prefer', [])}；blocked_mutations={mutation_policy.get('avoid', [])}；本轮只修一个主要问题。\n"
+            f"当前 failure_type={current_failure_type}；allowed_mutations={mutation_policy.get('prefer', [])}；blocked_mutations={mutation_policy.get('avoid', [])}；too_few_trades_recovery_mode={'yes' if current_failure_type in {'too_few_trades', 'training_trade_count_below_min', 'zero_trade'} else 'no'}；本轮只修一个主要问题。\n"
             f"当前失败摘要={previous_failure_reason or '无'}\n"
             "硬性约束：\n"
             + ("1) 当前是结构探索模式：允许不局限于 champion 小步改动，但必须吸收历史经验，避免重复已失败结构。\n" if explore_strategy_family else "1) 仅允许在 champion 基础上一次小改动，不允许完全重写。\n")
-            + "2) 策略必须在训练区间产生合理交易，严禁生成完全无交易策略。\n"
-            f"2) 训练区间总交易数目标为 {min_trades}~{max_trades}（不是单币种）。低于 {int(min_trades * min_trades_grace_ratio)} 笔直接跳过验证；{int(min_trades * min_trades_grace_ratio)}~{min_trades - 1} 笔继续验证但仅作候选参考。超过 {max_trades} 不能成为 best；超过 {int(max_trades * 1.5)} 直接跳过验证。\n"
+            + "2) 策略必须在训练区间产生合理交易，严禁生成完全无交易策略，也不允许把所有 pair 都过滤到几乎无交易。\n"
+            f"2) 训练区间全局总交易数目标必须保持 20~60，理想 25~45（不是单币种）；运行目标为 {min_trades}~{max_trades}。低于 {int(min_trades * min_trades_grace_ratio)} 笔直接跳过验证；{int(min_trades * min_trades_grace_ratio)}~{min_trades - 1} 笔继续验证但仅作候选参考。超过 {max_trades} 不能成为 best；超过 {int(max_trades * 1.5)} 直接跳过验证。\n"
+            "2a) 允许收紧 BTC/USDT 和 OP/USDT，但不得导致全局交易数低于 20；如果 BTC/OP 收紧，必须保留 SOL/BNB/DOGE 的交易机会。\n"
+            "2b) 若 mutation_spec 新增 regime/choppy/volatility filter，代码实现必须遵守 estimated_trade_count_guard，不得额外叠加导致低于 min_trades=20。\n"
             "3) 禁止连续状态型宽松入场；优先 crossed_above/crossed_below 事件触发；每个策略最多 1~2 个 entry_tag。\n"
             "4) 不允许多个 OR 条件堆叠造成高频；不允许为了增加交易数而放宽入场。\n"
             f"3) {zero_trade_hint}\n"
@@ -8467,7 +8499,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "- 如果 mutation_spec 要求新增指标（ema20、ema50、adx、atr_pct、bollinger_middleband、volume_mean_20 等），必须在 populate_indicators 中实际计算这些 dataframe 列，并在入场条件中引用相关列。\n"
             "- Bollinger 安全规则：禁止直接使用 bollinger['middle']/bollinger['mid']；qtpylib.bollinger_bands 只允许安全读取 upper/lower；bb_middle 必须通过 upper/lower 计算。\n"
             "- 如果需要 bb_middle，必须先计算 bb_upper/bb_lower，再写 dataframe['bb_middle'] = (dataframe['bb_upper'] + dataframe['bb_lower']) / 2。\n"
-            "- 避免把入场条件写成几乎永远不触发的苛刻组合。\n"
+            "- 避免把入场条件写成几乎永远不触发的苛刻组合；不允许把所有 pair 都过滤到几乎无交易。\n"
+            "- 目标交易数必须保持 20~60，理想 25~45；risk-reducing 不等于 no-trade，任何 mutation 都必须满足 min_trades >= 20。\n"
+            "- 如果 BTC/OP 收紧，应保留 SOL/BNB/DOGE 的交易机会，不能用全局过滤误伤所有币种。\n"
         )
         prompt += _format_pre_run_review_for_codegen(pre_run_ai_review)
         prompt += _format_prompt_guidance_section(

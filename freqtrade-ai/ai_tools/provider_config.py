@@ -142,6 +142,36 @@ def discover_enabled_providers() -> list[dict[str, Any]]:
     return providers
 
 
+
+
+def load_provider_config(provider_name: str, *, default_timeout: int | str = 120) -> dict[str, Any]:
+    """Load one AI_PROVIDER_<ID> configuration from environment.
+
+    This is the shared provider loader used by live-search and model pools.  It
+    supports direct API keys and API_KEY_ENV indirection, and keeps the original
+    provider id for audit logs.
+    """
+    provider_id = re.sub(r"[^A-Za-z0-9]+", "_", provider_name.strip()).strip("_").upper()
+    prefix = f"AI_PROVIDER_{provider_id}"
+    api_key, api_key_source = _provider_api_key(prefix)
+    timeout_raw = (os.getenv(f"{prefix}_TIMEOUT") or str(default_timeout) or "120").strip()
+    try:
+        timeout = float(timeout_raw)
+    except ValueError:
+        timeout = float(default_timeout or 120)
+    return {
+        "id": provider_id,
+        "name": provider_name.strip(),
+        "prefix": prefix,
+        "type": (os.getenv(f"{prefix}_TYPE") or "openai_compatible").strip().lower(),
+        "base_url": (os.getenv(f"{prefix}_BASE_URL") or "").strip(),
+        "api_key": api_key,
+        "api_key_source": api_key_source,
+        "model": (os.getenv(f"{prefix}_MODEL") or "").strip(),
+        "timeout": timeout,
+        "timeout_source": f"{prefix}_TIMEOUT" if os.getenv(f"{prefix}_TIMEOUT") else "default",
+    }
+
 def build_auto_provider_pool_names(role: str) -> list[str]:
     candidates: list[tuple[int, str, str]] = []
     for provider in discover_enabled_providers():
