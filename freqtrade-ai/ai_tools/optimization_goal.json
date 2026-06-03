@@ -188,15 +188,11 @@
     "enabled": true,
     "threshold": 0.95,
     "compare_fields": [
-      "market_intel_summary",
-      "committee_consensus",
-      "final_strategy_directive",
-      "mutation_spec",
       "normalized_mutation_intent",
       "codegen_prompt_fingerprint"
     ],
     "retry_on_duplicate": true,
-    "max_retries": 2
+    "max_retries": 1
   },
   "explore_strategy_family": {
     "enabled": true,
