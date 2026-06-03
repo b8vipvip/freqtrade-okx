@@ -648,8 +648,20 @@ FAILURE_TYPE_TO_MUTATION_MAP: dict[str, dict[str, list[str]]] = {
         "avoid": ["add_more_global_filters", "tighten_entry_trigger", "add_entry_filter", "reduce_trade_frequency"],
     },
     "training_trade_count_below_min": {
-        "prefer": ["controlled_widen_entry", "widen_entry_controlled", "remove_overstrict_pair_filter"],
-        "avoid": ["add_more_global_filters", "tighten_entry_trigger", "add_entry_filter", "reduce_trade_frequency"],
+        "prefer": ["controlled_widen_entry", "relax_global_filter", "reduce_overstrict_regime_filter", "pair_specific_restore_non_bad_pairs"],
+        "avoid": ["add_more_filters", "add_regime_filter", "add_choppy_filter", "tighten_entry_quality_filter", "tighten_all_pairs", "reduce_trade_frequency"],
+    },
+    "too_few_trades": {
+        "prefer": ["controlled_widen_entry", "relax_global_filter", "reduce_overstrict_regime_filter", "pair_specific_restore_non_bad_pairs"],
+        "avoid": ["add_more_filters", "add_regime_filter", "add_choppy_filter", "tighten_entry_quality_filter", "tighten_all_pairs", "reduce_trade_frequency"],
+    },
+    "near_no_trade": {
+        "prefer": ["controlled_widen_entry", "relax_global_filter", "reduce_overstrict_regime_filter", "pair_specific_restore_non_bad_pairs"],
+        "avoid": ["add_more_filters", "add_regime_filter", "add_choppy_filter", "tighten_entry_quality_filter", "tighten_all_pairs", "reduce_trade_frequency"],
+    },
+    "severe_near_no_trade": {
+        "prefer": ["controlled_widen_entry", "relax_global_filter", "reduce_overstrict_regime_filter", "pair_specific_restore_non_bad_pairs"],
+        "avoid": ["add_more_filters", "add_regime_filter", "add_choppy_filter", "tighten_entry_quality_filter", "tighten_all_pairs", "reduce_trade_frequency"],
     },
     "high_frequency": {
         "prefer": ["reduce_trade_frequency", "add_cooldown", "stricter_adx"],
@@ -676,6 +688,17 @@ FAILURE_TYPE_TO_MUTATION_MAP: dict[str, dict[str, list[str]]] = {
 
 def _infer_failure_type(summary: dict[str, Any] | None, nearest: dict[str, Any] | None = None) -> str:
     data = summary if isinstance(summary, dict) and summary else {}
+    train = data.get("train_metrics", {}) if isinstance(data.get("train_metrics"), dict) else {}
+    trade_value = data.get("train_total_trades", data.get("actual_trades", train.get("total_trades")))
+    has_trade_value = trade_value is not None and str(trade_value) != ""
+    min_trades = _safe_int(((data.get("target") if isinstance(data.get("target"), dict) else {}) or {}).get("min_trades", data.get("min_trades", 20))) or 20
+    failure_blob = json.dumps({"summary": data, "nearest": nearest or {}}, ensure_ascii=False).lower()
+    if data.get("zero_trade_failure") or (has_trade_value and _safe_int(trade_value) == 0) or "0 交易" in failure_blob:
+        return "zero_trade"
+    if has_trade_value and 0 < _safe_int(trade_value) <= 5:
+        return "near_no_trade"
+    if has_trade_value and _safe_int(trade_value) < min_trades:
+        return "too_few_trades"
     near_type = str((nearest or {}).get("near_miss_type") or data.get("near_miss_type") or "")
     if near_type == "risk_control_near_miss":
         return "stoploss_to_roi_high"
@@ -685,7 +708,6 @@ def _infer_failure_type(summary: dict[str, Any] | None, nearest: dict[str, Any] 
         return "train_positive_validation_negative"
     if near_type == "low_trade_profitable_near_miss":
         return "low_trade_profitable"
-    failure_blob = json.dumps({"summary": data, "nearest": nearest or {}}, ensure_ascii=False).lower()
     explicit_reason = str(data.get("failure_reason") or data.get("family_failure_reason") or data.get("invalid_reason") or "")
     if data.get("duplicate_strategy_failure") or str(data.get("failure_type") or "") == "duplicate_strategy" or "duplicate_strategy" in failure_blob or "高度重复" in explicit_reason:
         return "duplicate_strategy"
@@ -695,11 +717,12 @@ def _infer_failure_type(summary: dict[str, Any] | None, nearest: dict[str, Any] 
         if explicit_reason in {"backtest_command_failed", "freqtrade_config_validation_failed", "result_parse_error"}:
             return explicit_reason
         return "backtest_result_missing"
-    train = data.get("train_metrics", {}) if isinstance(data.get("train_metrics"), dict) else {}
-    trade_value = data.get("train_total_trades", train.get("total_trades"))
-    has_trade_value = trade_value is not None and str(trade_value) != ""
-    if data.get("zero_trade_failure") or (has_trade_value and _safe_int(trade_value) == 0) or "0 交易" in failure_blob:
-        return "zero_trade"
+    if data.get("training_trade_count_below_min") or "training_trade_count_below_min" in failure_blob:
+        return "too_few_trades"
+    if data.get("too_few_trades") or "too_few_trades" in failure_blob:
+        return "too_few_trades"
+    if data.get("near_no_trade") or data.get("severe_near_no_trade") or "near_no_trade" in failure_blob:
+        return "near_no_trade"
     if data.get("high_frequency_failure") or data.get("severe_high_frequency_failure") or "high_frequency" in failure_blob or "交易数超过" in failure_blob:
         return "high_frequency"
     if data.get("stoploss_to_roi_failure") or _safe_float(data.get("stoploss_to_roi_ratio")) > 1.2 or "止损" in failure_blob or "stoploss" in failure_blob:
@@ -708,17 +731,51 @@ def _infer_failure_type(summary: dict[str, Any] | None, nearest: dict[str, Any] 
         return "worst_month_loss"
     if _safe_float(train.get("profit_total_pct", data.get("train_profit_pct"))) > 0 and _safe_float(data.get("validation_avg_profit_pct")) < 0:
         return "train_positive_validation_negative"
-    if data.get("training_trade_count_below_min") or "training_trade_count_below_min" in failure_blob:
-        return "training_trade_count_below_min"
-    if data.get("too_few_trades") or "too_few_trades" in failure_blob:
-        return "too_few_trades"
     if data.get("trade_under_min") or data.get("low_trade_failure"):
-        return "low_trade_profitable"
+        return "too_few_trades"
     return "general_improvement"
 
 
 def _mutation_policy_for_failure_type(failure_type: str) -> dict[str, list[str]]:
     return FAILURE_TYPE_TO_MUTATION_MAP.get(failure_type) or FAILURE_TYPE_TO_MUTATION_MAP["general_improvement"]
+
+
+def _estimated_trade_range_from_guard(guard: dict[str, Any] | None) -> tuple[int | None, int | None, str]:
+    if not isinstance(guard, dict):
+        return None, None, ""
+    raw_range = guard.get("estimated_total_trades_range") or guard.get("estimated_trades_range") or guard.get("estimated_trade_count_range")
+    if isinstance(raw_range, str):
+        nums = [int(x) for x in re.findall(r"\d+", raw_range)]
+        if len(nums) >= 2:
+            return nums[0], nums[1], f"{nums[0]}-{nums[1]}"
+        if len(nums) == 1:
+            return nums[0], nums[0], str(nums[0])
+    if isinstance(raw_range, (list, tuple)) and raw_range:
+        nums = [_safe_int(x) for x in raw_range[:2]]
+        if len(nums) == 1:
+            nums.append(nums[0])
+        return nums[0], nums[1], f"{nums[0]}-{nums[1]}"
+    lo = guard.get("estimated_min_trades") or guard.get("min_estimated_trades") or guard.get("estimated_trades_min")
+    hi = guard.get("estimated_max_trades") or guard.get("max_estimated_trades") or guard.get("estimated_trades_max")
+    if lo is not None or hi is not None:
+        lo_i = _safe_int(lo if lo is not None else hi)
+        hi_i = _safe_int(hi if hi is not None else lo)
+        return lo_i, hi_i, f"{lo_i}-{hi_i}"
+    return None, None, ""
+
+
+def _estimate_trade_count_error(guard: dict[str, Any] | None, actual_trades: int) -> dict[str, Any]:
+    lo, hi, label = _estimated_trade_range_from_guard(guard)
+    if lo is None or hi is None:
+        return {"estimated_trades_range": "", "actual_trades": actual_trades, "estimate_error": "missing_estimate"}
+    error = "ok"
+    if actual_trades <= 5 and lo >= 20:
+        error = "severe_overfilter"
+    elif actual_trades < max(1, int(lo * 0.5)):
+        error = "overfilter"
+    elif actual_trades > max(hi * 2, hi + 20):
+        error = "underfilter"
+    return {"estimated_trades_range": label, "actual_trades": actual_trades, "estimate_error": error}
 
 
 def _candidate_has_valid_file(candidate: dict[str, Any] | None) -> bool:
@@ -3395,8 +3452,14 @@ def _build_common_failure_patterns(rows: list[dict[str, Any]], target_cfg: dict[
 
     if sum(_safe_int(r.get("total_trades")) > max_trades for r in rows) >= majority:
         patterns.append("交易数过高")
-    if sum(0 < _safe_int(r.get("total_trades")) < min_trades for r in rows) >= majority:
-        patterns.append("交易数偏低")
+    if sum(_safe_int(r.get("total_trades")) < min_trades for r in rows) >= majority:
+        patterns.append("too_few_trades")
+    if sum(0 < _safe_int(r.get("total_trades")) <= 5 for r in rows) >= 1:
+        patterns.append("near_no_trade")
+    if any(r.get("over_filtering") or (0 < _safe_int(r.get("total_trades")) < min_trades) for r in rows):
+        patterns.append("over_filtering")
+    if any(str(r.get("estimate_error") or "") == "severe_overfilter" for r in rows):
+        patterns.append("estimated_trade_count_guard_failed")
 
     validation_state_rows = [r for r in rows if r.get("validation_metrics")]
     if validation_state_rows:
@@ -3552,20 +3615,26 @@ def _load_strategy_code_from_record(record: dict[str, Any] | None) -> str:
     return sf.read_text(encoding="utf-8", errors="ignore")
 
 
-def _pre_run_recommends_nearest_parent(review: dict[str, Any] | None) -> tuple[bool, str, str]:
+def _pre_run_recommends_parent(review: dict[str, Any] | None) -> tuple[str, str, str]:
     if not isinstance(review, dict):
-        return False, "", "pre_run_ai_review 为空"
+        return "", "", "pre_run_ai_review 为空"
     next_guidance = review.get("next_run_guidance", {}) if isinstance(review.get("next_run_guidance"), dict) else {}
     preferred_parent = str(next_guidance.get("preferred_parent") or "").strip()
-    if preferred_parent.lower() == "nearest_candidate":
-        return True, preferred_parent, "next_run_guidance.preferred_parent=nearest_candidate"
+    normalized_parent = preferred_parent.lower().replace("-", "_").replace(" ", "_")
+    if normalized_parent in {"nearest_candidate", "nearest"}:
+        return "nearest_candidate", preferred_parent, "next_run_guidance.preferred_parent=nearest_candidate"
+    if normalized_parent in {"last_near_miss", "last_near_miss_strategy", "last_low_trade_near_miss", "last_near_miss_strategy_file"} or ("near" in normalized_parent and "miss" in normalized_parent):
+        return "last_near_miss", preferred_parent, "next_run_guidance.preferred_parent=last near miss"
     diagnosis = review.get("last_run_diagnosis", {}) if isinstance(review.get("last_run_diagnosis"), dict) else {}
     search_blob = json.dumps({"next_run_guidance": next_guidance, "last_run_diagnosis": diagnosis}, ensure_ascii=False).lower()
     nearest_terms = ("nearest_candidate", "nearest candidate", "最近候选", "最接近目标")
     parent_terms = ("preferred_parent", "parent", "父策略", "作为父", "基于", "围绕")
     if any(term in search_blob for term in nearest_terms) and any(term in search_blob for term in parent_terms):
-        return True, preferred_parent or "nearest_candidate（主要结论）", "pre_run 主要结论明确建议围绕 nearest_candidate 作为父策略"
-    return False, preferred_parent, "pre_run 未要求 nearest_candidate 作为父策略"
+        return "nearest_candidate", preferred_parent or "nearest_candidate（主要结论）", "pre_run 主要结论明确建议围绕 nearest_candidate 作为父策略"
+    near_miss_terms = ("last near miss", "last_near_miss", "near-miss", "near miss", "低交易数 near")
+    if any(term in search_blob for term in near_miss_terms) and any(term in search_blob for term in parent_terms):
+        return "last_near_miss", preferred_parent or "last near miss（主要结论）", "pre_run 主要结论明确建议围绕 last near miss 作为父策略"
+    return "", preferred_parent, "pre_run 未要求 nearest_candidate/last near miss 作为父策略"
 
 
 def _select_actual_session_parent_for_run(
@@ -3576,22 +3645,32 @@ def _select_actual_session_parent_for_run(
     historical_champion: dict[str, Any],
     nearest_mem: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    recommended_nearest, preferred_parent, reason = _pre_run_recommends_nearest_parent(pre_run_ai_review)
+    recommended_parent, preferred_parent, reason = _pre_run_recommends_parent(pre_run_ai_review)
     nearest_valid = _resolve_strategy_file((nearest_mem or {}).get("strategy_file")) is not None
+    last_near_miss_mem = nearest_mem if isinstance(nearest_mem, dict) and (nearest_mem.get("near_miss") or nearest_mem.get("near_miss_type")) else None
+    last_near_miss_valid = _resolve_strategy_file((last_near_miss_mem or {}).get("strategy_file")) is not None
     actual = dict(historical_champion)
     actual.setdefault("source", "historical_best")
     overwritten = False
     choice_reason = "默认使用 historical_best / 当前 champion 作为本次 session_parent。"
     recommendation_allowed = bool(explore_strategy_family or use_pre_run_parent_recommendation)
-    if recommended_nearest:
+    if recommended_parent:
         if not recommendation_allowed:
             choice_reason = f"{reason}，但 use_pre_run_parent_recommendation=false 且不是 explore-strategy-family 模式，fallback 到 historical_best。"
+        elif recommended_parent == "last_near_miss":
+            if last_near_miss_valid and isinstance(last_near_miss_mem, dict):
+                actual = {"meta": last_near_miss_mem, "code": _load_strategy_code_from_record(last_near_miss_mem), "source": "last_near_miss_session_parent"}
+                overwritten = True
+                choice_reason = f"{reason}，且 last near miss 策略文件有效；仅覆盖本次 run 的 session_parent，不覆盖 official best。"
+            else:
+                missing_reason = "last_near_miss_strategy_file_missing"
+                choice_reason = f"{reason}，但 {missing_reason}，fallback 到 historical_best。"
         elif nearest_valid and isinstance(nearest_mem, dict):
             actual = {"meta": nearest_mem, "code": _load_strategy_code_from_record(nearest_mem), "source": "nearest_candidate_session_parent"}
             overwritten = True
             choice_reason = f"{reason}，且 nearest_candidate 策略文件有效；仅覆盖本次 run 的 session_parent，不覆盖 official best。"
         else:
-            choice_reason = f"{reason}，但 nearest_candidate 策略文件无效，fallback 到 historical_best。"
+            choice_reason = f"{reason}，但 nearest_candidate 策略文件无效（last_near_miss_strategy_file_missing/nearest_candidate_strategy_file_missing），fallback 到 historical_best。"
     elif explore_strategy_family:
         choice_reason = reason
     actual["session_parent_choice"] = {
@@ -3603,6 +3682,8 @@ def _select_actual_session_parent_for_run(
         "overrode_historical_best_for_session": overwritten,
         "did_override_historical_best_for_session": overwritten,
         "nearest_candidate_file_valid": nearest_valid,
+        "last_near_miss_file_valid": last_near_miss_valid,
+        "recommended_parent_source": recommended_parent or "",
         "use_pre_run_parent_recommendation": bool(use_pre_run_parent_recommendation),
     }
     return actual
@@ -4889,6 +4970,13 @@ def _new_round_defaults() -> dict[str, Any]:
         "stoploss_to_roi_ratio": 0,
         "low_trade_profitable_near_miss": False,
         "trailing_failure": False,
+        "estimated_trade_count_guard": {},
+        "estimated_trades_range": "",
+        "actual_trades": 0,
+        "estimate_error": "",
+        "severe_near_no_trade": False,
+        "near_no_trade": False,
+        "over_filtering": False,
     }
 
 
@@ -4985,6 +5073,13 @@ def _minimal_round_summary(
         "backtest_result_missing_failure": bool(state.get("backtest_result_missing_failure", False)),
         "zip_mismatch_failure": bool(state.get("zip_mismatch_failure", False)),
         "stoploss_to_roi_failure": bool(state.get("stoploss_to_roi_failure", False)),
+        "estimated_trade_count_guard": state.get("estimated_trade_count_guard", {}),
+        "estimated_trades_range": state.get("estimated_trades_range", ""),
+        "actual_trades": _safe_int(state.get("actual_trades", state.get("train_total_trades", 0))),
+        "estimate_error": state.get("estimate_error", ""),
+        "near_no_trade": bool(state.get("near_no_trade", False)),
+        "severe_near_no_trade": bool(state.get("severe_near_no_trade", False)),
+        "over_filtering": bool(state.get("over_filtering", False)),
         "near_miss": bool(state.get("near_miss", False)),
         "near_miss_type": state.get("near_miss_type", ""),
     }
@@ -5394,6 +5489,11 @@ def _is_model_not_found_error(message: str, status_code: int | None = None) -> b
     return "model_not_found" in text or "model not found" in text or "does not exist" in text or status_code == 404
 
 
+def _is_quota_exhausted_error(message: str, status_code: int | None = None) -> bool:
+    text = (message or "").lower()
+    return "insufficient_user_quota" in text or "insufficient quota" in text or "quota=0" in text or "quota 0" in text or "balance is 0" in text or "余额为 0" in text
+
+
 def _blacklist_bad_provider_for_session(role_runtime: AIRoleRuntime, provider_name: str, model: str, reason: str) -> None:
     key = f"{provider_name}/{model}"
     BAD_PROVIDER_SESSION_BLACKLIST.add(key)
@@ -5506,10 +5606,14 @@ def safe_ask_ai(
                 error_message, status_code = _format_ai_error(exc)
                 last_error_message = error_message or exc.__class__.__name__
                 last_status_code = status_code
+                quota_exhausted = _is_quota_exhausted_error(last_error_message, status_code)
                 if _is_model_not_found_error(last_error_message, status_code):
                     _blacklist_bad_provider_for_session(role_runtime, provider_name, model, "model_not_found")
+                if quota_exhausted:
+                    print(f"provider quota exhausted: provider={provider_name} model={model}")
+                    _blacklist_bad_provider_for_session(role_runtime, provider_name, model, "quota_exhausted")
                 tos_block = _is_403_provider_tos_block(last_error_message, status_code)
-                retriable = tos_block or _is_retriable_ai_error(last_error_message, status_code, exc) or _is_model_not_found_error(last_error_message, status_code)
+                retriable = (not quota_exhausted) and (tos_block or _is_retriable_ai_error(last_error_message, status_code, exc) or _is_model_not_found_error(last_error_message, status_code))
                 role_runtime.attempts.append({
                     "provider": provider_name,
                     "model": model,
@@ -5589,6 +5693,12 @@ def _build_provider_pool_from_env(provider_pool_env: str, timeout_sec: int) -> t
             skipped.append(f"{provider_name}: provider removed from pool")
             continue
         prefix = _provider_env_prefix(provider_name)
+        if os.getenv(f"{prefix}_ENABLED", "true").strip().lower() in {"0", "false", "no", "n", "off"}:
+            skipped.append(f"{provider_name}: provider disabled by {prefix}_ENABLED=false")
+            continue
+        if re.sub(r"[^A-Za-z0-9]+", "_", provider_name.strip()).strip("_").upper().startswith("TOSKAXY_CLAUDE") and os.getenv("TOSKAXY_CLAUDE_ENABLED", "true").strip().lower() in {"0", "false", "no", "n", "off"}:
+            skipped.append(f"{provider_name}: provider disabled by TOSKAXY_CLAUDE_ENABLED=false")
+            continue
         provider_type = (os.getenv(f"{prefix}_TYPE") or "openai_compatible").strip().lower()
         base_url = (os.getenv(f"{prefix}_BASE_URL") or "").strip() or None
         api_key = (os.getenv(f"{prefix}_API_KEY") or "").strip()
@@ -7564,6 +7674,9 @@ def run_manual_ai_backtest(runtime_goal: dict[str, Any], args: argparse.Namespac
         "codegen_candidate_generated_count": 0,
         "codegen_candidate_accepted_count": 0,
         "codegen_reviewer_rejected_count": 0,
+        "codegen_reviewer_hard_rejected_count": 0,
+        "codegen_reviewer_non_selected_count": 0,
+        "codegen_reviewer_selected_count": 0,
         "accepted_codegen_candidate_count": 0,
         "final_codegen_success_count": 0,
         "generated_versions_count": 1,
@@ -8036,8 +8149,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     print("ai_committee：" + ("开启" if ai_committee_cfg.get("enabled") else "关闭"))
     print("prompt_similarity_filter：" + ("开启" if prompt_similarity_cfg.get("enabled") else "关闭"))
     print("codegen_committee：" + ("开启" if codegen_committee_cfg.get("enabled") else "关闭"))
-    prev_train_trades: int | None = None
-    previous_failure_reason: str | None = None
+    prev_train_trades: int | None = _safe_int(last_run_summary_mem.get("actual_trades", last_run_summary_mem.get("train_total_trades", 0))) if isinstance(last_run_summary_mem, dict) and last_run_summary_mem else None
+    previous_failure_reason: str | None = (str(last_run_summary_mem.get("failure_type") or last_run_summary_mem.get("estimate_error") or "") if isinstance(last_run_summary_mem, dict) else None) or None
     zero_trade_streak = 0
     consecutive_system_backtest_failures = 0
     recent_system_backtest_failures: list[dict[str, Any]] = []
@@ -8099,6 +8212,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         "codegen_candidate_generated_count": 0,
         "codegen_candidate_accepted_count": 0,
         "codegen_reviewer_rejected_count": 0,
+        "codegen_reviewer_hard_rejected_count": 0,
+        "codegen_reviewer_non_selected_count": 0,
+        "codegen_reviewer_selected_count": 0,
         "accepted_codegen_candidate_count": 0,
         "final_codegen_success_count": 0,
         "generated_versions_count": 0,
@@ -8524,7 +8640,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         session_nearest_record = session_state.get("session_nearest_candidate")
         actual_session_parent = session_state.get("actual_session_parent") or in_memory_champion
         actual_session_parent_choice = session_state.get("actual_session_parent_choice", {}) or {}
-        current_failure_type = _infer_failure_type(last_round_summary if isinstance(last_round_summary, dict) else {}, session_nearest_record if isinstance(session_nearest_record, dict) else nearest_mem)
+        failure_source_summary = last_round_summary if isinstance(last_round_summary, dict) and last_round_summary else (last_run_summary_mem if isinstance(last_run_summary_mem, dict) else {})
+        current_failure_type = _infer_failure_type(failure_source_summary, session_nearest_record if isinstance(session_nearest_record, dict) else nearest_mem)
         mutation_policy = _mutation_policy_for_failure_type(current_failure_type)
         round_parent_pool = _build_round_parent_pool(
             official_best=official_champion,
@@ -8641,7 +8758,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         print(f"failure_type: {current_failure_type}")
         print(f"allowed_mutations: {mutation_policy.get('prefer', [])}")
         print(f"blocked_mutations: {mutation_policy.get('avoid', [])}")
-        too_few_trades_recovery_mode = (os.getenv("TOO_FEW_TRADES_RECOVERY_ENABLED", "true").strip().lower() in {"1", "true", "yes", "y", "on"}) and current_failure_type in {"too_few_trades", "training_trade_count_below_min", "zero_or_near_zero_trade", "zero_trade"}
+        too_few_trades_recovery_mode = (os.getenv("TOO_FEW_TRADES_RECOVERY_ENABLED", "true").strip().lower() in {"1", "true", "yes", "y", "on"}) and current_failure_type in {"too_few_trades", "near_no_trade", "severe_near_no_trade", "training_trade_count_below_min", "zero_or_near_zero_trade", "zero_trade"}
         print(f"too_few_trades_recovery: {'yes' if too_few_trades_recovery_mode else 'no'}")
         print(f"previous_trade_count: {prev_train_trades if prev_train_trades is not None else 'unknown'}")
         print("recovery_allowed_mutations:" + json.dumps(RECOVERY_ALLOWED, ensure_ascii=False))
@@ -8669,7 +8786,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         spec_prompt += "pair_attribution 定向要求：允许收紧 BTC/USDT、OP/USDT entry threshold；OP 不允许高频入场；但不得导致全局训练交易数低于 20。SOL/BNB/DOGE 必须保留交易机会，不允许所有 pair 被过滤到几乎无交易。下一轮优先尝试 pair_specific_entry_threshold for BTC/OP、avoid_choppy_market_filter、stoploss_to_roi_ratio reduction。禁止 remove_risk_filter、adjust_roi_only、replace_stoploss_with_trailing，禁止让 OP 交易数暴涨。\n"
         spec_prompt += "mutation_spec 若新增 regime/choppy/volatility filter，必须包含 estimated_trade_count_guard 字段，说明预计总交易数范围、min_trades=20、是否可能低于下限、以及如何保留 SOL/BNB/DOGE 机会。\n"
         if too_few_trades_recovery_mode:
-            spec_prompt += "too_few_trades recovery mode：上一轮交易数过低，不允许继续收紧全局过滤；只能对 BTC/OP 保持更严格；必须恢复 SOL/BNB/DOGE 交易机会；目标交易数 20~60，理想 25~45。allowed_mutations 必须包含 controlled_widen_entry/relax_global_filter/pair_specific_restore_non_bad_pairs/reduce_overstrict_regime_filter；blocked_mutations 必须包含 add_more_global_filters/tighten_all_pairs/reduce_trade_frequency/add_choppy_filter_without_trade_guard。\n"
+            spec_prompt += f"too_few_trades recovery mode: yes；上一轮只有 {prev_train_trades if prev_train_trades is not None else 'unknown'} 笔交易，必须把交易数恢复到 20~25，而不是继续提高入场质量门槛。allowed_mutations 仅限 controlled_widen_entry/relax_global_filter/reduce_overstrict_regime_filter/pair_specific_restore_non_bad_pairs；blocked_mutations 必须包含 add_more_filters/add_regime_filter/add_choppy_filter/tighten_entry_quality_filter/tighten_all_pairs/reduce_trade_frequency。severe_near_no_trade 时优先恢复 SOL/BNB/BTC 入场路径，禁止继续叠加任何全局过滤器，禁止以 risk control 名义减少交易数。estimate_error={_compact_prompt_json((last_run_summary_mem or {}).get('estimate_error') if isinstance(last_run_summary_mem, dict) else '', 500)}。\n"
         spec_prompt += "允许 mutation=" + _compact_prompt_json(mutation_policy.get("prefer", []), 1000) + "\n"
         spec_prompt += "禁止 mutation=" + _compact_prompt_json(mutation_policy.get("avoid", []), 1000) + "\n"
         spec_prompt += "本轮只修一个主要问题；mutation_spec.mutation_type 必须优先从允许 mutation 中选择，且不得使用禁止 mutation。\n"
@@ -8788,6 +8905,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 may_reduce_below_min = True
         print(f"estimated_trade_count_guard: {guard_text}")
         print(f"whether mutation may reduce trades below min: {'yes' if may_reduce_below_min else 'no'}")
+        round_state["estimated_trade_count_guard"] = estimated_trade_count_guard if isinstance(estimated_trade_count_guard, dict) else {}
         write_json(version_dir / "mutation_spec.json", strategy_spec)
         print(f"2. mutation_spec 已保存：{version_dir / 'mutation_spec.json'}")
         if explore_strategy_family:
@@ -8814,19 +8932,20 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             + ("AI 投资委员会 risk_constraints=" + json.dumps(final_strategy_directive.get("risk_constraints", []), ensure_ascii=False) + "\n" if final_strategy_directive else "")
             + ("AI 投资委员会 pair_specific_rules=" + json.dumps(final_strategy_directive.get("pair_specific_rules", {}), ensure_ascii=False) + "\n" if final_strategy_directive else "")
             + "重要：不得把新闻/搜索结果写成策略代码规则；只能用可回测的 candle/volume/volatility/regime proxy。validation_intel 和 holdout_intel 未注入且禁止使用。\n"
-            f"当前 failure_type={current_failure_type}；allowed_mutations={mutation_policy.get('prefer', [])}；blocked_mutations={mutation_policy.get('avoid', [])}；too_few_trades_recovery_mode={'yes' if too_few_trades_recovery_mode else 'no'}；本轮只修一个主要问题。\n"
-            f"当前失败摘要={previous_failure_reason or '无'}\n"
+            + f"当前 failure_type={current_failure_type}；allowed_mutations={mutation_policy.get('prefer', [])}；blocked_mutations={mutation_policy.get('avoid', [])}；too_few_trades_recovery_mode={'yes' if too_few_trades_recovery_mode else 'no'}；本轮只修一个主要问题。\n"
+            + (f"TOO_FEW_TRADES_RECOVERY：上一轮只有 {prev_train_trades if prev_train_trades is not None else 'unknown'} 笔交易，目标恢复到 20~25；禁止 add_regime_filter/add_choppy_filter/add_more_filters/tighten_entry_quality_filter/tighten_all_pairs/reduce_trade_frequency，禁止以 risk control 名义减少交易数；必须恢复 SOL/BNB/BTC 入场路径。\n" if too_few_trades_recovery_mode else "")
+            + f"当前失败摘要={previous_failure_reason or '无'}\n"
             "硬性约束：\n"
             + ("1) 当前是结构探索模式：允许不局限于 champion 小步改动，但必须吸收历史经验，避免重复已失败结构。\n" if explore_strategy_family else "1) 仅允许在 champion 基础上一次小改动，不允许完全重写。\n")
             + "2) 策略必须在训练区间产生合理交易，严禁生成完全无交易策略，也不允许把所有 pair 都过滤到几乎无交易。\n"
-            f"2) 训练区间全局总交易数目标必须保持 20~60，理想 25~45（不是单币种）；运行目标为 {min_trades}~{max_trades}。低于 {int(min_trades * min_trades_grace_ratio)} 笔直接跳过验证；{int(min_trades * min_trades_grace_ratio)}~{min_trades - 1} 笔继续验证但仅作候选参考。超过 {max_trades} 不能成为 best；超过 {int(max_trades * 1.5)} 直接跳过验证。\n"
+            + f"2) 训练区间全局总交易数目标必须保持 20~60，理想 25~45（不是单币种）；运行目标为 {min_trades}~{max_trades}。低于 {int(min_trades * min_trades_grace_ratio)} 笔直接跳过验证；{int(min_trades * min_trades_grace_ratio)}~{min_trades - 1} 笔继续验证但仅作候选参考。超过 {max_trades} 不能成为 best；超过 {int(max_trades * 1.5)} 直接跳过验证。\n"
             "2a) 允许收紧 BTC/USDT 和 OP/USDT，但不得导致全局交易数低于 20；如果 BTC/OP 收紧，必须保留 SOL/BNB/DOGE 的交易机会。\n"
             "2b) 若 mutation_spec 新增 regime/choppy/volatility filter，代码实现必须遵守 estimated_trade_count_guard，不得额外叠加导致低于 min_trades=20。\n"
             "3) 禁止连续状态型宽松入场；优先 crossed_above/crossed_below 事件触发；每个策略最多 1~2 个 entry_tag。\n"
             "4) 不允许多个 OR 条件堆叠造成高频；不允许为了增加交易数而放宽入场。\n"
-            f"3) {zero_trade_hint}\n"
+            + f"3) {zero_trade_hint}\n"
             "4) 如果上一轮 total_trades=0，本轮必须大幅放宽入场条件，并确保训练区间产生交易。\n"
-            f"5) {_runtime_trade_target_text(runtime_goal)}\n"
+            + f"5) {_runtime_trade_target_text(runtime_goal)}\n"
             f"{_auto_trade_count_target_prompt_note(runtime_goal)}"
             "6) use_exit_signal 必须为 False，不允许改为 True。\n"
             "7) 仅现货 long only：不做空、不杠杆、不马丁格尔、不无限补仓，不允许 conditions_short。\n"
@@ -9012,12 +9131,20 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             ai_success = sum(1 for c in codegen_candidates_meta if not ((c.get("metadata") or {}).get("error")))
             candidate_generated = sum(1 for c in codegen_candidates_meta if str(c.get("code") or "").strip())
             candidate_accepted = sum(1 for c in codegen_candidates_meta if not ((c.get("metadata") or {}).get("prompt_duplicate")) and not (((c.get("metadata") or {}).get("lightweight_check") or {}).get("hard_errors")))
-            reviewer_rejected = max(0, len(codegen_candidates_meta) - (1 if committee_codegen_result.get("status") == "selected" else 0))
+            decision_meta = committee_codegen_result.get("decision", {}) if isinstance(committee_codegen_result, dict) else {}
+            ranking_meta = decision_meta.get("ranking", []) if isinstance(decision_meta, dict) else []
+            reviewer_hard_rejected = sum(1 for r in ranking_meta if (r.get("hard_errors") if isinstance(r, dict) else None))
+            reviewer_selected = 1 if committee_codegen_result.get("status") == "selected" else 0
+            reviewer_non_selected = max(0, len(codegen_candidates_meta) - reviewer_selected)
+            reviewer_rejected = reviewer_hard_rejected
             iteration_stats["ai_codegen_call_success_count"] += ai_success
             iteration_stats["codegen_candidate_generated_count"] += candidate_generated
             iteration_stats["codegen_candidate_accepted_count"] += candidate_accepted
             iteration_stats["accepted_codegen_candidate_count"] = iteration_stats["codegen_candidate_accepted_count"]
             iteration_stats["codegen_reviewer_rejected_count"] += reviewer_rejected
+            iteration_stats["codegen_reviewer_hard_rejected_count"] += reviewer_hard_rejected
+            iteration_stats["codegen_reviewer_non_selected_count"] += reviewer_non_selected
+            iteration_stats["codegen_reviewer_selected_count"] += reviewer_selected
             if explore_strategy_family:
                 _bump_strategy_family_stat(family_stats, selected_strategy_family, "codegen_candidate_generated", candidate_generated)
                 _bump_strategy_family_stat(family_stats, selected_strategy_family, "reviewer_rejected", reviewer_rejected)
@@ -9831,6 +9958,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         train_score = _score(train_metrics, train)
         _print_round_table(ver, train.timerange, train_metrics)
         train_trades = _safe_int(train_metrics.get("total_trades"))
+        estimate_report = _estimate_trade_count_error(round_state.get("estimated_trade_count_guard"), train_trades)
+        round_state.update(estimate_report)
+        if estimate_report.get("estimate_error") not in {"", "ok", "missing_estimate"}:
+            print("estimated_trade_count_guard estimate_error: " + _compact_prompt_json(estimate_report, 1000))
         severe_trade_excess = train_trades > max_trades * 1.5
         mild_trade_excess = max_trades < train_trades <= max_trades * 1.5
         high_freq_risk = train_trades > max_trades
@@ -9849,6 +9980,15 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             print(f"severe_high_frequency_failure：训练交易数 {train_trades} > max_trades*1.5 ({max_trades * 1.5})。")
         if trailing_failure:
             print("trailing_failure：moving_stop_profit_abs 为负且亏损超过 roi_profit_abs 的 50%。")
+        too_few_training_trades = train_trades < min_trades
+        near_no_trade = 0 < train_trades <= 5
+        severe_near_no_trade = train_trades <= 5
+        if too_few_training_trades:
+            print(f"too_few_trades recovery marker：训练交易数 {train_trades} < min_trades ({min_trades})。")
+            round_state["failure_type"] = "near_no_trade" if near_no_trade else "too_few_trades"
+            round_state["near_no_trade"] = near_no_trade
+            round_state["severe_near_no_trade"] = severe_near_no_trade
+            round_state["over_filtering"] = True
 
         val_scores = []
         validation_metrics = []
@@ -10017,6 +10157,11 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         if not is_valid:
             previous_failure_reason = invalid_reason
         failure_reasons = []
+        if train_trades < min_trades:
+            failure_reasons.append(("near_no_trade" if near_no_trade else "too_few_trades") + f"：训练交易数 {train_trades} < min_trades {min_trades}")
+            failure_reasons.append("over_filtering：入场/全局过滤过严导致训练交易数不足")
+            if estimate_report.get("estimate_error") == "severe_overfilter":
+                failure_reasons.append("estimated_trade_count_guard_failed：预估交易数与实际严重不符")
         if severe_high_frequency_failure:
             failure_reasons.append("训练区间交易数严重超过目标上限")
         if _safe_float(train_metrics.get("profit_total_pct")) < _safe_float((runtime_goal.get("baseline", {}) or {}).get("profit_total_pct")):
@@ -10076,6 +10221,12 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "train_profit_factor": _safe_float(train_metrics.get("profit_factor")),
             "is_new_best": False,
             "failure_reason": failure_reason,
+            "failure_type": "near_no_trade" if near_no_trade else ("too_few_trades" if train_trades < min_trades else ""),
+            "estimated_trade_count_guard": round_state.get("estimated_trade_count_guard", {}),
+            **estimate_report,
+            "near_no_trade": near_no_trade,
+            "severe_near_no_trade": severe_near_no_trade,
+            "over_filtering": bool(train_trades < min_trades),
             "zero_trade_failure": _safe_int(train_metrics.get("total_trades")) == 0,
             "low_trade_failure": trade_under_min,
             "runtime_error_failure": any((e or {}).get("error") == "backtest_failed" for e in backtest_errors),
@@ -10233,6 +10384,12 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "final_score": final_score,
             "improvement_vs_champion": improvement_vs_champion,
             "failure_reason": failure_reason,
+            "failure_type": "near_no_trade" if near_no_trade else ("too_few_trades" if train_trades < min_trades else ""),
+            "estimated_trade_count_guard": round_state.get("estimated_trade_count_guard", {}),
+            **estimate_report,
+            "near_no_trade": near_no_trade,
+            "severe_near_no_trade": severe_near_no_trade,
+            "over_filtering": bool(train_trades < min_trades),
             "not_best_reason": not_best_reason,
             "official_best_hard_gate_reasons": official_gate_reasons,
             "reason_detail": reason_detail,
@@ -10324,6 +10481,12 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "official_best_hard_gate_reasons": official_gate_reasons,
             "spec_hash": spec_hash,
             "failure_reason": failure_reason,
+            "failure_type": "near_no_trade" if near_no_trade else ("too_few_trades" if train_trades < min_trades else ""),
+            "estimated_trade_count_guard": round_state.get("estimated_trade_count_guard", {}),
+            **estimate_report,
+            "near_no_trade": near_no_trade,
+            "severe_near_no_trade": severe_near_no_trade,
+            "over_filtering": bool(train_trades < min_trades),
             "reason_detail": reason_detail,
             "avoid_next": "降低高频宽松入场，控制回撤与止损亏损。",
             **_extract_exit_profit_fields(train_metrics),
@@ -10819,6 +10982,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         "failed_mutation_types_this_run": session_state.get("failed_mutation_types_this_run", []),
         "successful_mutation_types_this_run": session_state.get("successful_mutation_types_this_run", []),
         "attempted_mutation_types_this_run": session_state.get("attempted_mutation_types_this_run", []),
+        "failure_type": _infer_failure_type(invalid_rows[-1] if invalid_rows else (session_state.get("last_round_summary") or {}), nearest_candidate),
+        "estimated_trades_range": next((r.get("estimated_trades_range") for r in reversed(invalid_rows) if r.get("estimated_trades_range")), ""),
+        "actual_trades": next((_safe_int(r.get("actual_trades", r.get("train_total_trades", r.get("total_trades", 0)))) for r in reversed(invalid_rows) if r.get("train_total_trades") is not None or r.get("total_trades") is not None), 0),
+        "estimate_error": next((r.get("estimate_error") for r in reversed(invalid_rows) if r.get("estimate_error")), ""),
         "trade_count_warning": trade_count_warning,
         "failed_versions": [r.get("version") for r in invalid_rows],
         "common_failure_patterns": common_failure_patterns,
@@ -10833,8 +11000,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             "observations": random_sample_run_observations,
         },
         "nearest_advisor_notes": nearest_advisor_notes,
-        "recommended_next_mutation_types": ["add_entry_filter", "tighten_entry_trigger", "remove_bad_entry_condition", "pair_specific_filter", "tag_specific_filter"],
-        "forbidden_next_mutation_types": sorted(set(used_failed_mutations).union(session_state.get("failed_mutation_types_this_run", []))),
+        "recommended_next_mutation_types": (["controlled_widen_entry", "relax_global_filter", "reduce_overstrict_regime_filter", "pair_specific_restore_non_bad_pairs"] if _infer_failure_type(invalid_rows[-1] if invalid_rows else {}, nearest_candidate) in {"too_few_trades", "near_no_trade", "zero_trade"} else ["add_entry_filter", "tighten_entry_trigger", "remove_bad_entry_condition", "pair_specific_filter", "tag_specific_filter"]),
+        "forbidden_next_mutation_types": sorted((set(["add_more_filters", "add_regime_filter", "add_choppy_filter", "tighten_entry_quality_filter", "tighten_all_pairs", "reduce_trade_frequency"]) if _infer_failure_type(invalid_rows[-1] if invalid_rows else {}, nearest_candidate) in {"too_few_trades", "near_no_trade", "zero_trade"} else set()).union(used_failed_mutations).union(session_state.get("failed_mutation_types_this_run", []))),
         "worst_pairs": sorted(best_pair_metrics, key=lambda x: _safe_float(x.get("profit_total_abs")))[:5],
         "best_pairs": sorted(best_pair_metrics, key=lambda x: _safe_float(x.get("profit_total_abs")), reverse=True)[:5],
         "worst_entry_tags": sorted(best_entry_tag_metrics, key=lambda x: _safe_float(x.get("profit_total_abs")))[:5],
@@ -10947,7 +11114,10 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             print("下一轮应该怎么改：优先选择未失败过的 mutation_type，继续单点小步调整。")
         else:
             print("本轮没有可参考 challenger。")
-        print("本轮失败模式总结：高频风险 / 止损吞噬利润 / trailing 结构失败 / 相似失败策略。")
+        if common_failure_patterns:
+            print("本轮失败模式总结：" + " / ".join(common_failure_patterns))
+        else:
+            print("本轮失败模式总结：暂无可归纳的共同失败模式。")
 
     print("========== 记忆写入状态 ==========")
     print(f"nearest_candidate.json：{'已写入' if nearest_candidate else '未写入'}")
@@ -10967,7 +11137,9 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
     print(f"AI codegen 调用成功次数：{iteration_stats.get('ai_codegen_call_success_count')}")
     print(f"成功提取 codegen candidate strategy.py 数：{iteration_stats.get('codegen_candidate_generated_count')}")
     print(f"已接受 codegen candidate 数：{iteration_stats.get('codegen_candidate_accepted_count')}")
-    print(f"reviewer 拒绝 candidate 数：{iteration_stats.get('codegen_reviewer_rejected_count')}")
+    print(f"reviewer_hard_rejected_count：{iteration_stats.get('codegen_reviewer_hard_rejected_count')}")
+    print(f"reviewer_non_selected_count：{iteration_stats.get('codegen_reviewer_non_selected_count')}")
+    print(f"reviewer_selected_count：{iteration_stats.get('codegen_reviewer_selected_count')}")
     print(f"最终 codegen 成功次数：{iteration_stats.get('final_codegen_success_count')}")
     print(f"实际生成策略版本数：{iteration_stats.get('generated_versions_count')}")
     print(f"训练回测版本数：{iteration_stats.get('train_backtest_count')}")

@@ -370,11 +370,17 @@ def _reviewer_decision_with_hard_gate(ai_decision: dict[str, Any], candidates: l
     selectable = [r for r in ranking if not r.get("hard_errors")]
     if selectable:
         selected = str(selectable[0].get("candidate") or "")
+        hard_rejected = [r.get("candidate") for r in ranking if r.get("hard_errors")]
+        non_selected = [r.get("candidate") for r in ranking if r.get("candidate") != selected]
         return {
             **ai_decision,
             "selected_candidate": selected,
             "ranking": ranking,
-            "rejected_candidates": [r.get("candidate") for r in ranking if r.get("candidate") != selected],
+            "rejected_candidates": hard_rejected,
+            "non_selected_candidates": non_selected,
+            "reviewer_hard_rejected_count": len(hard_rejected),
+            "reviewer_non_selected_count": len(non_selected),
+            "reviewer_selected_count": 1,
             "selected_candidate_had_hard_errors": False,
             "all_rejected": False,
             "selection_reason": ai_decision.get("selection_reason") or "hard-gated reviewer selected least-bad non-hard-error candidate for syntax/backtest",
@@ -385,6 +391,10 @@ def _reviewer_decision_with_hard_gate(ai_decision: dict[str, Any], candidates: l
         "selected_candidate": None,
         "ranking": ranking,
         "rejected_candidates": [r.get("candidate") for r in ranking],
+        "non_selected_candidates": [r.get("candidate") for r in ranking],
+        "reviewer_hard_rejected_count": len(ranking),
+        "reviewer_non_selected_count": len(ranking),
+        "reviewer_selected_count": 0,
         "all_rejected": True,
         "all_rejected_reason": "all candidates have hard_errors",
         "selection_reason": ai_decision.get("selection_reason") or "all candidates have hard_errors; retry allowed once",

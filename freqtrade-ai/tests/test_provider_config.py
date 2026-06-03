@@ -68,3 +68,10 @@ def test_force_provider_pool_manual_disables_auto_pool_log(monkeypatch, capsys) 
 
     provider_config.print_auto_provider_pool_log()
     assert capsys.readouterr().out == ""
+
+
+def test_toskaxy_claude_group_disable_filters_manual_pool(monkeypatch) -> None:
+    monkeypatch.setenv("TOSKAXY_CLAUDE_ENABLED", "false")
+    monkeypatch.setenv("STRATEGY_ADVISOR_PROVIDER_POOL", "TOSKAXY_CLAUDE_OPUS47,GS88_GPT55")
+
+    assert provider_config.provider_pool_names_for_env("STRATEGY_ADVISOR_PROVIDER_POOL") == ["GS88_GPT55"]

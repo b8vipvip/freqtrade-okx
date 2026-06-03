@@ -62,8 +62,21 @@ def provider_env_prefix(provider_name: str) -> str:
     return f"AI_PROVIDER_{normalized}"
 
 
+def _provider_disabled_by_group_env(provider_id: str) -> bool:
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", provider_id.strip()).strip("_").upper()
+    if normalized.startswith("TOSKAXY_CLAUDE") and env_flag("TOSKAXY_CLAUDE_ENABLED", True) is False:
+        return True
+    return False
+
+
 def parse_csv(raw: str | None) -> list[str]:
-    return [item.strip() for item in (raw or "").split(",") if item.strip() and re.sub(r"[^A-Za-z0-9]+", "_", item.strip()).strip("_").upper() not in REMOVED_PROVIDER_IDS]
+    return [
+        item.strip()
+        for item in (raw or "").split(",")
+        if item.strip()
+        and re.sub(r"[^A-Za-z0-9]+", "_", item.strip()).strip("_").upper() not in REMOVED_PROVIDER_IDS
+        and not _provider_disabled_by_group_env(item.strip())
+    ]
 
 
 def looks_like_placeholder_secret(value: str) -> bool:
@@ -118,7 +131,7 @@ def discover_enabled_providers() -> list[dict[str, Any]]:
     providers: list[dict[str, Any]] = []
     for env_name in sorted(os.environ):
         provider_id = _provider_id_from_enabled_env(env_name)
-        if not provider_id or provider_id in REMOVED_PROVIDER_IDS:
+        if not provider_id or provider_id in REMOVED_PROVIDER_IDS or _provider_disabled_by_group_env(provider_id):
             continue
         prefix = f"AI_PROVIDER_{provider_id}"
         if not env_flag(f"{prefix}_ENABLED", False):
