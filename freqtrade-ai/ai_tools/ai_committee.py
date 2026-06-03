@@ -28,7 +28,7 @@ DEFAULT_AI_COMMITTEE_CONFIG: dict[str, Any] = {
         "pessimistic_risk_officer",
         "optimistic_trend_analyst",
         "aggressive_momentum_trader",
-        "conservative_value_chair_candidate",
+        "conservative_risk_validator",
         "macro_liquidity_analyst",
         "quantitative_stat_arb_reviewer",
     ],
@@ -50,10 +50,10 @@ ROLE_SPECS: dict[str, dict[str, str]] = {
         "title": "激进动量交易员",
         "focus": "寻找短周期动量、突破确认、波动扩张机会；可以提出更激进 entry，但必须说明风控边界；不允许训练交易数超过 max_trades 或高频亏损。",
     },
-    "conservative_value_chair_candidate": {
+    "conservative_risk_validator": {
         "stance": "conservative",
-        "title": "保守价值/风险优先分析师",
-        "focus": "关注长期稳健、风险收益比、最差月表现、低回撤；少做低确定性交易，优先降低固定止损损失；不能把交易数压到 20 以下。",
+        "title": "保守量化风控验证员",
+        "focus": "使用中性的量化风控语言评估 external_event_risk、tail_risk、liquidity_shock、abnormal_volatility_window、drawdown_control；只讨论可回测的风险代理变量和交易数护栏，不讨论具体冲突、战争或政治事件细节；不能把交易数压到 20 以下。",
     },
     "macro_liquidity_analyst": {
         "stance": "macro",
@@ -106,6 +106,8 @@ def merge_config(goal: dict[str, Any] | None) -> dict[str, Any]:
     cfg["min_successful_roles"] = _env_int("AI_COMMITTEE_MIN_SUCCESSFUL_ROLES", int(cfg.get("min_successful_roles", 3) or 3))
     if os.getenv("AI_COMMITTEE_ROLES"):
         cfg["roles"] = _csv(os.getenv("AI_COMMITTEE_ROLES"))
+    role_aliases = {"conservative_value_chair_candidate": "conservative_risk_validator"}
+    cfg["roles"] = [role_aliases.get(str(role), str(role)) for role in (cfg.get("roles") or [])]
     analyst_pool = provider_pool_names_for_env("AI_COMMITTEE_ANALYST_PROVIDER_POOL") if (os.getenv("AI_COMMITTEE_ANALYST_PROVIDER_POOL") or auto_provider_pools_enabled()) else []
     if analyst_pool:
         cfg["analyst_provider_pool"] = analyst_pool
@@ -257,11 +259,25 @@ def _role_prompt(role: str, ctx: dict[str, Any]) -> str:
         f"你是专业、资深、理性、可审计的量化投资委员会分析师：{role}（{spec.get('title', '')}）。\n"
         f"立场/重点：{spec.get('focus', '')}\n"
         "只服务于最终量化策略目标，不允许玄学、情绪化、故事化。不得使用 validation/holdout 新闻或情报。\n"
+        "量化风控语言必须中性：可使用 external_event_risk/tail_risk/liquidity_shock/abnormal_volatility_window/drawdown_control；禁止要求或展开具体冲突、战争、政治事件细节。\n"
         "硬约束：min_trades>=20，ideal 25~45，max_trades<=60；不允许 no-trade 风控；不允许 replace_stoploss_with_trailing；不允许 adjust_roi_only；不允许 remove_risk_filter；不允许 news_keyword_rule。\n"
         "如果上一轮 too_few_trades，必须允许 controlled_widen_entry/relax_global_filter/pair_specific_restore_non_bad_pairs/reduce_overstrict_regime_filter，禁止继续收紧所有 pair。\n"
         "必须只输出 JSON，字段严格包括 role, stance, provider, model, summary, key_risks, key_opportunities, pair_specific_view, allowed_mutations, blocked_mutations, estimated_trade_count_guard, risk_constraints, confidence。\n"
         "上下文 JSON（仅训练区间情报）：\n" + json.dumps(safe_ctx, ensure_ascii=False, indent=2)[:50000]
     )
+
+
+def _provider_model_from_attempts(attempts: Any) -> tuple[str, str]:
+    if not isinstance(attempts, list):
+        return "", ""
+    for item in reversed(attempts):
+        if not isinstance(item, dict):
+            continue
+        provider = str(item.get("provider") or item.get("provider_id") or item.get("name") or "")
+        model = str(item.get("model") or "")
+        if provider or model:
+            return provider, model
+    return "", ""
 
 
 def _run_live_role(role: str, ctx: dict[str, Any], runtime: Any, ask_ai: Callable[..., str], state: dict[str, Any], offset: int, timeout_seconds: int) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
@@ -288,14 +304,20 @@ def _run_live_role(role: str, ctx: dict[str, Any], runtime: Any, ask_ai: Callabl
         except Exception as exc:  # noqa: BLE001 - failed roles are audited, not fatal
             provider = getattr(role_runtime, "used_provider", "") or provider
             model = getattr(role_runtime, "used_model", "") or model
+            if not (provider or model):
+                provider, model = _provider_model_from_attempts(getattr(role_runtime, "attempts", []))
             last_error = str(exc)
-            print(f"committee role {role} failed attempt={attempt + 1}: provider={provider}, model={model}, error={last_error}, raw_excerpt={(raw or '')[:300]!r}")
+            prohibited = bool(re.search(r"prohibited content|request contains prohibited content", last_error, flags=re.IGNORECASE))
+            print(f"committee role {role} failed attempt={attempt + 1}: provider={provider or 'unknown'}, model={model or 'unknown'}, prohibited_content={prohibited}, error={last_error}, raw_excerpt={(raw or '')[:300]!r}")
             if attempt == 0:
                 continue
+    if not (provider or model):
+        provider, model = _provider_model_from_attempts(getattr(role_runtime, "attempts", []))
     failure = {
         "role": role,
         "provider": provider,
         "model": model,
+        "prohibited_content": bool(re.search(r"prohibited content|request contains prohibited content", last_error, flags=re.IGNORECASE)),
         "error": last_error,
         "elapsed_seconds": round(time.time() - started, 3),
         "attempts": getattr(role_runtime, "attempts", []),
