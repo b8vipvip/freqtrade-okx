@@ -440,6 +440,8 @@ def collect_market_intelligence(
             (out_dir / "market_intel.json").write_text(json.dumps(intel, ensure_ascii=False, indent=2), encoding="utf-8")
             return intel
     print(f"market_intelligence cache_miss key={cache_key}")
+    print("market_intelligence cache_key_components=" + json.dumps(cache_metadata, ensure_ascii=False, sort_keys=True))
+    print("market_intelligence cache_key_excludes=run_id,timestamp,run_dir")
     print("market_intelligence skip_live_search=false")
     max_total = max(1, int(cfg.get("max_search_results", 12)))
     raw_sources: list[dict[str, Any]] = []

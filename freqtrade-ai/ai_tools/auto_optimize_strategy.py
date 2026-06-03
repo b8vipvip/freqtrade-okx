@@ -747,7 +747,7 @@ def _select_round_parent(
     failure_type: str,
     default_parent: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    if failure_type in {"backtest_result_missing", "zip_mismatch", "backtest_command_failed", "freqtrade_config_validation_failed", "result_parse_error", "duplicate_strategy"}:
+    if failure_type in {"backtest_result_missing", "zip_mismatch", "backtest_command_failed", "disk_full", "disk_space_low", "docker_error", "freqtrade_config_validation_failed", "result_parse_error", "unknown", "duplicate_strategy"}:
         return {
             "source": "actual_session_parent",
             "meta": default_parent or {},
@@ -2406,6 +2406,113 @@ def _snapshot_backtest_result_files(*dirs: Path) -> set[Path]:
     return files
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int_value(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _disk_space_snapshot(path: Path) -> dict[str, Any]:
+    target = path if path.exists() else path.parent
+    target.mkdir(parents=True, exist_ok=True)
+    usage = shutil.disk_usage(target)
+    gb = 1024 ** 3
+    return {
+        "path": str(target),
+        "disk_total_gb": round(usage.total / gb, 3),
+        "disk_used_gb": round(usage.used / gb, 3),
+        "disk_free_gb": round(usage.free / gb, 3),
+        "disk_total": usage.total,
+        "disk_used": usage.used,
+        "disk_free": usage.free,
+    }
+
+
+def _precheck_backtest_disk_space(results_dir: Path) -> dict[str, Any]:
+    threshold_gb = _env_float("BACKTEST_MIN_FREE_GB", 3.0)
+    snap = _disk_space_snapshot(results_dir)
+    ok = float(snap.get("disk_free_gb", 0.0)) >= threshold_gb
+    action = "execute_docker_backtest" if ok else "skip_docker_backtest"
+    report = {**snap, "threshold_gb": threshold_gb, "ok": ok, "action": action}
+    print("\n========== Docker backtest 磁盘空间预检 ==========")
+    print(f"backtest_results: {results_dir}")
+    print(f"disk_total: {report['disk_total']} bytes ({report['disk_total_gb']} GB)")
+    print(f"disk_used: {report['disk_used']} bytes ({report['disk_used_gb']} GB)")
+    print(f"disk_free: {report['disk_free']} bytes ({report['disk_free_gb']} GB)")
+    print(f"threshold: {threshold_gb} GB")
+    print(f"action: {action}")
+    return report
+
+
+def _top_level_backtest_result_files(results_dir: Path) -> list[Path]:
+    files: list[Path] = []
+    for pattern in ("backtest-result-*.zip", "backtest-result-*.json", "backtest-result-*.meta.json", "backtest-result-*_config.json"):
+        files.extend([p for p in results_dir.glob(pattern) if p.is_file()])
+    return sorted(set(files), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def _auto_clean_top_level_backtest_results(results_dir: Path, protected_files: set[Path] | None = None) -> dict[str, Any]:
+    enabled = _env_bool("BACKTEST_AUTO_CLEAN_TOP_LEVEL_RESULTS", True)
+    keep_recent = max(0, _env_int_value("BACKTEST_TOP_LEVEL_KEEP_RECENT", 30))
+    older_than_days = max(0.0, _env_float("BACKTEST_AUTO_CLEAN_OLDER_THAN_DAYS", 7.0))
+    protected = {p.resolve() for p in (protected_files or set()) if p}
+    report = {"enabled": enabled, "deleted_count": 0, "freed_bytes": 0, "freed_gb": 0.0, "kept_recent": keep_recent, "older_than_days": older_than_days}
+    if not enabled:
+        print("backtest top-level cleanup: enabled=false deleted_count=0 freed_bytes=0")
+        return report
+    now = time.time()
+    candidates = _top_level_backtest_result_files(results_dir)
+    deletable = []
+    for idx, path in enumerate(candidates):
+        resolved = path.resolve()
+        if resolved in protected:
+            continue
+        if idx < keep_recent:
+            continue
+        try:
+            age_days = (now - path.stat().st_mtime) / 86400.0
+        except OSError:
+            continue
+        if age_days >= older_than_days:
+            deletable.append(path)
+    freed = 0
+    deleted = 0
+    for path in deletable:
+        try:
+            size = path.stat().st_size
+            path.unlink()
+            freed += size
+            deleted += 1
+        except OSError as exc:
+            print(f"backtest top-level cleanup delete_failed file={path} error={exc}")
+    report.update({"deleted_count": deleted, "freed_bytes": freed, "freed_gb": round(freed / (1024 ** 3), 6)})
+    print("\n========== 回测结果顶层清理 ==========")
+    print(f"results_dir: {results_dir}")
+    print(f"deleted_count: {deleted}")
+    print(f"freed_bytes: {freed}")
+    print(f"freed_gb: {report['freed_gb']}")
+    print(f"keep_recent: {keep_recent}")
+    print(f"older_than_days: {older_than_days}")
+    print("protected_current_files: " + json.dumps(sorted(str(p) for p in protected), ensure_ascii=False))
+    print("ai_optimization_runs_deleted: false")
+    return report
+
+
 def _tail_lines(text: str | None, line_count: int = 200) -> str:
     lines = str(text or "").splitlines()
     return "\n".join(lines[-line_count:])
@@ -2421,10 +2528,18 @@ def _backtest_error_tail(cp: subprocess.CompletedProcess[str], line_count: int =
 
 def _classify_backtest_command_failure(cp: subprocess.CompletedProcess[str]) -> str:
     blob = f"{cp.stdout or ''}\n{cp.stderr or ''}".lower()
+    if "no space left on device" in blob or "oserror: [errno 28]" in blob:
+        return "disk_full"
     config_markers = ("invalid configuration", "configuration error", "jwt_secret_key", "too short")
     if any(marker in blob for marker in config_markers):
         return "freqtrade_config_validation_failed"
-    return "backtest_command_failed"
+    docker_markers = ("cannot connect to the docker daemon", "docker daemon", "container", "compose", "permission denied")
+    strategy_markers = ("traceback", "strategy", "populate_indicators", "populate_entry_trend", "populate_exit_trend")
+    if any(marker in blob for marker in docker_markers):
+        return "docker_error"
+    if any(marker in blob for marker in strategy_markers):
+        return "strategy_runtime_error"
+    return "unknown"
 
 
 def _is_system_backtest_failure(reason: str | None) -> bool:
@@ -2433,8 +2548,12 @@ def _is_system_backtest_failure(reason: str | None) -> bool:
         "backtest_result_missing_or_zip_mismatch",
         "zip_mismatch",
         "backtest_command_failed",
+        "disk_full",
+        "disk_space_low",
+        "docker_error",
         "freqtrade_config_validation_failed",
         "result_parse_error",
+        "unknown",
     }
 
 
@@ -9307,6 +9426,55 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             cwd=ROOT_DIR,
             result_dir_before_count=len(train_before_files),
         )
+        disk_precheck = _precheck_backtest_disk_space(results_dir)
+        if not disk_precheck.get("ok"):
+            failure_reason = "disk_space_low"
+            infrastructure_failure = {"type": failure_reason, "disk": disk_precheck}
+            backtest_result_missing_failure = False
+            zip_mismatch_failure = False
+            runtime_error_failure = True
+            invalid_reason = "训练区间回测跳过：backtest_results 所在磁盘剩余空间低于阈值"
+            family_failure_reason = failure_reason
+            status["train_backtest_status"] = "跳过：磁盘空间不足"
+            status["validation_backtest_status"] = "跳过"
+            status["is_valid"] = False
+            status["is_best"] = False
+            status["invalid_reason"] = invalid_reason
+            round_state.update({
+                "failure_reason": failure_reason,
+                "family_failure_reason": family_failure_reason,
+                "failure_type": failure_reason,
+                "infrastructure_failure": infrastructure_failure,
+                "runtime_error_failure": True,
+                "invalid_reason": invalid_reason,
+            })
+            _record_backtest_error(backtest_errors, stage="train", timerange=train.timerange, expected_strategy=class_name, error=failure_reason)
+            summary_path = write_iteration_summary({
+                "backtest_errors": backtest_errors,
+                "infrastructure_failure": infrastructure_failure,
+                "failure_reason": failure_reason,
+                "failure_type": failure_reason,
+                "invalid_reason": invalid_reason,
+                "final_score": 0.0,
+                "is_valid": False,
+                "is_best": False,
+            })
+            update_session_state_after_round(summary_path=summary_path)
+            iteration_stats["invalid_strategy_count"] += 1
+            leaderboard.append(enrich_leaderboard_entry({
+                "version": ver, "run_id": run_id, "strategy_class": class_name,
+                "strategy_file": str(strategy_file), "strategy_family": selected_strategy_family,
+                "is_valid": False, "is_best": False, "invalid_reason": invalid_reason,
+                "failure_reason": failure_reason, "failure_type": failure_reason,
+                "family_failure_reason": failure_reason, "final_score": 0.0,
+                "runtime_error_failure": True, "infrastructure_failure": infrastructure_failure,
+                "train_backtest_status": status["train_backtest_status"],
+            }))
+            consecutive_system_backtest_failures += 1
+            recent_system_backtest_failures.append({"version": ver, "failure_reason": failure_reason, "timerange": train.timerange})
+            print("处理：磁盘空间不足属于 infrastructure_failure，不写入 strategy_blacklist，不降低 strategy_family 权重，不归因到策略逻辑失败。")
+            flush_iteration_stats()
+            continue
         train_cp = run_cmd(train_cmd, ROOT_DIR)
         train_log_path = _write_backtest_process_log(version_dir, "train", train.timerange, train_cp)
         (version_dir / "backtest_logs.txt").write_text(
@@ -9315,6 +9483,7 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
         )
         if train_cp.returncode != 0:
             failure_reason = _classify_backtest_command_failure(train_cp)
+            infrastructure_failure = {"type": failure_reason} if failure_reason in {"disk_full", "docker_error", "unknown"} else {}
             backtest_error_tail = _backtest_error_tail(train_cp)
             print("回测命令执行失败。")
             print(f"command: {' '.join(train_cmd)}")
@@ -9343,6 +9512,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 "invalid_reason": invalid_reason,
                 "backtest_returncode": train_cp.returncode,
                 "backtest_error_tail": backtest_error_tail,
+                "failure_type": failure_reason,
+                "infrastructure_failure": infrastructure_failure,
             })
             _record_backtest_error(
                 backtest_errors,
@@ -9351,13 +9522,25 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 expected_strategy=class_name,
                 error=failure_reason,
             )
-            summary_path = write_iteration_summary({"backtest_errors": backtest_errors, "backtest_error_tail": backtest_error_tail, "backtest_returncode": train_cp.returncode})
+            summary_path = write_iteration_summary({"backtest_errors": backtest_errors, "backtest_error_tail": backtest_error_tail, "backtest_returncode": train_cp.returncode, "failure_type": failure_reason, "infrastructure_failure": infrastructure_failure})
             update_session_state_after_round(summary_path=summary_path)
             iteration_stats["invalid_strategy_count"] += 1
             status["is_valid"] = False
             status["invalid_reason"] = invalid_reason
             consecutive_system_backtest_failures += 1
             recent_system_backtest_failures.append({"version": ver, "failure_reason": failure_reason, "timerange": train.timerange})
+            if _is_system_backtest_failure(failure_reason):
+                leaderboard.append(enrich_leaderboard_entry({
+                    "version": ver, "run_id": run_id, "strategy_class": class_name,
+                    "strategy_file": str(strategy_file), "strategy_family": selected_strategy_family,
+                    "is_valid": False, "is_best": False, "invalid_reason": invalid_reason,
+                    "failure_reason": failure_reason, "failure_type": failure_reason,
+                    "family_failure_reason": failure_reason, "final_score": 0.0,
+                    "runtime_error_failure": True, "backtest_returncode": train_cp.returncode,
+                    "infrastructure_failure": infrastructure_failure,
+                }))
+                if failure_reason in {"disk_full", "disk_space_low"}:
+                    print("处理：磁盘/基础设施故障不写入策略失败 lessons，不影响 mutation/family 判断。")
             if explore_strategy_family and not _is_system_backtest_failure(failure_reason):
                 _update_strategy_family_stats(
                     family_stats, selected_strategy_family, is_valid=False,
@@ -9542,6 +9725,8 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 }))
             flush_iteration_stats()
             continue
+        cleanup_report = _auto_clean_top_level_backtest_results(results_dir, protected_files={train_result_file, train_result_local})
+        round_state["backtest_top_level_cleanup"] = cleanup_report
         train_attribution = write_attribution_files(train_result, version_dir)
         _print_pair_attribution_table(train_attribution)
         train_metrics = _extract_metrics(train_result)

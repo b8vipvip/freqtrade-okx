@@ -392,6 +392,33 @@ def _reviewer_decision_with_hard_gate(ai_decision: dict[str, Any], candidates: l
     }
 
 
+
+
+def _candidate_mentions(text: Any) -> set[str]:
+    return {m.group(0) for m in re.finditer(r"candidate_[A-Z]", str(text or ""))}
+
+
+def _ensure_selection_consistency(decision: dict[str, Any], selected: str) -> dict[str, Any]:
+    fixed = dict(decision)
+    fixed["selected_candidate"] = selected
+    reason = str(fixed.get("selection_reason") or "")
+    mentioned = _candidate_mentions(reason)
+    inconsistent = bool(mentioned and selected not in mentioned)
+    fixed["consistency_check"] = {
+        "selected_candidate": selected,
+        "selection_reason_mentions": sorted(mentioned),
+        "selection_reason_consistent": not inconsistent,
+        "action": "selection_reason_rewritten_to_structured_selected_candidate" if inconsistent else "ok",
+    }
+    if inconsistent:
+        print(f"WARNING codegen reviewer selection_reason mentions {sorted(mentioned)} but structured selected_candidate={selected}; using structured selected_candidate.")
+        fixed["original_selection_reason"] = reason
+        fixed["selection_reason"] = f"Structured selected_candidate={selected} is authoritative; original reviewer reason mentioned inconsistent candidate(s) {sorted(mentioned)} and was rewritten before saving."
+    elif selected and selected not in reason:
+        fixed["selection_reason"] = (reason + f" Selected candidate: {selected}.").strip() if reason else f"Selected candidate: {selected}."
+    return fixed
+
+
 def offline_review(candidates: list[dict[str, Any]]) -> dict[str, Any]:
     return _reviewer_decision_with_hard_gate({
         "compliance_check": {
@@ -516,9 +543,11 @@ def run_codegen_committee(
         valid_names = {str(item.get("candidate")) for item in results}
         if selected in valid_names:
             selected_item = next(item for item in results if item.get("candidate") == selected)
+            decision = _ensure_selection_consistency(decision, str(selected))
             _write_json(version_dir / "codegen_review_decision.json", decision)
             print(f"selected_candidate: {selected}")
             print(f"selection_reason: {decision.get('selection_reason') or ''}")
+            print(f"selected_candidate_consistency: {json.dumps(decision.get('consistency_check', {}), ensure_ascii=False)}")
             print(f"codegen retry triggered: {'yes' if retry_triggered else 'no'}")
             return {"status": "selected", "selected_candidate": selected, "selected_code": selected_item.get("code", ""), "decision": decision, "candidates": all_results, "retry_triggered": retry_triggered}
         if attempt == 0:
