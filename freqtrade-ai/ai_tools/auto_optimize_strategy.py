@@ -146,10 +146,68 @@ def _print_prompt_similarity_review(report: dict[str, Any]) -> None:
     print("========== Prompt 相似度审查 ==========")
     print(f"advisor_prompt_similarity: {float(report.get('advisor_prompt_similarity', 0.0)):.4f}")
     print(f"codegen_prompt_similarity: {float(report.get('codegen_prompt_similarity', 0.0)):.4f}")
+    print("similarity_basis: " + json.dumps(report.get("similarity_basis", {}), ensure_ascii=False, sort_keys=True))
+    print("compared_fields: " + json.dumps(report.get("compared_fields", []), ensure_ascii=False))
     print(f"similar_to_run: {report.get('similar_to_run') or ''}")
     print(f"similar_to_version: {report.get('similar_to_version') or ''}")
+    print(f"retry_count: {int(report.get('retry_count', report.get('retry_index', 0)) or 0)}")
+    print(f"max_retries: {int(report.get('max_retries', 0) or 0)}")
+    print(f"final_action: {report.get('final_action') or report.get('decision') or 'continue'}")
     print(f"decision: {report.get('decision') or 'continue'}")
 
+
+def _summarize_mutation_for_similarity_retry(mutation_spec: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(mutation_spec, dict):
+        return {}
+    return {
+        "strategy_family": mutation_spec.get("strategy_family", ""),
+        "mutation_type": mutation_spec.get("mutation_type", ""),
+        "indicators_to_add": mutation_spec.get("indicators_to_add") or mutation_spec.get("indicator_changes") or [],
+        "entry_conditions_to_change": mutation_spec.get("entry_conditions_to_change") or mutation_spec.get("entry_changes") or [],
+        "exit_conditions_to_change": mutation_spec.get("exit_conditions_to_change") or mutation_spec.get("exit_changes") or [],
+        "pair_specific_rules": mutation_spec.get("pair_specific_rules") or {},
+        "estimated_trade_count_guard": mutation_spec.get("estimated_trade_count_guard") or {},
+        "implementation_intent_summary": mutation_spec.get("implementation_intent_summary") or mutation_spec.get("intent_summary") or mutation_spec.get("reason") or "",
+    }
+
+
+def _build_prompt_similarity_advisor_retry_prompt(
+    *,
+    base_prompt: str,
+    report: dict[str, Any],
+    mutation_spec: dict[str, Any],
+    current_strategy_family: str,
+    explore_strategy_family: bool,
+) -> str:
+    previous_summary = _summarize_mutation_for_similarity_retry(mutation_spec)
+    previous_mutation_type = str(previous_summary.get("mutation_type") or "")
+    retry_context = {
+        "previous_similar_run": report.get("similar_to_run") or report.get("advisor_similar_to_run") or "",
+        "previous_similar_version": report.get("similar_to_version") or report.get("advisor_similar_to_version") or "",
+        "previous_mutation_type": previous_mutation_type,
+        "forbidden_same_mutation_summary": previous_summary,
+        "current_strategy_family": current_strategy_family or previous_summary.get("strategy_family") or "",
+        "retry_count": int(report.get("retry_count", report.get("retry_index", 0)) or 0) + 1,
+        "max_retries": int(report.get("max_retries", 1) or 1),
+    }
+    family_rule = ""
+    if explore_strategy_family:
+        family_rule = (
+            "\n结构探索已开启：必须强化 strategy_family 差异。禁止继续在 trend_following 下生成同一类 "
+            "add_regime_filter / choppy_filter / avoid_choppy_market_filter；如果 current_strategy_family 是 trend_following，"
+            "本次必须改变核心 family/indicator/entry 组合，或者给出明确非 trend-following 的结构意图。"
+        )
+    return (
+        base_prompt
+        + "\n\n========== Prompt similarity advisor-only retry（禁止重跑 market intel / committee / chairman）==========\n"
+        + "上一次 mutation_spec 与历史 prompt intent 过于相似。只重新生成 mutation_spec JSON，不要输出 Python 代码。\n"
+        + "必须生成与 previous_similar_run / previous_similar_version 明显不同的 mutation_spec；禁止复用 forbidden_same_mutation_summary 中的 mutation_type、指标组合、entry/exit 改动、pair_specific_rules 与 implementation_intent_summary。\n"
+        + "本次 retry 复用同一轮已经缓存的 AI committee / chairman final directive，不会重新执行 market_intelligence、6 个 committee roles 或 chairman。\n"
+        + "必须在 reason 或 implementation_intent_summary 中说明差异点。\n"
+        + "retry_context=" + json.dumps(retry_context, ensure_ascii=False, indent=2) + "\n"
+        + family_rule
+        + "\n只输出新的 mutation_spec JSON object。\n"
+    )
 
 def _explore_strategy_family_cfg(runtime_goal: dict[str, Any]) -> dict[str, Any]:
     raw = runtime_goal.get("explore_strategy_family", {})
@@ -8815,18 +8873,16 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
             )
         prompt_review_report: dict[str, Any] = {}
         if prompt_similarity_cfg.get("enabled"):
-            max_prompt_retries = int(prompt_similarity_cfg.get("max_retries", 2) or 2)
+            max_prompt_retries = int(prompt_similarity_cfg.get("max_retries", 1) or 1)
+            prompt_similarity_stop = False
             for prompt_retry in range(max_prompt_retries + 1):
                 prompt_review_report = review_prompts(
                     run_dir=run_dir,
                     registry_path=PROMPT_REGISTRY_FILE,
                     fields={
-                        "market_intel_summary": market_intel_summary,
-                        "committee_consensus": committee_result.get("committee_consensus", []) if isinstance(committee_result, dict) else [],
                         "final_strategy_directive": final_strategy_directive,
                         "mutation_spec": strategy_spec,
-                        "advisor_prompt": spec_prompt,
-                        "codegen_prompt": prompt,
+                        "codegen_role": "freqtrade_strategy_codegen",
                     },
                     config=prompt_similarity_cfg,
                     run_id=run_id,
@@ -8835,36 +8891,69 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                     save=True,
                 )
                 _print_prompt_similarity_review(prompt_review_report)
-                if prompt_review_report.get("decision") != "retry":
+                decision = str(prompt_review_report.get("decision") or "continue")
+                if decision != "retry_advisor_only":
+                    if decision == "prompt_duplicate_stop":
+                        prompt_similarity_stop = True
                     break
-                retry_hint = (
-                    f"prompt similarity duplicate on {prompt_review_report.get('similar_field')} "
-                    f"similar_to={prompt_review_report.get('similar_to_run')}/{prompt_review_report.get('similar_to_version')}; "
-                    "change directive family/indicator mix/pair-specific thresholds materially before codegen"
+
+                retry_prompt = _build_prompt_similarity_advisor_retry_prompt(
+                    base_prompt=spec_prompt,
+                    report=prompt_review_report,
+                    mutation_spec=strategy_spec,
+                    current_strategy_family=selected_strategy_family or planned_strategy_family,
+                    explore_strategy_family=explore_strategy_family,
                 )
-                committee_result = run_committee(
-                    run_dir=run_dir,
-                    market_intel=market_intel,
-                    pair_attribution=session_nearest_record.get("pair_attribution", {}) if isinstance(session_nearest_record, dict) else {},
-                    last_run_summary=last_round_summary if isinstance(last_round_summary, dict) else {},
-                    nearest_candidate=session_nearest_record if isinstance(session_nearest_record, dict) else {},
-                    historical_best=official_champion if isinstance(official_champion, dict) else {},
-                    current_goal=runtime_goal,
-                    active_pairs=active_pairs_for_intel,
-                    failure_type=current_failure_type,
-                    config=ai_committee_cfg,
-                    retry_hint=retry_hint,
-                    analyst_runtime=committee_analyst_runtime,
-                    chairman_runtime=committee_chairman_runtime,
-                    ask_ai_func=safe_ask_ai,
-                    ai_state=ai_runtime_state,
-                )
-                final_strategy_directive = committee_result.get("final_strategy_directive", {}) if isinstance(committee_result, dict) else {}
-                prompt += "\n\n========== Prompt 相似度 retry 后主席差异化 directive ==========\n" + json.dumps(final_strategy_directive, ensure_ascii=False, indent=2) + "\n"
-            if prompt_review_report.get("decision") == "skip" and not codegen_committee_cfg.get("enabled"):
-                previous_failure_reason = "prompt_duplicate"
-                failure_reason = "prompt_duplicate"
-                invalid_reason = "prompt_duplicate"
+                (version_dir / f"advisor_prompt.retry_{prompt_retry + 1}.txt").write_text(retry_prompt, encoding="utf-8")
+                print("Prompt similarity 触发 advisor-only retry：复用本轮 market_intel / committee / chairman final directive，不重新运行完整 committee。")
+                old_strategy_spec_json = json.dumps(strategy_spec, ensure_ascii=False)
+                try:
+                    retry_spec_text = safe_ask_ai(
+                        advisor_runtime,
+                        [{"role": "user", "content": retry_prompt}],
+                        state=ai_runtime_state,
+                    )
+                except AIRequestFailed as exc:
+                    previous_failure_reason = f"prompt_similarity advisor-only retry 失败：{str(exc)}"
+                    invalid_reason = previous_failure_reason
+                    status["invalid_reason"] = invalid_reason
+                    prompt_similarity_stop = True
+                    break
+                (version_dir / f"strategy_spec.retry_{prompt_retry + 1}.raw.txt").write_text(retry_spec_text or "", encoding="utf-8")
+                try:
+                    retry_strategy_spec = extract_json_object(retry_spec_text or "")
+                except (ValueError, json.JSONDecodeError):
+                    previous_failure_reason = "prompt_similarity advisor-only retry 返回的 mutation_spec 不是有效 JSON object。"
+                    invalid_reason = "mutation_spec JSON 解析失败"
+                    status["invalid_reason"] = invalid_reason
+                    prompt_similarity_stop = True
+                    break
+                if explore_strategy_family:
+                    returned_family = _normalize_strategy_family(retry_strategy_spec.get("strategy_family"))
+                    if returned_family != planned_strategy_family:
+                        retry_strategy_spec["strategy_family_validation_warning"] = (
+                            f"advisor retry 返回 strategy_family={returned_family or '缺失/非法'}，已按本轮结构探索计划修正为 {planned_strategy_family}"
+                        )
+                        retry_strategy_spec["strategy_family"] = planned_strategy_family
+                    selected_strategy_family = _normalize_strategy_family(retry_strategy_spec.get("strategy_family")) or planned_strategy_family
+                strategy_spec = retry_strategy_spec
+                mutation_type = str(strategy_spec.get("mutation_type", "") or "")
+                spec_hash = hashlib.sha256(json.dumps(strategy_spec, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+                write_json(version_dir / "mutation_spec.json", strategy_spec)
+                with (version_dir / "advisor_prompt.txt").open("a", encoding="utf-8") as prompt_audit:
+                    prompt_audit.write("\n\n========== prompt_similarity advisor-only retry 返回的本轮选择（审计）==========\n")
+                    prompt_audit.write(f"retry_index={prompt_retry + 1}; mutation_type={mutation_type or '未提供'}\n")
+                    prompt_audit.write("完整 mutation_spec=" + json.dumps(strategy_spec, ensure_ascii=False, indent=2) + "\n")
+                new_strategy_spec_json = json.dumps(strategy_spec, ensure_ascii=False)
+                if old_strategy_spec_json in prompt:
+                    prompt = prompt.replace(old_strategy_spec_json, new_strategy_spec_json, 1)
+                else:
+                    prompt += "\n\n========== Prompt similarity advisor-only retry mutation_spec ==========" + "\nmutation_spec=" + new_strategy_spec_json + "\n"
+                print(f"advisor-only retry mutation_spec 已保存：{version_dir / 'mutation_spec.json'}")
+            if prompt_similarity_stop or prompt_review_report.get("decision") == "prompt_duplicate_stop":
+                previous_failure_reason = "prompt_duplicate_after_retry"
+                failure_reason = "prompt_duplicate_after_retry"
+                invalid_reason = "prompt_duplicate_after_retry"
                 round_state["failure_type"] = "prompt_duplicate"
                 status["invalid_reason"] = invalid_reason
                 status["failure_type"] = "prompt_duplicate"
@@ -8875,12 +8964,14 @@ def run_auto_optimization(runtime_goal: dict[str, Any], args: argparse.Namespace
                 summary_path = write_iteration_summary()
                 update_session_state_after_round(summary_path=summary_path)
                 leaderboard.append(enrich_leaderboard_entry({"version": ver, "run_id": run_id, "strategy_class": class_name, "is_valid": False, "invalid_reason": invalid_reason, "failure_reason": failure_reason, "failure_type": "prompt_duplicate"}))
-                print("本轮停止：prompt_duplicate，不调用 codegen；该失败不按 zero_trade 处理。")
+                print("本轮停止：prompt_duplicate_stop，不调用 codegen；该失败不按 zero_trade 处理。")
                 print(f"8. 第 {i} 轮完成：无效，原因：{invalid_reason}")
                 flush_iteration_stats()
                 continue
+            if prompt_review_report.get("decision") == "force_continue_after_retry_limit":
+                print("Prompt similarity retry 已达上限；decision=force_continue_after_retry_limit，继续进入 codegen 并记录 prompt_duplicate_after_retry。")
         else:
-            prompt_review_report = {"advisor_prompt_similarity": 0.0, "codegen_prompt_similarity": 0.0, "decision": "continue"}
+            prompt_review_report = {"advisor_prompt_similarity": 0.0, "codegen_prompt_similarity": 0.0, "decision": "continue", "final_action": "continue", "retry_count": 0, "max_retries": 0, "similarity_basis": {}, "compared_fields": []}
             _print_prompt_similarity_review(prompt_review_report)
         (version_dir / "codegen_prompt.txt").write_text(prompt, encoding="utf-8")
         print("3. 正在调用代码生成模型池生成 Freqtrade 策略代码……")

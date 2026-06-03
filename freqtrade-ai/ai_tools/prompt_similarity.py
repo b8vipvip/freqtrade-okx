@@ -14,10 +14,17 @@ from typing import Any
 DEFAULT_PROMPT_SIMILARITY_CONFIG: dict[str, Any] = {
     "enabled": False,
     "threshold": 0.95,
-    "compare_fields": ["market_intel_summary", "committee_consensus", "final_strategy_directive", "mutation_spec", "normalized_mutation_intent", "codegen_prompt_fingerprint"],
+    "compare_fields": ["normalized_mutation_intent", "codegen_prompt_fingerprint"],
     "retry_on_duplicate": True,
-    "max_retries": 2,
+    "max_retries": 1,
 }
+
+_ALLOWED_COMPARE_FIELDS = {"normalized_mutation_intent", "codegen_prompt_fingerprint"}
+
+
+def _sanitize_compare_fields(fields: Any) -> list[str]:
+    cleaned = [str(x) for x in (fields or []) if str(x) in _ALLOWED_COMPARE_FIELDS]
+    return cleaned or list(DEFAULT_PROMPT_SIMILARITY_CONFIG["compare_fields"])
 
 
 def merge_config(goal: dict[str, Any] | None) -> dict[str, Any]:
@@ -34,6 +41,7 @@ def merge_config(goal: dict[str, Any] | None) -> dict[str, Any]:
         cfg["max_retries"] = int(os.getenv("PROMPT_SIMILARITY_MAX_RETRIES", "2") or 2)
     if os.getenv("PROMPT_SIMILARITY_COMPARE_FIELDS"):
         cfg["compare_fields"] = [x.strip() for x in os.getenv("PROMPT_SIMILARITY_COMPARE_FIELDS", "").split(",") if x.strip()]
+    cfg["compare_fields"] = _sanitize_compare_fields(cfg.get("compare_fields"))
     return cfg
 
 
@@ -73,22 +81,33 @@ def normalized_mutation_intent(fields: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(directive, dict):
         directive = {}
     return {
+        "strategy_family": spec.get("strategy_family") or directive.get("strategy_family") or "",
         "mutation_type": spec.get("mutation_type") or directive.get("mutation_type") or "",
         "indicators_to_add": spec.get("indicators_to_add") or spec.get("indicator_changes") or directive.get("indicators_to_add") or [],
         "entry_conditions_to_change": spec.get("entry_conditions_to_change") or spec.get("entry_changes") or directive.get("entry_conditions_to_change") or [],
+        "exit_conditions_to_change": spec.get("exit_conditions_to_change") or spec.get("exit_changes") or directive.get("exit_conditions_to_change") or [],
         "pair_specific_rules": spec.get("pair_specific_rules") or directive.get("pair_specific_rules") or {},
         "estimated_trade_count_guard": spec.get("estimated_trade_count_guard") or directive.get("estimated_trade_count_guard") or {},
+        "implementation_intent_summary": spec.get("implementation_intent_summary") or spec.get("intent_summary") or spec.get("reason") or directive.get("implementation_intent_summary") or "",
     }
 
 
 def _codegen_prompt_fingerprint(fields: dict[str, Any]) -> dict[str, Any]:
     spec = fields.get("mutation_spec") if isinstance(fields, dict) else {}
     directive = fields.get("final_strategy_directive") if isinstance(fields, dict) else {}
+    required_diff = {}
+    if isinstance(spec, dict):
+        required_diff = {
+            "changes": spec.get("changes", []),
+            "required_implementation_diff": spec.get("required_implementation_diff") or spec.get("implementation_diff") or spec.get("implementation_intent_summary") or "",
+            "entry_conditions_to_change": spec.get("entry_conditions_to_change") or spec.get("entry_changes") or [],
+            "exit_conditions_to_change": spec.get("exit_conditions_to_change") or spec.get("exit_changes") or [],
+            "pair_specific_rules": spec.get("pair_specific_rules") or {},
+        }
     return {
-        "mutation_intent": normalized_mutation_intent(fields),
-        "codegen_requirements": directive.get("codegen_requirements", []) if isinstance(directive, dict) else [],
-        "risk_constraints": directive.get("risk_constraints", []) if isinstance(directive, dict) else [],
-        "spec_hash_basis": spec if isinstance(spec, dict) else {},
+        "mutation_spec": normalized_mutation_intent(fields),
+        "codegen_role": fields.get("codegen_role") or "freqtrade_strategy_codegen",
+        "required_implementation_diff": required_diff,
     }
 
 def build_fingerprints(fields: dict[str, Any], compare_fields: list[str]) -> dict[str, Any]:
@@ -127,7 +146,7 @@ def review_prompts(
     cfg = dict(DEFAULT_PROMPT_SIMILARITY_CONFIG)
     if isinstance(config, dict):
         cfg.update(config)
-    compare_fields = [str(x) for x in cfg.get("compare_fields", []) if str(x)]
+    compare_fields = _sanitize_compare_fields(cfg.get("compare_fields"))
     threshold = float(cfg.get("threshold", 0.95))
     fps = build_fingerprints(fields, compare_fields)
     registry = _load_registry(registry_path)
@@ -147,6 +166,8 @@ def review_prompts(
                 best = {"score": round(score, 4), "field": field, "similar_to_run": str(item.get("run_id", "")), "similar_to_version": str(item.get("version", ""))}
     advisor_similarity = 0.0
     codegen_similarity = 0.0
+    advisor_best = {"score": 0.0, "similar_to_run": "", "similar_to_version": ""}
+    codegen_best = {"score": 0.0, "similar_to_run": "", "similar_to_version": ""}
     for item in registry:
         if str(item.get("run_id", "")) == str(run_id) and str(item.get("version", "")) == str(version):
             continue
@@ -155,33 +176,65 @@ def review_prompts(
             cur = fps.get(field, {})
             old = prev.get(field, {}) if isinstance(prev, dict) else {}
             score = 1.0 if cur.get("hash") == old.get("hash") and cur.get("hash") else jaccard(set(cur.get("tokens", [])), set(old.get("tokens", [])))
-            if target == "advisor":
-                advisor_similarity = max(advisor_similarity, score)
-            else:
-                codegen_similarity = max(codegen_similarity, score)
-    prompt_duplicate = max(advisor_similarity, codegen_similarity) >= threshold
+            if target == "advisor" and score > advisor_similarity:
+                advisor_similarity = score
+                advisor_best = {"score": round(score, 4), "similar_to_run": str(item.get("run_id", "")), "similar_to_version": str(item.get("version", ""))}
+            elif target == "codegen" and score > codegen_similarity:
+                codegen_similarity = score
+                codegen_best = {"score": round(score, 4), "similar_to_run": str(item.get("run_id", "")), "similar_to_version": str(item.get("version", ""))}
+    advisor_duplicate = advisor_similarity >= threshold
+    codegen_duplicate = codegen_similarity >= threshold
+    prompt_duplicate = advisor_duplicate or codegen_duplicate
     duplicate = prompt_duplicate or best["score"] >= threshold
-    decision_duplicate = prompt_duplicate
-    decision = "retry" if decision_duplicate and bool(cfg.get("retry_on_duplicate", True)) and retry_index < int(cfg.get("max_retries", 2)) else ("skip" if decision_duplicate else "continue")
+    max_retries = int(cfg.get("max_retries", 1) or 1)
+    if advisor_duplicate and bool(cfg.get("retry_on_duplicate", True)) and retry_index < max_retries:
+        decision = "retry_advisor_only"
+        final_action = "retry_advisor_only"
+    elif prompt_duplicate and retry_index >= max_retries:
+        decision = "force_continue_after_retry_limit"
+        final_action = "force_continue_after_retry_limit"
+    elif prompt_duplicate:
+        decision = "prompt_duplicate_stop"
+        final_action = "prompt_duplicate_stop"
+    else:
+        decision = "continue"
+        final_action = "continue"
+    basis = {
+        "advisor": "normalized_mutation_intent_only",
+        "advisor_compared_fields": ["strategy_family", "mutation_type", "indicators_to_add", "entry_conditions_to_change", "exit_conditions_to_change", "pair_specific_rules", "estimated_trade_count_guard", "implementation_intent_summary"],
+        "codegen": "mutation_spec_codegen_role_required_implementation_diff_only",
+        "excluded": ["full_parent_strategy_code", "public_rule_templates", "market_intel_full_text", "full_advisor_prompt", "full_codegen_prompt", "committee_consensus_full_text"],
+    }
     report = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "run_id": run_id,
         "version": version,
         "retry_index": retry_index,
+        "retry_count": retry_index,
+        "max_retries": max_retries,
         "threshold": threshold,
         "advisor_prompt_similarity": round(advisor_similarity, 4),
         "codegen_prompt_similarity": round(codegen_similarity, 4),
-        "similar_to_run": best["similar_to_run"],
-        "similar_to_version": best["similar_to_version"],
+        "advisor_similar_to_run": advisor_best["similar_to_run"],
+        "advisor_similar_to_version": advisor_best["similar_to_version"],
+        "codegen_similar_to_run": codegen_best["similar_to_run"],
+        "codegen_similar_to_version": codegen_best["similar_to_version"],
+        "similar_to_run": advisor_best["similar_to_run"] or codegen_best["similar_to_run"] or best["similar_to_run"],
+        "similar_to_version": advisor_best["similar_to_version"] or codegen_best["similar_to_version"] or best["similar_to_version"],
         "similar_field": best["field"],
+        "similarity_basis": basis,
+        "compared_fields": compare_fields,
         "max_similarity": best["score"],
         "is_duplicate": duplicate,
         "prompt_duplicate": prompt_duplicate,
+        "advisor_prompt_duplicate": advisor_duplicate,
+        "codegen_prompt_duplicate": codegen_duplicate,
         "decision": decision,
+        "final_action": final_action,
         "fingerprints": fps,
     }
     if save:
         (run_dir / "prompt_fingerprints.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-        registry.append({k: report[k] for k in ["generated_at", "run_id", "version", "retry_index", "threshold", "advisor_prompt_similarity", "codegen_prompt_similarity", "similar_to_run", "similar_to_version", "similar_field", "max_similarity", "is_duplicate", "prompt_duplicate", "decision", "fingerprints"]})
+        registry.append({k: report[k] for k in ["generated_at", "run_id", "version", "retry_index", "retry_count", "max_retries", "threshold", "advisor_prompt_similarity", "codegen_prompt_similarity", "advisor_similar_to_run", "advisor_similar_to_version", "codegen_similar_to_run", "codegen_similar_to_version", "similar_to_run", "similar_to_version", "similar_field", "similarity_basis", "compared_fields", "max_similarity", "is_duplicate", "prompt_duplicate", "advisor_prompt_duplicate", "codegen_prompt_duplicate", "decision", "final_action", "fingerprints"]})
         _write_registry(registry_path, registry)
     return report

@@ -497,7 +497,7 @@ def run_codegen_committee(
                 item["metadata"]["prompt_similarity_report"] = report
                 item["metadata"]["code_duplicate_report"] = duplicate_report
                 item["metadata"]["prompt_duplicate"] = bool(duplicate_report.get("is_duplicate"))
-                item["metadata"]["prompt_fingerprint_audit_only"] = bool(report.get("prompt_duplicate") or report.get("decision") in {"retry", "skip"})
+                item["metadata"]["prompt_fingerprint_audit_only"] = bool(report.get("prompt_duplicate") or report.get("decision") in {"retry_advisor_only", "prompt_duplicate_stop", "force_continue_after_retry_limit"})
                 _write_json(version_dir / "codegen_candidates" / str(item.get("candidate")) / "metadata.json", item["metadata"])
                 if not item["metadata"].get("prompt_duplicate"):
                     survivors.append(item)
