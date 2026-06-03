@@ -754,3 +754,62 @@ def test_strategy_family_leaderboard_counts_backtest_zip_failures() -> None:
     assert family["zip_mismatch_failure_count"] == 1
     assert "trend_following" in leaderboard["disabled_families_for_next_run"]
     assert "trend_following" not in leaderboard["preferred_families_for_next_optimize"]
+
+
+def test_too_few_trade_inference_forces_recovery_policy_and_estimate_error() -> None:
+    summary = {
+        "target": {"min_trades": 20},
+        "train_total_trades": 1,
+        "estimated_trade_count_guard": {"estimated_total_trades_range": "28-42"},
+    }
+
+    assert optimizer._infer_failure_type(summary, {"near_miss_type": "low_trade_profitable_near_miss"}) == "near_no_trade"
+    policy = optimizer._mutation_policy_for_failure_type("near_no_trade")
+    assert policy["prefer"] == [
+        "controlled_widen_entry",
+        "relax_global_filter",
+        "reduce_overstrict_regime_filter",
+        "pair_specific_restore_non_bad_pairs",
+    ]
+    assert "add_regime_filter" in policy["avoid"]
+    assert "add_choppy_filter" in policy["avoid"]
+
+    estimate = optimizer._estimate_trade_count_error(summary["estimated_trade_count_guard"], 1)
+    assert estimate == {
+        "estimated_trades_range": "28-42",
+        "actual_trades": 1,
+        "estimate_error": "severe_overfilter",
+    }
+
+
+def test_last_near_miss_parent_recommendation_is_honored_when_file_exists(tmp_path) -> None:
+    strategy_file = tmp_path / "NearMissStrategy.py"
+    strategy_file.write_text("class NearMissStrategy: pass\n", encoding="utf-8")
+    near_miss = {
+        "strategy_class": "NearMissStrategy",
+        "strategy_file": str(strategy_file),
+        "near_miss": True,
+        "near_miss_type": "low_trade_profitable_near_miss",
+    }
+    historical = {"meta": {"strategy_class": "HistoricalBest"}, "code": "", "source": "historical_best"}
+    review = {"next_run_guidance": {"preferred_parent": "last near miss"}}
+
+    choice = optimizer._select_actual_session_parent_for_run(
+        explore_strategy_family=True,
+        use_pre_run_parent_recommendation=False,
+        pre_run_ai_review=review,
+        historical_champion=historical,
+        nearest_mem=near_miss,
+    )
+
+    assert choice["source"] == "last_near_miss_session_parent"
+    assert choice["meta"]["strategy_class"] == "NearMissStrategy"
+    assert choice["session_parent_choice"]["recommended_parent_source"] == "last_near_miss"
+    assert "last near miss 策略文件有效" in choice["session_parent_choice"]["reason"]
+
+
+def test_quota_exhaustion_detection_and_toskaxy_claude_disable(monkeypatch) -> None:
+    assert optimizer._is_quota_exhausted_error("insufficient_user_quota: quota=0", 429) is True
+    monkeypatch.setenv("TOSKAXY_CLAUDE_ENABLED", "false")
+    monkeypatch.setenv("STRATEGY_ADVISOR_PROVIDER_POOL", "TOSKAXY_CLAUDE_OPUS47,OTHER_PROVIDER")
+    assert optimizer.provider_pool_names_for_env("STRATEGY_ADVISOR_PROVIDER_POOL") == ["OTHER_PROVIDER"]

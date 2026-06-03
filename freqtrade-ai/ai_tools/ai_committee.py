@@ -69,9 +69,9 @@ ROLE_SPECS: dict[str, dict[str, str]] = {
 
 PAIR_VIEW_TEMPLATE = {pair: {} for pair in ["BTC/USDT", "OP/USDT", "SOL/USDT", "BNB/USDT", "DOGE/USDT"]}
 HARD_BLOCKED_MUTATIONS = ["replace_stoploss_with_trailing", "adjust_roi_only", "remove_risk_filter", "news_keyword_rule"]
-RECOVERY_FAILURE_TYPES = {"too_few_trades", "training_trade_count_below_min", "zero_or_near_zero_trade", "zero_trade"}
-RECOVERY_ALLOWED = ["controlled_widen_entry", "relax_global_filter", "pair_specific_restore_non_bad_pairs", "reduce_overstrict_regime_filter"]
-RECOVERY_BLOCKED = ["add_more_global_filters", "tighten_all_pairs", "reduce_trade_frequency", "add_choppy_filter_without_trade_guard"]
+RECOVERY_FAILURE_TYPES = {"too_few_trades", "near_no_trade", "severe_near_no_trade", "training_trade_count_below_min", "zero_or_near_zero_trade", "zero_trade"}
+RECOVERY_ALLOWED = ["controlled_widen_entry", "relax_global_filter", "reduce_overstrict_regime_filter", "pair_specific_restore_non_bad_pairs"]
+RECOVERY_BLOCKED = ["add_more_filters", "add_regime_filter", "add_choppy_filter", "tighten_entry_quality_filter", "tighten_all_pairs", "reduce_trade_frequency", "add_more_global_filters", "add_choppy_filter_without_trade_guard"]
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -254,6 +254,7 @@ def _role_prompt(role: str, ctx: dict[str, Any]) -> str:
         "active_pairs": ctx.get("active_pairs", []),
         "failure_type": ctx.get("failure_type", ""),
         "too_few_trades_recovery": (_env_flag("TOO_FEW_TRADES_RECOVERY_ENABLED", True) and ctx.get("failure_type") in RECOVERY_FAILURE_TYPES),
+        "estimated_trade_count_error": ctx.get("estimated_trade_count_error") or (ctx.get("last_run_summary", {}) or {}).get("estimate_error", ""),
     }
     return (
         f"你是专业、资深、理性、可审计的量化投资委员会分析师：{role}（{spec.get('title', '')}）。\n"
@@ -261,7 +262,7 @@ def _role_prompt(role: str, ctx: dict[str, Any]) -> str:
         "只服务于最终量化策略目标，不允许玄学、情绪化、故事化。不得使用 validation/holdout 新闻或情报。\n"
         "量化风控语言必须中性：可使用 external_event_risk/tail_risk/liquidity_shock/abnormal_volatility_window/drawdown_control；禁止要求或展开具体冲突、战争、政治事件细节。\n"
         "硬约束：min_trades>=20，ideal 25~45，max_trades<=60；不允许 no-trade 风控；不允许 replace_stoploss_with_trailing；不允许 adjust_roi_only；不允许 remove_risk_filter；不允许 news_keyword_rule。\n"
-        "如果上一轮 too_few_trades，必须允许 controlled_widen_entry/relax_global_filter/pair_specific_restore_non_bad_pairs/reduce_overstrict_regime_filter，禁止继续收紧所有 pair。\n"
+        "如果上一轮 too_few_trades/near_no_trade，必须允许 controlled_widen_entry/relax_global_filter/reduce_overstrict_regime_filter/pair_specific_restore_non_bad_pairs，禁止 add_regime_filter/add_choppy_filter/add_more_filters/tighten_entry_quality_filter/tighten_all_pairs/reduce_trade_frequency。若上一轮只有 1 笔交易，目标是恢复到 20~25 笔，而不是继续提高入场质量门槛；必须显式看到 estimated_trade_count_error。\n"
         "必须只输出 JSON，字段严格包括 role, stance, provider, model, summary, key_risks, key_opportunities, pair_specific_view, allowed_mutations, blocked_mutations, estimated_trade_count_guard, risk_constraints, confidence。\n"
         "上下文 JSON（仅训练区间情报）：\n" + json.dumps(safe_ctx, ensure_ascii=False, indent=2)[:50000]
     )
@@ -363,7 +364,7 @@ def _build_directive(ctx: dict[str, Any], role_outputs: list[dict[str, Any]], fa
         "allowed_mutations": allowed,
         "blocked_mutations": blocked,
         "too_few_trades_recovery_mode": too_few,
-        "trade_count_target": {"min": 20, "ideal_min": 25, "ideal_max": 45, "max": 60},
+        "trade_count_target": {"min": 20, "ideal_min": 20, "ideal_max": 25, "max": 60} if too_few else {"min": 20, "ideal_min": 25, "ideal_max": 45, "max": 60},
         "estimated_trade_count_guard": _guard("主席硬约束：不允许把交易数压到 20 以下，理想 25~45，最高 60。"),
         "pair_specific_rules": {
             "BTC/USDT": {"bias": "stricter quality/risk gates if prior attribution is weak"},
@@ -376,7 +377,7 @@ def _build_directive(ctx: dict[str, Any], role_outputs: list[dict[str, Any]], fa
         "codegen_requirements": [
             "populate_entry_trend must implement pair-specific BTC/OP thresholds when required",
             "regime/choppy/volatility filters must include estimated_trade_count_guard and pair-specific bypass/less strict path",
-            "must preserve SOL/BNB/DOGE opportunities and at least 3 pairs can potentially trigger entry",
+            "must preserve/restore SOL/BNB/BTC entry paths when severe near-no-trade was observed; keep at least 3 pairs able to trigger entry",
             "risk-reducing does not mean no-trade; satisfy min_trades >= 20 and target 20~60 (ideal 25~45)",
             "do not implement news-based rules or external API calls",
         ],
